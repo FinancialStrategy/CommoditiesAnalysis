@@ -941,7 +941,8 @@ class Visualizer:
                 line=dict(color='red', width=2, dash='dash'),
                 opacity=0.5
             ))
-                        fig.update_layout(
+            
+            fig.update_layout(
                 height=500,
                 template="plotly_white",
                 hovermode='closest'
@@ -1017,10 +1018,6 @@ class Visualizer:
             )
             
             # Autocorrelation
-            from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
-            import io
-            import base64
-            
             # Calculate ACF
             acf_vals = np.correlate(returns_clean - np.mean(returns_clean), 
                                    returns_clean - np.mean(returns_clean), 
@@ -2291,4 +2288,3 @@ if __name__ == "__main__":
     except Exception as e:
         st.error(f"An error occurred: {str(e)}")
         st.error("Please try refreshing the page or contact support if the issue persists.")
-          
