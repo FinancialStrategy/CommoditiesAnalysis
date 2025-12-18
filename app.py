@@ -67,55 +67,6 @@ BENCHMARKS = {
     "GLD": {"name": "Gold ETF", "type": "commodity"}
 }
 
-# -----------------------------------------------------------------------------
-# GOLD ETF BENCHMARK (Most Active US Gold ETF Selector)
-# -----------------------------------------------------------------------------
-GOLD_ETF_CANDIDATES = {
-    "GLD": {"name": "SPDR Gold Shares", "type": "commodity"},
-    "IAU": {"name": "iShares Gold Trust", "type": "commodity"},
-    "GLDM": {"name": "SPDR Gold MiniShares Trust", "type": "commodity"},
-    "SGOL": {"name": "abrdn Physical Gold Shares ETF", "type": "commodity"},
-    "BAR": {"name": "GraniteShares Gold Trust", "type": "commodity"}
-}
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def select_most_active_gold_etf(start_date: datetime, end_date: datetime,
-                                candidates: Optional[List[str]] = None) -> Tuple[str, pd.DataFrame]:
-    """Select the most active US-listed Gold ETF (by average dollar volume) for the period.
-    Returns (symbol, dataframe). Falls back to GLD if selection fails.
-    """
-    symbols = candidates if candidates else list(GOLD_ETF_CANDIDATES.keys())
-    best_sym = "GLD"
-    best_score = -1.0
-    best_df = pd.DataFrame()
-
-    for sym in symbols:
-        try:
-            df = fetch_asset_data(sym, start_date, end_date)
-            if df is None or df.empty:
-                continue
-            if "Volume" not in df.columns or ("Close" not in df.columns and "Adj Close" not in df.columns):
-                continue
-            px_col = "Close" if "Close" in df.columns else "Adj Close"
-            tail = df.tail(80).dropna(subset=[px_col, "Volume"])
-            if tail.empty:
-                continue
-            dollar_vol = (tail[px_col].astype(float) * tail["Volume"].astype(float)).mean()
-            if (dollar_vol is not None) and (float(dollar_vol) == float(dollar_vol)) and float(dollar_vol) > best_score:
-                best_score = float(dollar_vol)
-                best_sym = sym
-                best_df = df
-        except Exception:
-            continue
-
-    if best_df is None or best_df.empty:
-        try:
-            best_df = fetch_asset_data(best_sym, start_date, end_date)
-        except Exception:
-            best_df = pd.DataFrame()
-
-    return best_sym, best_df
-
 # =============================================================================
 # STYLES & UTILITIES
 # =============================================================================
@@ -906,155 +857,302 @@ class AdvancedAnalytics:
 
 
     # -------------------------------------------------------------------------
-    # ADVANCED VaR / CVaR / ES (Absolute + Relative) - Institutional Extensions
+    # Advanced VaR / CVaR / ES (Absolute + Relative) + Rolling Series + Backtests
     # -------------------------------------------------------------------------
+
     @staticmethod
-    def _compound_horizon_returns(returns: pd.Series, horizon: int = 1) -> pd.Series:
-        """Convert daily returns into horizon (h-day) compounded returns."""
+    def _compound_horizon_returns(returns: pd.Series, horizon_days: int = 1) -> pd.Series:
+        """Compound simple returns over a horizon (1D returns -> hD horizon returns)."""
         r = returns.dropna()
-        if horizon <= 1:
+        if horizon_days <= 1:
             return r
-        hr = (1.0 + r).rolling(horizon).apply(np.prod, raw=True) - 1.0
-        return hr.dropna()
+        # Compounded simple return over horizon
+        return (1.0 + r).rolling(horizon_days).apply(lambda x: float(np.prod(x) - 1.0), raw=True).dropna()
 
     @staticmethod
-    def _var_es_gaussian(mu: float, sigma: float, p: float) -> Tuple[float, float]:
-        """Gaussian VaR/ES for left tail probability p."""
-        z = stats.norm.ppf(p)
-        var = mu + sigma * z
-        es = mu - sigma * stats.norm.pdf(z) / max(p, 1e-12)
-        return float(var), float(es)
+    def compute_var_cvar_es(
+        returns: pd.Series,
+        confidence_level: float = 0.95,
+        method: str = "historical",
+        horizon_days: int = 1
+    ) -> Dict[str, Any]:
+        """Compute VaR / CVaR(=ES) for a return series.
 
-    @staticmethod
-    def _var_es_student_t(df: float, loc: float, scale: float, p: float) -> Tuple[float, float]:
-        """Student-t VaR/ES for left tail probability p (df>1)."""
-        q = stats.t.ppf(p, df, loc=loc, scale=scale)
-        t_std = stats.t.ppf(p, df)
-        if df <= 1:
-            return float(q), float(q)
-        es_std = -((df + t_std ** 2) / (df - 1.0)) * (stats.t.pdf(t_std, df) / max(p, 1e-12))
-        es = loc + scale * es_std
-        return float(q), float(es)
-
-    @staticmethod
-    def compute_var_cvar_es(returns: pd.Series,
-                            confidence_level: float = 0.95,
-                            method: str = "historical",
-                            horizon: int = 1) -> Dict[str, float]:
-        """Compute VaR / CVaR / ES for a return series.
-        - VaR: quantile of returns (left tail)
-        - CVaR/ES: conditional tail expectation (mean of returns below VaR threshold)
-
-        Methods:
-          - historical
-          - gaussian (parametric normal)
-          - student_t (parametric Student-t)
-          - cornish_fisher (non-normal adjustment; ES is an approximation)
+        Notes:
+        - returns are expected as daily simple returns (decimal).
+        - horizon_days compounds returns first (more accurate than sqrt scaling).
         """
-        r = AdvancedAnalytics._compound_horizon_returns(returns, horizon=horizon)
-        if r.empty or len(r) < 60:
-            return {"var": np.nan, "cvar": np.nan, "es": np.nan}
-
-        alpha = float(confidence_level)
-        p = 1.0 - alpha
-        p = min(max(p, 1e-6), 0.5)
-
         method = (method or "historical").lower().strip()
+        r = AdvancedAnalytics._compound_horizon_returns(returns, horizon_days=horizon_days).dropna()
+
+        n = int(r.shape[0])
+        if n < 60:
+            return {"observations": n, "var": np.nan, "cvar": np.nan, "es": np.nan}
+
+        alpha = 1.0 - float(confidence_level)
+        if not (0 < alpha < 1):
+            return {"observations": n, "var": np.nan, "cvar": np.nan, "es": np.nan}
+
+        if method in ("historical", "hist", "empirical"):
+            var = float(np.quantile(r, alpha))
+            tail = r[r <= var]
+            es = float(tail.mean()) if len(tail) > 0 else np.nan
+            return {
+                "observations": n,
+                "var": var,
+                "cvar": es,
+                "es": es,
+                "tail_count": int(len(tail))
+            }
+
         mu = float(r.mean())
-        sigma = float(r.std(ddof=1)) if float(r.std(ddof=1)) > 0 else 1e-12
+        sigma = float(r.std(ddof=1))
+        if not np.isfinite(sigma) or sigma <= 0:
+            return {"observations": n, "var": np.nan, "cvar": np.nan, "es": np.nan}
 
-        if method == "historical":
-            var = float(np.percentile(r.values, p * 100.0))
-            tail = r[r <= var]
-            es = float(tail.mean()) if len(tail) > 0 else float(var)
-            cvar = es
+        z = float(stats.norm.ppf(alpha))
 
-        elif method in ("normal", "gaussian", "parametric"):
-            var, es = AdvancedAnalytics._var_es_gaussian(mu, sigma, p)
-            cvar = es
+        if method in ("gaussian", "normal", "parametric"):
+            var = mu + sigma * z
+            # ES under Normal: mu - sigma * phi(z) / alpha  (since z is negative for alpha<0.5)
+            es = mu - sigma * float(stats.norm.pdf(z)) / alpha
+            return {
+                "observations": n,
+                "var": float(var),
+                "cvar": float(es),
+                "es": float(es)
+            }
 
-        elif method in ("t", "student_t", "student-t"):
-            try:
-                df_hat, loc_hat, scale_hat = stats.t.fit(r.values)
-                df_hat = float(max(df_hat, 2.05))
-                var, es = AdvancedAnalytics._var_es_student_t(df_hat, float(loc_hat), float(scale_hat), p)
-                cvar = es
-            except Exception:
-                var, es = AdvancedAnalytics._var_es_gaussian(mu, sigma, p)
-                cvar = es
-
-        elif method in ("cornish_fisher", "cornish-fisher", "cf"):
-            s = float(stats.skew(r.values, bias=False))
-            k = float(stats.kurtosis(r.values, fisher=True, bias=False))
-            z = float(stats.norm.ppf(p))
-            z_cf = (z
-                    + (1.0 / 6.0) * (z ** 2 - 1.0) * s
-                    + (1.0 / 24.0) * (z ** 3 - 3.0 * z) * k
-                    - (1.0 / 36.0) * (2.0 * z ** 3 - 5.0 * z) * (s ** 2))
+        if method in ("cornish-fisher", "cornish_fisher", "cf"):
+            s = float(r.skew())
+            k = float(r.kurtosis(fisher=False))  # Pearson kurtosis (normal=3)
+            z_cf = (
+                z
+                + (1.0 / 6.0) * (z * z - 1.0) * s
+                + (1.0 / 24.0) * (z**3 - 3.0 * z) * (k - 3.0)
+                - (1.0 / 36.0) * (2.0 * z**3 - 5.0 * z) * (s**2)
+            )
             var = mu + sigma * z_cf
-            es = mu - sigma * stats.norm.pdf(z_cf) / max(p, 1e-12)  # approximation
-            cvar = es
+            # Approximate ES using adjusted z (practical approximation used in risk dashboards)
+            es = mu - sigma * float(stats.norm.pdf(z_cf)) / alpha
+            return {
+                "observations": n,
+                "var": float(var),
+                "cvar": float(es),
+                "es": float(es),
+                "skew": s,
+                "kurtosis": k
+            }
 
-        else:
-            var = float(np.percentile(r.values, p * 100.0))
-            tail = r[r <= var]
-            es = float(tail.mean()) if len(tail) > 0 else float(var)
-            cvar = es
-
-        return {"var": float(var), "cvar": float(cvar), "es": float(es)}
+        # Fallback to historical
+        var = float(np.quantile(r, alpha))
+        tail = r[r <= var]
+        es = float(tail.mean()) if len(tail) > 0 else np.nan
+        return {
+            "observations": n,
+            "var": var,
+            "cvar": es,
+            "es": es,
+            "tail_count": int(len(tail))
+        }
 
     @staticmethod
-    def build_var_cvar_es_table(asset_returns: pd.Series,
-                                benchmark_returns: Optional[pd.Series] = None,
-                                methods: Optional[List[str]] = None,
-                                confidence_levels: Optional[List[float]] = None,
-                                horizons: Optional[List[int]] = None) -> pd.DataFrame:
-        """Create an institutional table for Absolute and Relative VaR/CVaR/ES."""
-        methods = methods or ["historical", "gaussian", "student_t", "cornish_fisher"]
-        confidence_levels = confidence_levels or [0.95, 0.99]
-        horizons = horizons or [1]
-
-        asset_r = asset_returns.dropna()
-        bench_r = benchmark_returns.dropna() if isinstance(benchmark_returns, pd.Series) else None
-
-        rel_r = None
-        if bench_r is not None and not bench_r.empty:
-            aligned = pd.concat([asset_r.rename("asset"), bench_r.rename("bench")], axis=1, join="inner").dropna()
-            if not aligned.empty:
-                asset_r = aligned["asset"]
-                rel_r = aligned["asset"] - aligned["bench"]
-
+    def build_var_cvar_es_table(
+        returns: pd.Series,
+        confidence_levels: List[float],
+        methods: List[str],
+        horizons: List[int]
+    ) -> pd.DataFrame:
+        """Build a compact table of VaR/CVaR/ES across confidence levels, methods and horizons."""
         rows = []
         for h in horizons:
-            for conf in confidence_levels:
-                for mth in methods:
-                    out_abs = AdvancedAnalytics.compute_var_cvar_es(asset_r, conf, mth, horizon=h)
+            for cl in confidence_levels:
+                for m in methods:
+                    out = AdvancedAnalytics.compute_var_cvar_es(
+                        returns=returns, confidence_level=cl, method=m, horizon_days=h
+                    )
                     rows.append({
-                        "Type": "Absolute",
-                        "Method": mth,
-                        "Confidence": conf,
-                        "Horizon_Days": h,
-                        "VaR": out_abs["var"] * 100.0,
-                        "CVaR": out_abs["cvar"] * 100.0,
-                        "ES": out_abs["es"] * 100.0
+                        "Horizon (D)": int(h),
+                        "CL": f"{cl:.0%}",
+                        "Method": m,
+                        "Obs": int(out.get("observations", 0)),
+                        "VaR (%)": out.get("var", np.nan) * 100,
+                        "CVaR (%)": out.get("cvar", np.nan) * 100,
+                        "ES (%)": out.get("es", np.nan) * 100
                     })
-
-                    if rel_r is not None and (not rel_r.empty):
-                        out_rel = AdvancedAnalytics.compute_var_cvar_es(rel_r, conf, mth, horizon=h)
-                        rows.append({
-                            "Type": "Relative (Asset - Gold ETF)",
-                            "Method": mth,
-                            "Confidence": conf,
-                            "Horizon_Days": h,
-                            "VaR": out_rel["var"] * 100.0,
-                            "CVaR": out_rel["cvar"] * 100.0,
-                            "ES": out_rel["es"] * 100.0
-                        })
-
         df = pd.DataFrame(rows)
         if not df.empty:
-            df = df.sort_values(["Type", "Horizon_Days", "Confidence", "Method"]).reset_index(drop=True)
+            df = df.sort_values(["Horizon (D)", "CL", "Method"])
         return df
+
+    @staticmethod
+    def compute_relative_returns(asset_returns: pd.Series, benchmark_returns: pd.Series) -> pd.Series:
+        """Compute relative (excess) returns: asset - benchmark (aligned)."""
+        aligned = pd.concat(
+            [asset_returns.rename("asset"), benchmark_returns.rename("bench")],
+            axis=1, join="inner"
+        ).dropna()
+        if aligned.empty:
+            return pd.Series(dtype=float)
+        return aligned["asset"] - aligned["bench"]
+
+    @staticmethod
+    def rolling_risk_series(
+        returns: pd.Series,
+        window: int = 250,
+        confidence_level: float = 0.95,
+        method: str = "historical",
+        metric: str = "VaR",
+        horizon_days: int = 1
+    ) -> pd.Series:
+        """Rolling VaR/CVaR/ES series (percent decimals)."""
+        method = (method or "historical").lower().strip()
+        metric = (metric or "VaR").upper().strip()
+        r = AdvancedAnalytics._compound_horizon_returns(returns, horizon_days=horizon_days).dropna()
+        if len(r) < window + 10:
+            return pd.Series(dtype=float)
+
+        alpha = 1.0 - float(confidence_level)
+
+        if method in ("historical", "hist", "empirical"):
+            if metric == "VAR":
+                s = r.rolling(window).quantile(alpha)
+                return s.dropna()
+            # CVaR/ES: rolling apply (slower but robust)
+            def _tail_mean(x):
+                v = np.quantile(x, alpha)
+                tail = x[x <= v]
+                return float(np.mean(tail)) if tail.size else np.nan
+            s = r.rolling(window).apply(_tail_mean, raw=True)
+            return s.dropna()
+
+        if method in ("gaussian", "normal", "parametric"):
+            mu = r.rolling(window).mean()
+            sig = r.rolling(window).std(ddof=1)
+            z = float(stats.norm.ppf(alpha))
+            if metric == "VAR":
+                s = mu + sig * z
+                return s.dropna()
+            # ES under Normal
+            s = mu - sig * float(stats.norm.pdf(z)) / alpha
+            return s.dropna()
+
+        if method in ("cornish-fisher", "cornish_fisher", "cf"):
+            mu = r.rolling(window).mean()
+            sig = r.rolling(window).std(ddof=1)
+            sk = r.rolling(window).skew()
+            ku = r.rolling(window).kurt() + 3.0  # convert fisher->pearson
+            z = float(stats.norm.ppf(alpha))
+            z_cf = (
+                z
+                + (1.0 / 6.0) * (z * z - 1.0) * sk
+                + (1.0 / 24.0) * (z**3 - 3.0 * z) * (ku - 3.0)
+                - (1.0 / 36.0) * (2.0 * z**3 - 5.0 * z) * (sk**2)
+            )
+            if metric == "VAR":
+                s = mu + sig * z_cf
+                return s.dropna()
+            # Approx ES with adjusted z
+            s = mu - sig * float(stats.norm.pdf(z_cf)) / alpha
+            return s.dropna()
+
+        # Fallback to historical VaR
+        if metric == "VAR":
+            return r.rolling(window).quantile(alpha).dropna()
+
+        def _tail_mean(x):
+            v = np.quantile(x, alpha)
+            tail = x[x <= v]
+            return float(np.mean(tail)) if tail.size else np.nan
+
+        return r.rolling(window).apply(_tail_mean, raw=True).dropna()
+
+    @staticmethod
+    def advanced_var_backtest(
+        returns: pd.Series,
+        var_method: str = "historical",
+        confidence_level: float = 0.95,
+        window: int = 250,
+        horizon_days: int = 1
+    ) -> Dict[str, Any]:
+        """Advanced VaR backtest returning aligned Series + diagnostics."""
+        r = AdvancedAnalytics._compound_horizon_returns(returns, horizon_days=horizon_days).dropna()
+        if len(r) < window + 50:
+            return {}
+
+        var_s = AdvancedAnalytics.rolling_risk_series(
+            r, window=window, confidence_level=confidence_level, method=var_method, metric="VaR", horizon_days=1
+        )
+
+        if var_s.empty:
+            return {}
+
+        # Align: var_s is indexed at rolling window end. Compare returns on same dates.
+        r_aligned = r.reindex(var_s.index).dropna()
+        var_s = var_s.reindex(r_aligned.index).dropna()
+
+        if r_aligned.empty or var_s.empty:
+            return {}
+
+        hits_s = (r_aligned < var_s).astype(bool)
+        hits_array = hits_s.values
+        n = len(hits_array)
+        x = int(hits_array.sum())
+        expected = (1.0 - confidence_level) * n
+
+        # Kupiec POF test
+        if x > 0 and n - x > 0:
+            p_hat = x / n
+            p = 1.0 - confidence_level
+            L0 = (1 - p) ** (n - x) * p ** x
+            L1 = (1 - p_hat) ** (n - x) * p_hat ** x
+            LR = -2 * np.log(L0 / L1)
+            kupiec_pval = 1 - stats.chi2.cdf(LR, 1)
+        else:
+            LR = 0.0
+            kupiec_pval = 1.0
+
+        # Christoffersen independence test
+        LR_ind = 0.0
+        christoffersen_pval = 1.0
+        if n >= 2:
+            transitions = np.zeros((2, 2))
+            for i in range(1, n):
+                prev = int(hits_array[i - 1])
+                curr = int(hits_array[i])
+                transitions[prev, curr] += 1
+
+            n00, n01 = transitions[0, 0], transitions[0, 1]
+            n10, n11 = transitions[1, 0], transitions[1, 1]
+
+            if (n00 + n01) > 0 and (n10 + n11) > 0:
+                p01 = n01 / (n00 + n01)
+                p11 = n11 / (n10 + n11)
+                p1 = (n01 + n11) / n
+
+                L0 = (1 - p1) ** (n00 + n10) * p1 ** (n01 + n11)
+                L1 = (1 - p01) ** n00 * p01 ** n01 * (1 - p11) ** n10 * p11 ** n11
+
+                LR_ind = -2 * np.log(L0 / L1)
+                christoffersen_pval = 1 - stats.chi2.cdf(LR_ind, 1)
+
+        rolling_breach_rate = hits_s.rolling(50).mean() * 100
+
+        return {
+            "observations": n,
+            "breaches": x,
+            "breach_rate": (x / n) * 100 if n > 0 else np.nan,
+            "expected_breaches": expected,
+            "kupiec_stat": float(LR),
+            "kupiec_pval": float(kupiec_pval),
+            "christoffersen_stat": float(LR_ind),
+            "christoffersen_pval": float(christoffersen_pval),
+            "returns": r_aligned,
+            "var_series": var_s,
+            "hits": hits_s,
+            "rolling_breach_rate": rolling_breach_rate,
+            "cumulative_breaches": hits_s.cumsum()
+        }
 
 # =============================================================================
 # VISUALIZATION ENGINE
@@ -1216,139 +1314,6 @@ class EnhancedVisualization:
 
         return fig
 
-
-
-def create_garch_conditional_volatility_chart(self,
-                                             cond_vol: pd.Series,
-                                             title: str = "GARCH Conditional Volatility") -> go.Figure:
-    """Standalone view of GARCH conditional volatility (single-series chart)."""
-    fig = go.Figure()
-    if cond_vol is None:
-        return fig
-
-    v = pd.Series(cond_vol).dropna()
-    if v.empty:
-        return fig
-
-    fig.add_trace(go.Scatter(
-        x=v.index,
-        y=v.values * 100.0,
-        name="GARCH Conditional Vol (%)",
-        line=dict(color=self.colors["primary"], width=2),
-        fill="tozeroy",
-        fillcolor="rgba(0,0,0,0.06)"
-    ))
-
-    fig.update_layout(
-        title=title,
-        height=420,
-        template="plotly_white",
-        hovermode="x unified",
-        yaxis_title="Annualized Volatility (%)",
-        xaxis_title="Date"
-    )
-    fig.update_xaxes(rangeslider_visible=True)
-    return fig
-
-
-def create_bollinger_breach_chart(self,
-                                  series: pd.Series,
-                                  window: int = 20,
-                                  k: float = 2.0,
-                                  title: str = "Bollinger Bands Breach") -> go.Figure:
-    """Bollinger bands breach visualization for a daily log-difference (or return) series."""
-    fig = go.Figure()
-    if series is None:
-        return fig
-
-    s = pd.Series(series).dropna()
-    if s.empty:
-        return fig
-
-    w = int(max(5, min(int(window), len(s))))
-    k = float(max(0.5, min(float(k), 5.0)))
-
-    ma = s.rolling(w).mean()
-    sd = s.rolling(w).std(ddof=0)
-    upper = ma + k * sd
-    lower = ma - k * sd
-
-    dfb = pd.DataFrame({
-        "val": s.values,
-        "ma": ma.values,
-        "upper": upper.values,
-        "lower": lower.values
-    }, index=s.index).dropna()
-
-    if dfb.empty:
-        return fig
-
-    breach_up = dfb["val"] > dfb["upper"]
-    breach_lo = dfb["val"] < dfb["lower"]
-
-    # Band shading (no visible lines)
-    fig.add_trace(go.Scatter(
-        x=dfb.index, y=dfb["upper"],
-        mode="lines",
-        line=dict(width=0),
-        hoverinfo="skip",
-        showlegend=False
-    ))
-    fig.add_trace(go.Scatter(
-        x=dfb.index, y=dfb["lower"],
-        mode="lines",
-        line=dict(width=0),
-        fill="tonexty",
-        fillcolor="rgba(120,120,120,0.14)",
-        name="Bollinger Band",
-        hoverinfo="skip"
-    ))
-
-    # Daily series as bars for a clear breach view
-    fig.add_trace(go.Bar(
-        x=dfb.index,
-        y=dfb["val"],
-        name="Daily Log Difference",
-        opacity=0.85
-    ))
-
-    # Rolling mean (reference)
-    fig.add_trace(go.Scatter(
-        x=dfb.index,
-        y=dfb["ma"],
-        name="Rolling Mean",
-        line=dict(width=1.5, dash="dot")
-    ))
-
-    # Breach markers
-    if breach_up.any():
-        fig.add_trace(go.Scatter(
-            x=dfb.index[breach_up],
-            y=dfb.loc[breach_up, "val"],
-            mode="markers",
-            name="Upper Breach",
-            marker=dict(size=8, symbol="triangle-up")
-        ))
-    if breach_lo.any():
-        fig.add_trace(go.Scatter(
-            x=dfb.index[breach_lo],
-            y=dfb.loc[breach_lo, "val"],
-            mode="markers",
-            name="Lower Breach",
-            marker=dict(size=8, symbol="triangle-down")
-        ))
-
-    fig.update_layout(
-        title=title,
-        height=520,
-        template="plotly_white",
-        hovermode="x unified",
-        yaxis_title="Log Difference",
-        xaxis_title="Date",
-        bargap=0.05
-    )
-    fig.update_xaxes(rangeslider_visible=True)
-    return fig
     def create_regime_chart(self, price: pd.Series, regimes: Union[np.ndarray, pd.Series],
                             regime_labels: Dict[int, str], title: str) -> go.Figure:
         """Create regime visualization chart (supports Series-aligned regimes)."""
@@ -1458,241 +1423,6 @@ def create_bollinger_breach_chart(self,
 
         return fig
 
-
-    def create_advanced_backtest_chart(self,
-                                       returns: pd.Series,
-                                       var_series: Union[List[float], pd.Series],
-                                       hits: Union[np.ndarray, pd.Series],
-                                       title: str,
-                                       expected_rate: Optional[float] = None) -> go.Figure:
-        """Advanced backtesting visualization:
-        1) Returns with VaR and breach markers
-        2) Hit sequence (0/1) bars
-        3) Rolling breach rate vs expected
-        """
-        if isinstance(var_series, pd.Series):
-            var_s = var_series.dropna()
-            ret_s = returns.reindex(var_s.index).dropna()
-            x = var_s.index
-            hits_s = hits.reindex(x) if isinstance(hits, pd.Series) else pd.Series(hits, index=x)
-            hits_s = hits_s.astype(bool).reindex(x).fillna(False)
-        else:
-            var_arr = np.array(var_series, dtype=float)
-            start_idx = len(returns) - len(var_arr)
-            start_idx = max(start_idx, 0)
-            x = returns.index[start_idx:]
-            var_s = pd.Series(var_arr, index=x).dropna()
-            ret_s = returns.reindex(var_s.index).dropna()
-            hits_s = hits.reindex(var_s.index) if isinstance(hits, pd.Series) else pd.Series(hits, index=var_s.index)
-            hits_s = hits_s.astype(bool).reindex(var_s.index).fillna(False)
-
-        df = pd.DataFrame({"ret": ret_s, "var": var_s, "hit": hits_s}).dropna()
-        if df.empty:
-            return go.Figure()
-
-        if expected_rate is None:
-            expected_rate = max(min(float(df["hit"].mean()), 0.5), 1e-6)
-
-        roll_win = max(min(60, len(df)), 20)
-        df["roll_hit_rate"] = df["hit"].rolling(roll_win).mean() * 100.0
-
-        fig = make_subplots(
-            rows=3, cols=1,
-            shared_xaxes=True,
-            vertical_spacing=0.04,
-            row_heights=[0.55, 0.20, 0.25],
-            subplot_titles=(
-                "Returns & VaR (Breaches highlighted)",
-                "Hit Sequence (1 = breach)",
-                f"Rolling Breach Rate ({roll_win}D) vs Expected"
-            )
-        )
-
-        fig.add_trace(go.Scatter(
-            x=df.index, y=df["ret"] * 100.0, name="Return (%)",
-            mode="lines", line=dict(width=1.2)
-        ), row=1, col=1)
-
-        fig.add_trace(go.Scatter(
-            x=df.index, y=df["var"] * 100.0, name="VaR Threshold (%)",
-            mode="lines", line=dict(width=1.5, dash="dash")
-        ), row=1, col=1)
-
-        breaches = df[df["hit"]]
-        if not breaches.empty:
-            fig.add_trace(go.Scatter(
-                x=breaches.index, y=breaches["ret"] * 100.0,
-                name="Breaches", mode="markers",
-                marker=dict(size=6, symbol="x")
-            ), row=1, col=1)
-
-        fig.add_trace(go.Bar(
-            x=df.index,
-            y=df["hit"].astype(int),
-            name="Hit (0/1)",
-            opacity=0.8
-        ), row=2, col=1)
-
-        fig.add_trace(go.Scatter(
-            x=df.index,
-            y=df["roll_hit_rate"],
-            name="Rolling Breach Rate (%)",
-            mode="lines",
-            line=dict(width=1.8)
-        ), row=3, col=1)
-
-        fig.add_trace(go.Scatter(
-            x=df.index,
-            y=np.full(len(df), expected_rate * 100.0),
-            name="Expected Rate (%)",
-            mode="lines",
-            line=dict(width=1.2, dash="dot")
-        ), row=3, col=1)
-
-        fig.update_layout(
-            title=title,
-            height=820,
-            template="plotly_white",
-            hovermode="x unified",
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-        )
-        fig.update_yaxes(title_text="Return (%)", row=1, col=1)
-        fig.update_yaxes(title_text="Hit", row=2, col=1, range=[-0.05, 1.25])
-        fig.update_yaxes(title_text="Breach Rate (%)", row=3, col=1)
-        fig.update_xaxes(title_text="Date", row=3, col=1)
-        return fig
-
-    def create_var_cvar_es_comparison_chart(self, risk_table: pd.DataFrame, title: str) -> go.Figure:
-        """Create comparative charts for VaR/CVaR/ES across methods and types."""
-        if risk_table is None or risk_table.empty:
-            return go.Figure()
-
-        df = risk_table.copy()
-        df["Confidence"] = df["Confidence"].apply(lambda x: f"{float(x):.0%}")
-        df["Horizon_Days"] = df["Horizon_Days"].astype(int)
-
-        long_df = df.melt(
-            id_vars=["Type", "Method", "Confidence", "Horizon_Days"],
-            value_vars=["VaR", "CVaR", "ES"],
-            var_name="Metric",
-            value_name="Value"
-        )
-
-        if long_df[["Confidence", "Horizon_Days"]].drop_duplicates().shape[0] > 1:
-            first = long_df[["Confidence", "Horizon_Days"]].drop_duplicates().iloc[0]
-            long_df = long_df[(long_df["Confidence"] == first["Confidence"]) &
-                              (long_df["Horizon_Days"] == first["Horizon_Days"])]
-
-        fig = make_subplots(rows=1, cols=3, shared_yaxes=False,
-                            subplot_titles=("VaR (%)", "CVaR (%)", "ES (%)"))
-
-        for j, metric in enumerate(["VaR", "CVaR", "ES"], start=1):
-            part = long_df[long_df["Metric"] == metric]
-            for t in part["Type"].unique():
-                p2 = part[part["Type"] == t]
-                fig.add_trace(go.Bar(
-                    x=p2["Method"],
-                    y=p2["Value"],
-                    name=t,
-                    showlegend=(j == 1),
-                    opacity=0.9
-                ), row=1, col=j)
-            fig.update_xaxes(title_text="Method", row=1, col=j)
-
-        fig.update_layout(
-            title=title,
-            height=480,
-            template="plotly_white",
-            barmode="group",
-            hovermode="x unified",
-            legend=dict(orientation="h", yanchor="bottom", y=1.10, xanchor="right", x=1)
-        )
-        return fig
-
-
-def create_conditional_vol_band_chart(self,
-                                      cond_vol: pd.Series,
-                                      band_window: int = 60,
-                                      band_level: float = 0.90,
-                                      title: str = "Conditional Volatility Bands") -> go.Figure:
-    """Non-line visualization of conditional volatility with upper/lower bounds.
-    Uses rolling quantile bands and displays conditional volatility as bars (not a line).
-    Adds breach markers and shaded band for a clearer institutional view.
-    """
-    if cond_vol is None:
-        return go.Figure()
-
-    v = pd.Series(cond_vol).dropna()
-    if v.empty:
-        return go.Figure()
-
-    w = int(max(10, min(int(band_window), len(v))))
-    level = float(min(max(float(band_level), 0.60), 0.99))
-    lo_q = (1.0 - level) / 2.0
-    hi_q = 1.0 - lo_q
-
-    lower = v.rolling(w).quantile(lo_q)
-    upper = v.rolling(w).quantile(hi_q)
-
-    df2 = pd.DataFrame({"vol": v, "lower": lower, "upper": upper}).dropna()
-    if df2.empty:
-        return go.Figure()
-
-    breach_up = df2["vol"] > df2["upper"]
-    breach_lo = df2["vol"] < df2["lower"]
-    breach_any = breach_up | breach_lo
-
-    fig = go.Figure()
-
-    # Shaded band (no visible boundary lines)
-    fig.add_trace(go.Scatter(
-        x=df2.index,
-        y=df2["upper"] * 100.0,
-        mode="lines",
-        line=dict(width=0),
-        hoverinfo="skip",
-        showlegend=False
-    ))
-    fig.add_trace(go.Scatter(
-        x=df2.index,
-        y=df2["lower"] * 100.0,
-        mode="lines",
-        line=dict(width=0),
-        fill="tonexty",
-        fillcolor="rgba(120,120,120,0.16)",
-        name=f"{int(level*100)}% Band",
-        hoverinfo="skip"
-    ))
-
-    # Conditional volatility as bars (non-line view)
-    fig.add_trace(go.Bar(
-        x=df2.index,
-        y=df2["vol"] * 100.0,
-        name="Conditional Vol (%)",
-        opacity=0.88
-    ))
-
-    # Breach markers (non-line)
-    if breach_any.any():
-        fig.add_trace(go.Scatter(
-            x=df2.index[breach_any],
-            y=(df2.loc[breach_any, "vol"] * 100.0),
-            mode="markers",
-            name="Band Breach",
-            marker=dict(size=8, symbol="x")
-        ))
-
-    fig.update_layout(
-        title=title,
-        height=560,
-        template="plotly_white",
-        hovermode="x unified",
-        yaxis_title="Volatility (%)",
-        xaxis_title="Date",
-        bargap=0.05
-    )
-    fig.update_xaxes(rangeslider_visible=True)
-    return fig
     def create_correlation_heatmap(self, corr_matrix: pd.DataFrame, title: str) -> go.Figure:
         """Create correlation heatmap"""
         fig = go.Figure(data=go.Heatmap(
@@ -1712,6 +1442,204 @@ def create_conditional_vol_band_chart(self,
             template="plotly_white"
         )
 
+        return fig
+
+
+    # -------------------------------------------------------------------------
+    # Advanced Risk Visuals: VaR/CVaR/ES comparisons, advanced backtest, GARCH band
+    # -------------------------------------------------------------------------
+
+    def create_risk_comparison_bars(
+        self,
+        summary_df: pd.DataFrame,
+        title: str = "VaR / CVaR / ES Comparison"
+    ) -> go.Figure:
+        """Grouped bar chart comparing VaR/CVaR/ES across entities (Asset/Benchmark/Relative)."""
+        # Expected columns: Entity, VaR (%), CVaR (%), ES (%)
+        fig = go.Figure()
+
+        if summary_df is None or summary_df.empty:
+            fig.update_layout(title=title, template="plotly_white", height=420)
+            return fig
+
+        entities = summary_df["Entity"].astype(str).tolist()
+
+        for metric in ["VaR (%)", "CVaR (%)", "ES (%)"]:
+            if metric in summary_df.columns:
+                fig.add_trace(go.Bar(
+                    x=entities,
+                    y=summary_df[metric].values,
+                    name=metric.replace(" (%)", "")
+                ))
+
+        fig.update_layout(
+            title=title,
+            height=420,
+            template="plotly_white",
+            barmode="group",
+            hovermode="x unified",
+            yaxis_title="Risk (%)"
+        )
+        return fig
+
+    def create_rolling_risk_chart(
+        self,
+        series_map: Dict[str, pd.Series],
+        title: str = "Rolling Risk",
+        yaxis_title: str = "Risk (%)"
+    ) -> go.Figure:
+        """Multi-line rolling risk chart."""
+        fig = go.Figure()
+
+        for name, s in (series_map or {}).items():
+            if s is None or len(s) == 0:
+                continue
+            fig.add_trace(go.Scatter(
+                x=s.index,
+                y=s.values * 100,
+                name=str(name),
+                line=dict(width=2)
+            ))
+
+        fig.update_layout(
+            title=title,
+            height=450,
+            template="plotly_white",
+            hovermode="x unified",
+            yaxis_title=yaxis_title,
+            xaxis_title="Date"
+        )
+        return fig
+
+    def create_advanced_backtest_chart(
+        self,
+        returns: pd.Series,
+        var_series: pd.Series,
+        hits: pd.Series,
+        confidence_level: float,
+        title: str = "Advanced VaR Backtest"
+    ) -> go.Figure:
+        """Advanced backtest chart with breaches + cumulative breaches."""
+        fig = make_subplots(
+            rows=2, cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.08,
+            row_heights=[0.65, 0.35],
+            subplot_titles=("Returns vs VaR (Breaches highlighted)", "Cumulative Breaches vs Expected")
+        )
+
+        if returns is None or var_series is None or returns.empty or var_series.empty:
+            fig.update_layout(title=title, height=650, template="plotly_white")
+            return fig
+
+        r = returns.reindex(var_series.index).dropna()
+        v = var_series.reindex(r.index).dropna()
+        h = hits.reindex(r.index).fillna(False).astype(bool)
+
+        fig.add_trace(go.Scatter(
+            x=r.index,
+            y=r.values * 100,
+            name="Returns",
+            line=dict(width=1)
+        ), row=1, col=1)
+
+        fig.add_trace(go.Scatter(
+            x=v.index,
+            y=v.values * 100,
+            name=f"VaR ({confidence_level:.0%})",
+            line=dict(color=self.colors["danger"], width=2, dash="dash")
+        ), row=1, col=1)
+
+        breach_dates = r.index[h.values]
+        breach_returns = r.values[h.values] * 100
+        fig.add_trace(go.Scatter(
+            x=breach_dates,
+            y=breach_returns,
+            mode="markers",
+            name="Breaches",
+            marker=dict(size=8, color=self.colors["danger"], symbol="x")
+        ), row=1, col=1)
+
+        cum_breaches = h.cumsum()
+        expected = (1.0 - confidence_level) * np.arange(1, len(h) + 1)
+
+        fig.add_trace(go.Scatter(
+            x=h.index,
+            y=cum_breaches.values,
+            name="Cumulative Breaches",
+            line=dict(width=2)
+        ), row=2, col=1)
+
+        fig.add_trace(go.Scatter(
+            x=h.index,
+            y=expected,
+            name="Expected",
+            line=dict(dash="dot", width=2)
+        ), row=2, col=1)
+
+        fig.update_layout(
+            title=title,
+            height=700,
+            template="plotly_white",
+            hovermode="x unified"
+        )
+        fig.update_yaxes(title_text="Return (%)", row=1, col=1)
+        fig.update_yaxes(title_text="Count", row=2, col=1)
+        return fig
+
+    def create_garch_volatility_band(
+        self,
+        cond_vol: pd.Series,
+        title: str = "GARCH Conditional Volatility Band",
+        window: int = 120,
+        lower_q: float = 0.05,
+        upper_q: float = 0.95
+    ) -> go.Figure:
+        """Shaded volatility band around conditional volatility using rolling quantiles."""
+        fig = go.Figure()
+
+        if cond_vol is None or len(cond_vol) < max(60, window):
+            fig.update_layout(title=title, height=450, template="plotly_white")
+            return fig
+
+        s = cond_vol.dropna()
+        low = s.rolling(window).quantile(lower_q)
+        high = s.rolling(window).quantile(upper_q)
+
+        # Shaded band
+        fig.add_trace(go.Scatter(
+            x=low.index,
+            y=(low.values * 100),
+            name=f"Lower ({lower_q:.0%})",
+            line=dict(width=0),
+            showlegend=True
+        ))
+        fig.add_trace(go.Scatter(
+            x=high.index,
+            y=(high.values * 100),
+            name=f"Upper ({upper_q:.0%})",
+            fill="tonexty",
+            line=dict(width=0),
+            opacity=0.25,
+            showlegend=True
+        ))
+
+        # Center line
+        fig.add_trace(go.Scatter(
+            x=s.index,
+            y=s.values * 100,
+            name="Conditional Vol",
+            line=dict(color=self.colors["primary"], width=2)
+        ))
+
+        fig.update_layout(
+            title=title,
+            height=450,
+            template="plotly_white",
+            hovermode="x unified",
+            yaxis_title="Annualized Vol (%)",
+            xaxis_title="Date"
+        )
         return fig
 
 # =============================================================================
@@ -1734,16 +1662,16 @@ class InstitutionalCommoditiesDashboard:
             "asset_data": {},
             "returns_data": {},
             "benchmark_data": {},
+            "relative_benchmark_ticker": "GLD",
             "selected_assets": [],
             "portfolio_weights": {},
             "garch_results": {},
             "regime_results": {},
             "portfolio_results": {},
             "backtest_results": {},
-            "champion_models": {},
-            "relative_backtest_results": {},
-            "gold_benchmark_symbol": "GLD"
-                }
+            "advanced_backtest_results": {},
+            "champion_models": {}
+        }
 
         for key, value in defaults.items():
             if key not in st.session_state:
@@ -1825,12 +1753,21 @@ class InstitutionalCommoditiesDashboard:
                 default=[0.95, 0.99]
             )
 
+            st.markdown("**Relative Risk Benchmark (Gold ETF)**")
+            relative_benchmark = st.selectbox(
+                "Gold ETF Benchmark (Relative Risk)",
+                options=["GLD", "IAU", "GLDM", "SGOL", "BAR"],
+                index=0,
+                help="Used for Relative VaR/CVaR/ES (asset - benchmark) and relative VaR backtesting."
+            )
+
+
             backtest_window = st.slider("Backtest Window", 100, 500, 250, 25)
 
             st.markdown("</div>", unsafe_allow_html=True)
 
             if st.button("📥 Load Market Data", type="primary", use_container_width=True):
-                self._load_data(selected_assets, selected_benchmarks, start_date, end_date)
+                self._load_data(selected_assets, selected_benchmarks, start_date, end_date, relative_benchmark)
 
             if st.session_state.data_loaded:
                 if st.button("🔄 Clear Cache", type="secondary", use_container_width=True):
@@ -1847,11 +1784,12 @@ class InstitutionalCommoditiesDashboard:
                 "p_max": p_max if ARCH_AVAILABLE else 2,
                 "q_max": q_max if ARCH_AVAILABLE else 2,
                 "confidence_levels": confidence_levels,
+                "relative_benchmark": relative_benchmark,
                 "backtest_window": backtest_window
             }
 
     def _load_data(self, assets: List[str], benchmarks: List[str],
-                   start_date: datetime, end_date: datetime):
+                   start_date: datetime, end_date: datetime, relative_benchmark: str = "GLD"):
         """Load data for selected assets and benchmarks (adds diagnostics for failures)."""
         if not assets:
             st.warning("Please select at least one asset")
@@ -1865,7 +1803,7 @@ class InstitutionalCommoditiesDashboard:
 
             # Progress indicator (institutional UX)
             progress = st.progress(0)
-            total = max(len(assets) + len(benchmarks), 1)
+            total = max(len(assets) + len(benchmarks) + 1, 1)  # +1 for relative benchmark auto-load
             done = 0
 
             for symbol in assets:
@@ -1891,6 +1829,22 @@ class InstitutionalCommoditiesDashboard:
                     failed_bench.append(benchmark)
                 done += 1
                 progress.progress(min(done / total, 1.0))
+
+
+            # --- Relative Risk Benchmark (Gold ETF) auto-load ---
+            # Institutional requirement: compute Relative VaR/CVaR/ES vs most active US Gold ETF (default: GLD)
+            rel_ticker = (relative_benchmark or "GLD").strip().upper()
+            if rel_ticker:
+                if rel_ticker not in benchmark_data:
+                    df_rel = fetch_asset_data(rel_ticker, start_date, end_date)
+                    if not df_rel.empty and len(df_rel) >= 60 and "Returns" in df_rel.columns:
+                        benchmark_data[rel_ticker] = df_rel
+                    else:
+                        failed_bench.append(rel_ticker)
+                st.session_state.relative_benchmark_ticker = rel_ticker
+
+            done += 1
+            progress.progress(min(done / total, 1.0))
 
             progress.empty()
 
@@ -2280,75 +2234,32 @@ class InstitutionalCommoditiesDashboard:
 
                 fig = self.viz.create_volatility_chart(
                     returns,
-                    None,
+                    fit["cond_volatility"],
                     pd.Series(fit["forecast_volatility"]),
-                    f"{selected_asset} - Volatility Analysis"
+                    f"{selected_asset} - GARCH Volatility"
                 )
 
                 st.plotly_chart(fig, use_container_width=True)
 
-                # New standalone chart: GARCH conditional volatility only (moved out of the first chart)
-                st.subheader("GARCH Conditional Volatility")
 
-                fig_cond = self.viz.create_garch_conditional_volatility_chart(
-                    pd.Series(fit["cond_volatility"]),
-                    title=f"{selected_asset} - GARCH Conditional Volatility"
-                )
-                st.plotly_chart(fig_cond, use_container_width=True)
-
-
-                # Additional (non-line) visualization: Conditional Volatility with Upper/Lower Bounds
-                st.subheader("Conditional Volatility Bands (Non-Line View)")
-
-                b1, b2 = st.columns(2)
-                with b1:
-                    band_window = st.slider("Band Window (days)", 20, 252, 60, 10, key=f"band_window_{selected_asset}")
-                with b2:
-                    band_level = st.select_slider(
-                        "Band Level",
-                        options=[0.80, 0.90, 0.95, 0.99],
-                        value=0.90,
-                        format_func=lambda x: f"{x:.0%}",
-                        key=f"band_level_{selected_asset}"
-                    )
-
-                fig_band = self.viz.create_conditional_vol_band_chart(
-                    pd.Series(fit["cond_volatility"]),
-                    band_window=int(band_window),
-                    band_level=float(band_level),
-                    title=f"{selected_asset} - Conditional Volatility Bands"
-                )
-                st.plotly_chart(fig_band, use_container_width=True)
-
-                # Bollinger breaches on daily log difference (fourth chart)
-                st.subheader("Bollinger Bands Breach: Daily Log Difference")
-
-                bb1, bb2 = st.columns(2)
-                with bb1:
-                    bb_window = st.slider(
-                        "Bollinger Window (days)",
-                        10, 120, 20, 5,
-                        key=f"bb_window_{selected_asset}"
-                    )
-                with bb2:
-                    bb_k = st.slider(
-                        "Bollinger Std Dev Multiplier",
-                        1.0, 3.5, 2.0, 0.1,
-                        key=f"bb_k_{selected_asset}"
-                    )
-
-                log_diff = np.log(df["Adj Close"]).diff().dropna()
-
-                fig_bb = self.viz.create_bollinger_breach_chart(
-                    log_diff,
-                    window=int(bb_window),
-                    k=float(bb_k),
-                    title=f"{selected_asset} - Daily Log Difference Bollinger Breaches"
-                )
-                st.plotly_chart(fig_bb, use_container_width=True)
-
-
-
+            # --- Additional chart: Conditional Volatility with Upper/Lower Bounds (Band) ---
+            st.markdown("#### 📎 Conditional Volatility Band (Upper/Lower Bounds)")
+            band_window = st.slider(
+                "Band Window (days)",
+                min_value=60,
+                max_value=300,
+                value=120,
+                step=10,
+                key=f"garch_band_window_{selected_asset}"
+            )
+            fig_band = self.viz.create_garch_volatility_band(
+                fit["cond_volatility"],
+                title=f"{selected_asset} – GARCH Conditional Volatility Band (Rolling {band_window}D Quantiles)",
+                window=int(band_window),
+                lower_q=0.05,
+                upper_q=0.95
+            )
+            st.plotly_chart(fig_band, use_container_width=True)
 
         else:
             st.info("Run grid search to select and fit a champion GARCH model.")
@@ -2470,6 +2381,223 @@ class InstitutionalCommoditiesDashboard:
         """Display advanced analytics"""
         st.header("📈 Advanced Analytics")
 
+
+        if not st.session_state.returns_data:
+            st.info("Please load market data first to enable Advanced Analytics.")
+            return
+
+        # ---------------------------------------------------------------------
+        # Advanced VaR / CVaR / ES (Absolute + Relative vs Gold ETF Benchmark)
+        # ---------------------------------------------------------------------
+        st.subheader("📌 Advanced VaR / CVaR / ES (Absolute & Relative vs Gold ETF)")
+
+        rel_bench = config.get("relative_benchmark", st.session_state.get("relative_benchmark_ticker", "GLD"))
+        rel_bench = (rel_bench or "GLD").strip().upper()
+        st.caption(f"Relative risk benchmark: **{rel_bench}** (default = GLD, most active US Gold ETF).")
+
+        # Choose target (single asset vs portfolio)
+        target_mode = st.radio(
+            "Target",
+            ["Selected Asset", "Portfolio (Current Weights)"],
+            horizontal=True,
+            key="adv_risk_target_mode"
+        )
+
+        # Determine target returns
+        if target_mode.startswith("Portfolio"):
+            returns_df_port = pd.DataFrame(st.session_state.returns_data).dropna()
+            if returns_df_port.empty:
+                st.warning("Portfolio returns are not available (insufficient overlap).")
+                target_returns = pd.Series(dtype=float)
+            else:
+                w = np.array([st.session_state.portfolio_weights.get(a, 0.0) for a in returns_df_port.columns], dtype=float)
+                if w.sum() <= 0:
+                    w = np.ones(len(returns_df_port.columns)) / len(returns_df_port.columns)
+                else:
+                    w = w / w.sum()
+                target_returns = pd.Series(returns_df_port.values @ w, index=returns_df_port.index, name="Portfolio")
+                st.caption(f"Portfolio built from {len(returns_df_port.columns)} assets with normalized weights.")
+        else:
+            target_asset = st.selectbox(
+                "Asset for Advanced Risk Table",
+                options=st.session_state.selected_assets,
+                key="adv_risk_asset_select"
+            )
+            target_returns = st.session_state.returns_data.get(target_asset, pd.Series(dtype=float))
+
+        # Benchmark returns (Gold ETF)
+        bench_df = st.session_state.benchmark_data.get(rel_bench)
+        if bench_df is None or bench_df.empty or "Returns" not in bench_df.columns:
+            st.warning(f"Gold ETF benchmark **{rel_bench}** is not loaded. Re-run 'Load Market Data' and keep your date range wide enough.")
+            bench_returns = pd.Series(dtype=float)
+        else:
+            bench_returns = bench_df["Returns"].dropna()
+
+        rel_returns = self.analytics.compute_relative_returns(target_returns, bench_returns) if len(bench_returns) else pd.Series(dtype=float)
+
+        # Risk-table controls
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            risk_methods = st.multiselect(
+                "Methods",
+                ["historical", "gaussian", "cornish_fisher"],
+                default=["historical", "gaussian"],
+                key="adv_risk_methods"
+            )
+        with c2:
+            horizons = st.multiselect(
+                "Horizons (days)",
+                [1, 5, 10, 20],
+                default=[1, 10],
+                key="adv_risk_horizons"
+            )
+        with c3:
+            cls = st.multiselect(
+                "Confidence Levels",
+                sorted(list(set(config.get("confidence_levels", [0.95, 0.99])))),
+                default=sorted(list(set(config.get("confidence_levels", [0.95, 0.99])))),
+                key="adv_risk_cls"
+            )
+
+        if not risk_methods:
+            risk_methods = ["historical"]
+        if not horizons:
+            horizons = [1]
+        if not cls:
+            cls = [0.95]
+
+        # Build tables
+        tab_abs, tab_bench, tab_rel = st.tabs(["Absolute (Target)", f"Benchmark ({rel_bench})", "Relative (Target - Benchmark)"])
+
+        with tab_abs:
+            abs_tbl = self.analytics.build_var_cvar_es_table(target_returns, cls, risk_methods, horizons)
+            if abs_tbl.empty:
+                st.info("Not enough data to compute advanced risk table.")
+            else:
+                st.dataframe(
+                    abs_tbl.style.format({"VaR (%)": "{:.2f}", "CVaR (%)": "{:.2f}", "ES (%)": "{:.2f}"}),
+                    use_container_width=True
+                )
+
+        with tab_bench:
+            bench_tbl = self.analytics.build_var_cvar_es_table(bench_returns, cls, risk_methods, horizons) if len(bench_returns) else pd.DataFrame()
+            if bench_tbl.empty:
+                st.info("Benchmark risk table not available (benchmark returns missing).")
+            else:
+                st.dataframe(
+                    bench_tbl.style.format({"VaR (%)": "{:.2f}", "CVaR (%)": "{:.2f}", "ES (%)": "{:.2f}"}),
+                    use_container_width=True
+                )
+
+        with tab_rel:
+            rel_tbl = self.analytics.build_var_cvar_es_table(rel_returns, cls, risk_methods, horizons) if len(rel_returns) else pd.DataFrame()
+            if rel_tbl.empty:
+                st.info("Relative risk table not available (alignment / overlap issue).")
+            else:
+                st.dataframe(
+                    rel_tbl.style.format({"VaR (%)": "{:.2f}", "CVaR (%)": "{:.2f}", "ES (%)": "{:.2f}"}),
+                    use_container_width=True
+                )
+
+        # Comparative charts (single selection)
+        st.markdown("#### 📊 Comparative Charts (Target vs Benchmark vs Relative)")
+        c4, c5, c6 = st.columns(3)
+        with c4:
+            chart_method = st.selectbox("Chart Method", risk_methods, key="adv_risk_chart_method")
+        with c5:
+            chart_h = st.selectbox("Chart Horizon (days)", horizons, key="adv_risk_chart_h")
+        with c6:
+            chart_cl = st.selectbox("Chart CL", cls, format_func=lambda x: f"{x:.0%}", key="adv_risk_chart_cl")
+
+        out_abs = self.analytics.compute_var_cvar_es(target_returns, chart_cl, chart_method, horizon_days=int(chart_h))
+        out_b = self.analytics.compute_var_cvar_es(bench_returns, chart_cl, chart_method, horizon_days=int(chart_h)) if len(bench_returns) else {"var": np.nan, "cvar": np.nan, "es": np.nan}
+        out_rel = self.analytics.compute_var_cvar_es(rel_returns, chart_cl, chart_method, horizon_days=int(chart_h)) if len(rel_returns) else {"var": np.nan, "cvar": np.nan, "es": np.nan}
+
+        comp_df = pd.DataFrame([
+            {"Entity": "Target", "VaR (%)": out_abs.get("var", np.nan) * 100, "CVaR (%)": out_abs.get("cvar", np.nan) * 100, "ES (%)": out_abs.get("es", np.nan) * 100},
+            {"Entity": rel_bench, "VaR (%)": out_b.get("var", np.nan) * 100, "CVaR (%)": out_b.get("cvar", np.nan) * 100, "ES (%)": out_b.get("es", np.nan) * 100},
+            {"Entity": "Relative", "VaR (%)": out_rel.get("var", np.nan) * 100, "CVaR (%)": out_rel.get("cvar", np.nan) * 100, "ES (%)": out_rel.get("es", np.nan) * 100},
+        ])
+
+        fig_comp = self.viz.create_risk_comparison_bars(
+            comp_df,
+            title=f"{chart_method.title()} Risk @ {chart_cl:.0%} (H={chart_h}D)"
+        )
+        st.plotly_chart(fig_comp, use_container_width=True)
+
+        # Rolling risk chart (VaR only by default, for speed)
+        st.markdown("#### 📈 Rolling Risk (VaR) – Target / Benchmark / Relative")
+        rwin = st.slider("Rolling Window (days)", 60, 500, min(250, int(config.get("backtest_window", 250))), 10, key="adv_risk_roll_win")
+        roll_target = self.analytics.rolling_risk_series(target_returns, window=rwin, confidence_level=chart_cl, method=chart_method, metric="VaR", horizon_days=int(chart_h))
+        roll_bench = self.analytics.rolling_risk_series(bench_returns, window=rwin, confidence_level=chart_cl, method=chart_method, metric="VaR", horizon_days=int(chart_h)) if len(bench_returns) else pd.Series(dtype=float)
+        roll_rel = self.analytics.rolling_risk_series(rel_returns, window=rwin, confidence_level=chart_cl, method=chart_method, metric="VaR", horizon_days=int(chart_h)) if len(rel_returns) else pd.Series(dtype=float)
+
+        fig_roll = self.viz.create_rolling_risk_chart(
+            {"Target": roll_target, rel_bench: roll_bench, "Relative": roll_rel},
+            title=f"Rolling VaR ({chart_method.title()}, {chart_cl:.0%}, H={chart_h}D, Window={rwin}D)",
+            yaxis_title="VaR (%)"
+        )
+        st.plotly_chart(fig_roll, use_container_width=True)
+
+        st.markdown("#### 🧪 Advanced Backtesting (Absolute & Relative)")
+        bc1, bc2, bc3, bc4 = st.columns(4)
+        with bc1:
+            bt_method = st.selectbox("Backtest Method", ["historical", "gaussian", "cornish_fisher"], index=0, key="adv_bt_method_any")
+        with bc2:
+            bt_cl = st.selectbox("Backtest CL", cls, format_func=lambda x: f"{x:.0%}", key="adv_bt_cl_any")
+        with bc3:
+            bt_window = st.slider("Backtest Window", 60, 500, min(250, int(config.get("backtest_window", 250))), 10, key="adv_bt_window_any")
+        with bc4:
+            bt_h = st.selectbox("Backtest Horizon (days)", horizons, key="adv_bt_h_any")
+
+        if st.button("🚦 Run Advanced Backtests", key="adv_bt_run_any"):
+            with st.spinner("Running advanced backtests..."):
+                res_abs = self.analytics.advanced_var_backtest(
+                    returns=target_returns,
+                    var_method=bt_method,
+                    confidence_level=float(bt_cl),
+                    window=int(bt_window),
+                    horizon_days=int(bt_h)
+                )
+                res_rel = {}
+                if len(rel_returns):
+                    res_rel = self.analytics.advanced_var_backtest(
+                        returns=rel_returns,
+                        var_method=bt_method,
+                        confidence_level=float(bt_cl),
+                        window=int(bt_window),
+                        horizon_days=int(bt_h)
+                    )
+
+            bt_tabs = ["Absolute"]
+            if res_rel:
+                bt_tabs.append("Relative")
+            tabs_bt = st.tabs(bt_tabs)
+            with tabs_bt[0]:
+                if res_abs:
+                    fig_bt_abs = self.viz.create_advanced_backtest_chart(
+                        returns=res_abs["returns"],
+                        var_series=res_abs["var_series"],
+                        hits=res_abs["hits"],
+                        confidence_level=float(bt_cl),
+                        title=f"Advanced VaR Backtest – Absolute ({bt_method.title()}, {bt_cl:.0%})"
+                    )
+                    st.plotly_chart(fig_bt_abs, use_container_width=True)
+                else:
+                    st.info("Absolute advanced backtest not available (insufficient data).")
+            if res_rel and len(tabs_bt) > 1:
+                with tabs_bt[1]:
+                    fig_bt_rel = self.viz.create_advanced_backtest_chart(
+                        returns=res_rel["returns"],
+                        var_series=res_rel["var_series"],
+                        hits=res_rel["hits"],
+                        confidence_level=float(bt_cl),
+                        title=f"Advanced VaR Backtest – Relative vs {rel_bench} ({bt_method.title()}, {bt_cl:.0%})"
+                    )
+                    st.plotly_chart(fig_bt_rel, use_container_width=True)
+
+        st.divider()
+
         st.subheader("✅ VaR Backtesting")
 
         selected_asset = st.selectbox(
@@ -2548,169 +2676,86 @@ class InstitutionalCommoditiesDashboard:
             st.plotly_chart(fig, use_container_width=True)
 
 
-        # ---------------------------------------------------------------------
-        # ADVANCED VaR / CVaR / ES + RELATIVE RISK vs Most Active US Gold ETF
-        # ---------------------------------------------------------------------
-        st.subheader("🧮 Advanced VaR / CVaR / ES (Absolute + Relative vs Gold ETF)")
+            # -----------------------------------------------------------------
+            # Advanced Backtesting (Absolute + Relative vs Gold ETF) + New Chart
+            # -----------------------------------------------------------------
+            st.subheader("🧪 Advanced Backtesting Chart (Absolute & Relative vs Gold ETF)")
 
-        # Select the most active Gold ETF benchmark (by avg $ volume) for the period
-        try:
-            gold_sym, gold_df = select_most_active_gold_etf(config["start_date"], config["end_date"])
-        except Exception:
-            gold_sym, gold_df = "GLD", pd.DataFrame()
+            rel_bench = config.get("relative_benchmark", st.session_state.get("relative_benchmark_ticker", "GLD"))
+            rel_bench = (rel_bench or "GLD").strip().upper()
+            bench_df = st.session_state.benchmark_data.get(rel_bench)
+            bench_returns = bench_df["Returns"].dropna() if bench_df is not None and not bench_df.empty and "Returns" in bench_df.columns else pd.Series(dtype=float)
 
-        gold_returns = pd.Series(dtype=float)
-        if isinstance(gold_df, pd.DataFrame) and (not gold_df.empty) and ("Returns" in gold_df.columns):
-            gold_returns = gold_df["Returns"].dropna()
-        elif "GLD" in st.session_state.benchmark_data and "Returns" in st.session_state.benchmark_data["GLD"].columns:
-            gold_sym = "GLD"
-            gold_returns = st.session_state.benchmark_data["GLD"]["Returns"].dropna()
-
-        st.session_state.gold_benchmark_symbol = gold_sym
-        if not gold_returns.empty:
-            st.caption(f"Gold ETF benchmark selected (most active): **{gold_sym}**")
-        else:
-            st.caption("Gold ETF benchmark unavailable for the selected date range (try extending the range).")
-
-        # Controls
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            adv_methods = st.multiselect(
-                "Methods",
-                ["historical", "gaussian", "student_t", "cornish_fisher"],
-                default=["historical", "gaussian", "cornish_fisher"]
+            adv_abs = self.analytics.advanced_var_backtest(
+                returns=returns,
+                var_method=var_method,
+                confidence_level=confidence_level,
+                window=int(window),
+                horizon_days=1
             )
-        with c2:
-            adv_conf = st.multiselect(
-                "Confidence",
-                config["confidence_levels"] if config.get("confidence_levels") else [0.95, 0.99],
-                default=config["confidence_levels"] if config.get("confidence_levels") else [0.95, 0.99],
-                format_func=lambda x: f"{x:.0%}"
-            )
-        with c3:
-            adv_horizon = st.selectbox("Horizon (days)", options=[1, 5, 10, 20], index=0)
-        with c4:
-            show_table = st.checkbox("Show Risk Table", value=True)
 
-        aligned = None
-        if not gold_returns.empty:
-            aligned = pd.concat([returns.rename("asset"), gold_returns.rename("gold")], axis=1, join="inner").dropna()
-
-        if show_table:
-            if aligned is not None and len(aligned) >= 100:
-                risk_df = self.analytics.build_var_cvar_es_table(
-                    aligned["asset"],
-                    aligned["gold"],
-                    methods=adv_methods,
-                    confidence_levels=adv_conf,
-                    horizons=[int(adv_horizon)]
+            adv_tabs = ["Absolute Backtest"]
+            if len(bench_returns):
+                rel_series = self.analytics.compute_relative_returns(returns, bench_returns)
+                adv_rel = self.analytics.advanced_var_backtest(
+                    returns=rel_series,
+                    var_method=var_method,
+                    confidence_level=confidence_level,
+                    window=int(window),
+                    horizon_days=1
                 )
-                if not risk_df.empty:
-                    st.dataframe(
-                        risk_df.style.format({
-                            "Confidence": "{:.0%}",
-                            "VaR": "{:.2f}%",
-                            "CVaR": "{:.2f}%",
-                            "ES": "{:.2f}%"
-                        }),
-                        use_container_width=True
-                    )
-
-                    fig_risk = self.viz.create_var_cvar_es_comparison_chart(
-                        risk_df,
-                        title=f"{selected_asset}: VaR/CVaR/ES Comparison (H={adv_horizon}D)"
-                    )
-                    st.plotly_chart(fig_risk, use_container_width=True)
-                else:
-                    st.info("Risk table could not be computed (insufficient data after alignment).")
+                adv_tabs.append(f"Relative vs {rel_bench}")
             else:
-                st.info("Relative risk requires sufficient overlapping data between the asset and the Gold ETF benchmark.")
+                adv_rel = {}
 
-        # ---------------------------------------------------------------------
-        # ADVANCED BACKTESTING CHART (Absolute) + Optional Relative Backtesting
-        # ---------------------------------------------------------------------
-        if selected_asset in st.session_state.backtest_results:
-            results = st.session_state.backtest_results[selected_asset]
-            if results and ("var_series" in results) and ("hits" in results):
-                expected_rate = (results["expected_breaches"] / max(results["observations"], 1)) if results.get("observations") else None
+            tab_abs_bt, tab_rel_bt = st.tabs(adv_tabs) if len(adv_tabs) == 2 else (st.tabs(adv_tabs)[0], None)
 
-                st.subheader("🧪 Advanced Backtesting Visualization (Absolute)")
-                fig_adv_bt = self.viz.create_advanced_backtest_chart(
-                    returns,
-                    results["var_series"],
-                    results["hits"],
-                    title=f"{selected_asset} - Advanced VaR Backtest",
-                    expected_rate=expected_rate
-                )
-                st.plotly_chart(fig_adv_bt, use_container_width=True)
-
-                # Basel-style traffic light (generic binomial quantiles)
-                try:
-                    n = int(results.get("observations", 0))
-                    x = int(results.get("breaches", 0))
-                    p = float(expected_rate) if expected_rate is not None else 0.01
-                    green_max = int(stats.binom.ppf(0.95, n, p))
-                    yellow_max = int(stats.binom.ppf(0.99, n, p))
-                    zone = "🟢 Green" if x <= green_max else ("🟠 Yellow" if x <= yellow_max else "🔴 Red")
-                    st.info(f"Backtest Traffic Light (binomial quantiles): **{zone}**  | breaches={x}, green≤{green_max}, yellow≤{yellow_max}")
-                except Exception:
-                    pass
-
-        st.subheader("🪙 Relative VaR Backtesting vs Gold ETF (Asset - Gold ETF)")
-
-        if aligned is not None and len(aligned) >= max(250, int(config.get("backtest_window", 250)) + 50):
-            rel_series = (aligned["asset"] - aligned["gold"]).dropna()
-
-            r1, r2, r3 = st.columns(3)
-            with r1:
-                rel_method = st.selectbox("Relative VaR Method", ["historical", "normal"], key="rel_var_method")
-            with r2:
-                rel_conf = st.selectbox(
-                    "Relative Confidence",
-                    config["confidence_levels"],
-                    index=0,
-                    key="rel_conf_level",
-                    format_func=lambda x: f"{x:.0%}"
-                )
-            with r3:
-                rel_window = st.number_input(
-                    "Relative Window Size",
-                    min_value=100,
-                    max_value=500,
-                    value=int(config.get("backtest_window", 250)),
-                    key="rel_backtest_window"
-                )
-
-            if st.button("📊 Run Relative Backtest", type="secondary", use_container_width=True):
-                with st.spinner("Running relative VaR backtest..."):
-                    rel_bt = self.analytics.var_backtest(rel_series, rel_method, rel_conf, int(rel_window))
-                    if rel_bt:
-                        st.session_state.relative_backtest_results[selected_asset] = rel_bt
-                        st.success("Relative backtest completed!")
-
-            if selected_asset in st.session_state.relative_backtest_results:
-                rel_res = st.session_state.relative_backtest_results[selected_asset]
-                if rel_res:
+            with tab_abs_bt:
+                if adv_abs:
                     c1, c2, c3, c4 = st.columns(4)
                     with c1:
-                        st.metric("Observations", f"{rel_res['observations']:,}")
+                        st.metric("Obs", f"{adv_abs.get('observations', 0):,}")
                     with c2:
-                        st.metric("Breaches", f"{rel_res['breaches']:,}")
+                        st.metric("Breaches", f"{adv_abs.get('breaches', 0):,}")
                     with c3:
-                        st.metric("Breach Rate", f"{rel_res['breach_rate']:.2f}%")
+                        st.metric("Kupiec p", f"{adv_abs.get('kupiec_pval', 1.0):.4f}")
                     with c4:
-                        st.metric("Expected Breaches", f"{rel_res['expected_breaches']:.1f}")
+                        st.metric("Christoffersen p", f"{adv_abs.get('christoffersen_pval', 1.0):.4f}")
 
-                    fig_rel_adv = self.viz.create_advanced_backtest_chart(
-                        rel_series,
-                        rel_res["var_series"],
-                        rel_res["hits"],
-                        title=f"{selected_asset} - Relative VaR Backtest vs {gold_sym}",
-                        expected_rate=(rel_res["expected_breaches"] / max(rel_res["observations"], 1))
+                    fig_adv_abs = self.viz.create_advanced_backtest_chart(
+                        returns=adv_abs["returns"],
+                        var_series=adv_abs["var_series"],
+                        hits=adv_abs["hits"],
+                        confidence_level=confidence_level,
+                        title=f"{selected_asset} – Advanced {var_method.title()} VaR Backtest ({confidence_level:.0%})"
                     )
-                    st.plotly_chart(fig_rel_adv, use_container_width=True)
-        else:
-            st.info("Relative backtesting needs a longer overlapping history with the Gold ETF benchmark.")
+                    st.plotly_chart(fig_adv_abs, use_container_width=True)
+                else:
+                    st.info("Advanced backtest not available (insufficient data after compounding / window constraints).")
+
+            if tab_rel_bt is not None:
+                with tab_rel_bt:
+                    if adv_rel:
+                        c1, c2, c3, c4 = st.columns(4)
+                        with c1:
+                            st.metric("Obs", f"{adv_rel.get('observations', 0):,}")
+                        with c2:
+                            st.metric("Breaches", f"{adv_rel.get('breaches', 0):,}")
+                        with c3:
+                            st.metric("Kupiec p", f"{adv_rel.get('kupiec_pval', 1.0):.4f}")
+                        with c4:
+                            st.metric("Christoffersen p", f"{adv_rel.get('christoffersen_pval', 1.0):.4f}")
+
+                        fig_adv_rel = self.viz.create_advanced_backtest_chart(
+                            returns=adv_rel["returns"],
+                            var_series=adv_rel["var_series"],
+                            hits=adv_rel["hits"],
+                            confidence_level=confidence_level,
+                            title=f"{selected_asset} – Relative VaR Backtest vs {rel_bench} ({confidence_level:.0%})"
+                        )
+                        st.plotly_chart(fig_adv_rel, use_container_width=True)
+                    else:
+                        st.info("Relative advanced backtest not available (benchmark overlap insufficient).")
 
         st.subheader("📉 Rolling Beta Analysis")
 
@@ -2794,6 +2839,7 @@ class InstitutionalCommoditiesDashboard:
             "timestamp": datetime.now().isoformat(),
             "assets_loaded": list(st.session_state.asset_data.keys()),
             "benchmarks_loaded": list(st.session_state.benchmark_data.keys()),
+            "relative_benchmark_ticker": st.session_state.get("relative_benchmark_ticker", "GLD"),
             "data_points": len(next(iter(st.session_state.returns_data.values())))
             if st.session_state.returns_data else 0,
             "portfolio_weights": st.session_state.portfolio_weights,
