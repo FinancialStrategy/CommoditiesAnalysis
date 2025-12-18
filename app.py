@@ -1216,6 +1216,139 @@ class EnhancedVisualization:
 
         return fig
 
+
+
+def create_garch_conditional_volatility_chart(self,
+                                             cond_vol: pd.Series,
+                                             title: str = "GARCH Conditional Volatility") -> go.Figure:
+    """Standalone view of GARCH conditional volatility (single-series chart)."""
+    fig = go.Figure()
+    if cond_vol is None:
+        return fig
+
+    v = pd.Series(cond_vol).dropna()
+    if v.empty:
+        return fig
+
+    fig.add_trace(go.Scatter(
+        x=v.index,
+        y=v.values * 100.0,
+        name="GARCH Conditional Vol (%)",
+        line=dict(color=self.colors["primary"], width=2),
+        fill="tozeroy",
+        fillcolor="rgba(0,0,0,0.06)"
+    ))
+
+    fig.update_layout(
+        title=title,
+        height=420,
+        template="plotly_white",
+        hovermode="x unified",
+        yaxis_title="Annualized Volatility (%)",
+        xaxis_title="Date"
+    )
+    fig.update_xaxes(rangeslider_visible=True)
+    return fig
+
+
+def create_bollinger_breach_chart(self,
+                                  series: pd.Series,
+                                  window: int = 20,
+                                  k: float = 2.0,
+                                  title: str = "Bollinger Bands Breach") -> go.Figure:
+    """Bollinger bands breach visualization for a daily log-difference (or return) series."""
+    fig = go.Figure()
+    if series is None:
+        return fig
+
+    s = pd.Series(series).dropna()
+    if s.empty:
+        return fig
+
+    w = int(max(5, min(int(window), len(s))))
+    k = float(max(0.5, min(float(k), 5.0)))
+
+    ma = s.rolling(w).mean()
+    sd = s.rolling(w).std(ddof=0)
+    upper = ma + k * sd
+    lower = ma - k * sd
+
+    dfb = pd.DataFrame({
+        "val": s.values,
+        "ma": ma.values,
+        "upper": upper.values,
+        "lower": lower.values
+    }, index=s.index).dropna()
+
+    if dfb.empty:
+        return fig
+
+    breach_up = dfb["val"] > dfb["upper"]
+    breach_lo = dfb["val"] < dfb["lower"]
+
+    # Band shading (no visible lines)
+    fig.add_trace(go.Scatter(
+        x=dfb.index, y=dfb["upper"],
+        mode="lines",
+        line=dict(width=0),
+        hoverinfo="skip",
+        showlegend=False
+    ))
+    fig.add_trace(go.Scatter(
+        x=dfb.index, y=dfb["lower"],
+        mode="lines",
+        line=dict(width=0),
+        fill="tonexty",
+        fillcolor="rgba(120,120,120,0.14)",
+        name="Bollinger Band",
+        hoverinfo="skip"
+    ))
+
+    # Daily series as bars for a clear breach view
+    fig.add_trace(go.Bar(
+        x=dfb.index,
+        y=dfb["val"],
+        name="Daily Log Difference",
+        opacity=0.85
+    ))
+
+    # Rolling mean (reference)
+    fig.add_trace(go.Scatter(
+        x=dfb.index,
+        y=dfb["ma"],
+        name="Rolling Mean",
+        line=dict(width=1.5, dash="dot")
+    ))
+
+    # Breach markers
+    if breach_up.any():
+        fig.add_trace(go.Scatter(
+            x=dfb.index[breach_up],
+            y=dfb.loc[breach_up, "val"],
+            mode="markers",
+            name="Upper Breach",
+            marker=dict(size=8, symbol="triangle-up")
+        ))
+    if breach_lo.any():
+        fig.add_trace(go.Scatter(
+            x=dfb.index[breach_lo],
+            y=dfb.loc[breach_lo, "val"],
+            mode="markers",
+            name="Lower Breach",
+            marker=dict(size=8, symbol="triangle-down")
+        ))
+
+    fig.update_layout(
+        title=title,
+        height=520,
+        template="plotly_white",
+        hovermode="x unified",
+        yaxis_title="Log Difference",
+        xaxis_title="Date",
+        bargap=0.05
+    )
+    fig.update_xaxes(rangeslider_visible=True)
+    return fig
     def create_regime_chart(self, price: pd.Series, regimes: Union[np.ndarray, pd.Series],
                             regime_labels: Dict[int, str], title: str) -> go.Figure:
         """Create regime visualization chart (supports Series-aligned regimes)."""
@@ -1476,71 +1609,90 @@ class EnhancedVisualization:
         )
         return fig
 
-    def create_conditional_vol_band_chart(self,
-                                          cond_vol: pd.Series,
-                                          band_window: int = 60,
-                                          band_level: float = 0.90,
-                                          title: str = "Conditional Volatility Bands") -> go.Figure:
-        """Non-line visualization of conditional volatility with upper/lower bounds.
-        Uses rolling quantile bands and displays conditional volatility as bars (not a line).
-        """
-        if cond_vol is None:
-            return go.Figure()
 
-        v = pd.Series(cond_vol).dropna()
-        if v.empty:
-            return go.Figure()
+def create_conditional_vol_band_chart(self,
+                                      cond_vol: pd.Series,
+                                      band_window: int = 60,
+                                      band_level: float = 0.90,
+                                      title: str = "Conditional Volatility Bands") -> go.Figure:
+    """Non-line visualization of conditional volatility with upper/lower bounds.
+    Uses rolling quantile bands and displays conditional volatility as bars (not a line).
+    Adds breach markers and shaded band for a clearer institutional view.
+    """
+    if cond_vol is None:
+        return go.Figure()
 
-        w = int(max(10, min(band_window, len(v))))
-        level = float(min(max(band_level, 0.60), 0.99))
-        lo_q = (1.0 - level) / 2.0
-        hi_q = 1.0 - lo_q
+    v = pd.Series(cond_vol).dropna()
+    if v.empty:
+        return go.Figure()
 
-        lower = v.rolling(w).quantile(lo_q)
-        upper = v.rolling(w).quantile(hi_q)
+    w = int(max(10, min(int(band_window), len(v))))
+    level = float(min(max(float(band_level), 0.60), 0.99))
+    lo_q = (1.0 - level) / 2.0
+    hi_q = 1.0 - lo_q
 
-        df2 = pd.DataFrame({"vol": v, "lower": lower, "upper": upper}).dropna()
-        if df2.empty:
-            return go.Figure()
+    lower = v.rolling(w).quantile(lo_q)
+    upper = v.rolling(w).quantile(hi_q)
 
-        fig = go.Figure()
+    df2 = pd.DataFrame({"vol": v, "lower": lower, "upper": upper}).dropna()
+    if df2.empty:
+        return go.Figure()
 
+    breach_up = df2["vol"] > df2["upper"]
+    breach_lo = df2["vol"] < df2["lower"]
+    breach_any = breach_up | breach_lo
+
+    fig = go.Figure()
+
+    # Shaded band (no visible boundary lines)
+    fig.add_trace(go.Scatter(
+        x=df2.index,
+        y=df2["upper"] * 100.0,
+        mode="lines",
+        line=dict(width=0),
+        hoverinfo="skip",
+        showlegend=False
+    ))
+    fig.add_trace(go.Scatter(
+        x=df2.index,
+        y=df2["lower"] * 100.0,
+        mode="lines",
+        line=dict(width=0),
+        fill="tonexty",
+        fillcolor="rgba(120,120,120,0.16)",
+        name=f"{int(level*100)}% Band",
+        hoverinfo="skip"
+    ))
+
+    # Conditional volatility as bars (non-line view)
+    fig.add_trace(go.Bar(
+        x=df2.index,
+        y=df2["vol"] * 100.0,
+        name="Conditional Vol (%)",
+        opacity=0.88
+    ))
+
+    # Breach markers (non-line)
+    if breach_any.any():
         fig.add_trace(go.Scatter(
-            x=df2.index, y=df2["upper"] * 100.0,
-            name="Upper Bound",
-            mode="lines",
-            line=dict(width=0),
-            hoverinfo="skip",
-            showlegend=False
-        ))
-        fig.add_trace(go.Scatter(
-            x=df2.index, y=df2["lower"] * 100.0,
-            name="Lower Bound",
-            mode="lines",
-            line=dict(width=0),
-            fill="tonexty",
-            opacity=0.25,
-            hoverinfo="skip",
-            showlegend=False
+            x=df2.index[breach_any],
+            y=(df2.loc[breach_any, "vol"] * 100.0),
+            mode="markers",
+            name="Band Breach",
+            marker=dict(size=8, symbol="x")
         ))
 
-        fig.add_trace(go.Bar(
-            x=df2.index,
-            y=df2["vol"] * 100.0,
-            name="Conditional Vol (%)",
-            opacity=0.85
-        ))
-
-        fig.update_layout(
-            title=title,
-            height=520,
-            template="plotly_white",
-            hovermode="x unified",
-            yaxis_title="Volatility (%)",
-            xaxis_title="Date"
-        )
-        return fig
-
+    fig.update_layout(
+        title=title,
+        height=560,
+        template="plotly_white",
+        hovermode="x unified",
+        yaxis_title="Volatility (%)",
+        xaxis_title="Date",
+        bargap=0.05
+    )
+    fig.update_xaxes(rangeslider_visible=True)
+    return fig
     def create_correlation_heatmap(self, corr_matrix: pd.DataFrame, title: str) -> go.Figure:
         """Create correlation heatmap"""
         fig = go.Figure(data=go.Heatmap(
@@ -2128,12 +2280,22 @@ class InstitutionalCommoditiesDashboard:
 
                 fig = self.viz.create_volatility_chart(
                     returns,
-                    fit["cond_volatility"],
+                    None,
                     pd.Series(fit["forecast_volatility"]),
-                    f"{selected_asset} - GARCH Volatility"
+                    f"{selected_asset} - Volatility Analysis"
                 )
 
                 st.plotly_chart(fig, use_container_width=True)
+
+                # New standalone chart: GARCH conditional volatility only (moved out of the first chart)
+                st.subheader("GARCH Conditional Volatility")
+
+                fig_cond = self.viz.create_garch_conditional_volatility_chart(
+                    pd.Series(fit["cond_volatility"]),
+                    title=f"{selected_asset} - GARCH Conditional Volatility"
+                )
+                st.plotly_chart(fig_cond, use_container_width=True)
+
 
                 # Additional (non-line) visualization: Conditional Volatility with Upper/Lower Bounds
                 st.subheader("Conditional Volatility Bands (Non-Line View)")
@@ -2157,6 +2319,34 @@ class InstitutionalCommoditiesDashboard:
                     title=f"{selected_asset} - Conditional Volatility Bands"
                 )
                 st.plotly_chart(fig_band, use_container_width=True)
+
+                # Bollinger breaches on daily log difference (fourth chart)
+                st.subheader("Bollinger Bands Breach: Daily Log Difference")
+
+                bb1, bb2 = st.columns(2)
+                with bb1:
+                    bb_window = st.slider(
+                        "Bollinger Window (days)",
+                        10, 120, 20, 5,
+                        key=f"bb_window_{selected_asset}"
+                    )
+                with bb2:
+                    bb_k = st.slider(
+                        "Bollinger Std Dev Multiplier",
+                        1.0, 3.5, 2.0, 0.1,
+                        key=f"bb_k_{selected_asset}"
+                    )
+
+                log_diff = np.log(df["Adj Close"]).diff().dropna()
+
+                fig_bb = self.viz.create_bollinger_breach_chart(
+                    log_diff,
+                    window=int(bb_window),
+                    k=float(bb_k),
+                    title=f"{selected_asset} - Daily Log Difference Bollinger Breaches"
+                )
+                st.plotly_chart(fig_bb, use_container_width=True)
+
 
 
 
