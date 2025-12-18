@@ -691,7 +691,7 @@ class Dashboard:
         if ret_df.empty or len(ret_df) < 180:
             st.warning("Not enough overlap for portfolio.")
             return
-        mode = st.radio("Weights", ["Equal", "Custom"], horizontal=True)
+        mode = st.radio("Weights", ["Equal", "Custom"], horizontal=True, key="pf_weights_mode")
         if mode == "Equal":
             w = np.ones(len(assets)) / len(assets)
         else:
@@ -727,7 +727,7 @@ class Dashboard:
 
     def tab_volatility(self, rets, diag, p):
         st.markdown("### 🧠 Volatility (Champion GARCH)")
-        target = st.selectbox("Target", list(rets.keys()), index=0)
+        target = st.selectbox("Target", list(rets.keys()), index=0, key="vol_target")
         r = rets[target]
         c1, c2, c3 = st.columns(3)
         with c1: self.metric_card("ARCH LM p", format_number(diag[target]["arch_p"], 4), good=(safe_float(diag[target]["arch_p"], 1) < 0.05))
@@ -766,7 +766,7 @@ class Dashboard:
         if not HMM_AVAILABLE:
             st.info("Install `hmmlearn` + `scikit-learn` to enable regimes.")
             return
-        target = st.selectbox("Target", list(rets.keys()), index=0)
+        target = st.selectbox("Target", list(rets.keys()), index=0, key="reg_target")
         n_states = st.slider("States", 2, 5, 3, 1)
         use_rv = st.checkbox("Use RV20 feature", True)
         seed = st.number_input("Seed", 0, 10000, 7, 1)
@@ -800,7 +800,7 @@ class Dashboard:
             w = np.array(w_list, dtype=float)
             w = (w / w.sum()) if w.sum() > 1e-12 else np.ones(len(assets)) / len(assets)
 
-        scenario = st.selectbox("Scenario", list(SCENARIOS.keys()), index=1)
+        scenario = st.selectbox("Scenario", list(SCENARIOS.keys()), index=1, key="sc_scenario")
         base = SCENARIOS[scenario]
         c1, c2, c3 = st.columns(3)
         with c1: horizon = st.slider("Horizon", 5, 90, 20, 5)
@@ -838,9 +838,9 @@ class Dashboard:
 
     def tab_backtests(self, rets, p):
         st.markdown("### ✅ VaR Backtests (Kupiec + Christoffersen)")
-        target = st.selectbox("Target", list(rets.keys()), index=0)
+        target = st.selectbox("Target", list(rets.keys()), index=0, key="bt_target")
         method = st.radio("VaR method", ["historical", "normal"], horizontal=True)
-        conf = float(st.selectbox("Confidence", list(p["confs"]), index=min(1, len(p["confs"])-1)))
+        conf = float(st.selectbox("Confidence", list(p["confs"]), index=min(1, len(p["confs"])-1), key="bt_conf"))
         df_bt = self.an.rolling_var_backtest(rets[target], method, int(p["bt_window"]), conf)
         if df_bt.empty:
             st.warning("Not enough data for backtest.")
