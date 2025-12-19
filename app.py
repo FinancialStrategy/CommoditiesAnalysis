@@ -1,5 +1,5 @@
 """
-🏛️ Institutional Commodities Analytics Platform v6.0
+🏛️ ENIGMA Commodities Analytics Platform v6.0
 Integrated Portfolio Analytics • Advanced GARCH & Regime Detection • Machine Learning • Professional Reporting
 Streamlit Cloud Optimized with Superior Architecture & Performance
 ENHANCED VERSION WITH ADVANCED TECHNIQUES
@@ -683,6 +683,8 @@ def _is_empty_data(obj: Any) -> bool:
             return obj.dropna().empty
         if isinstance(obj, (dict, list, tuple, set)):
             return len(obj) == 0
+        if isinstance(obj, np.ndarray):
+            return obj.size == 0
         return False
     except Exception:
         return True
@@ -7623,8 +7625,19 @@ class InstitutionalCommoditiesDashboard:
         
         runtime = datetime.now() - self.start_time
         assets_loaded = len(st.session_state.asset_data)
-        data_points = len(next(iter(st.session_state.returns_data.values()))) if not _is_empty_data(st.session_state.get("returns_data")) else 0
-        
+        returns_data_obj = st.session_state.get("returns_data")
+        if _is_empty_data(returns_data_obj):
+            data_points = 0
+        elif isinstance(returns_data_obj, pd.DataFrame):
+            # Count rows with at least one non-NaN value
+            data_points = int(returns_data_obj.dropna(how="all").shape[0])
+        elif isinstance(returns_data_obj, dict):
+            first_val = next(iter(returns_data_obj.values()), None)
+            data_points = int(len(first_val)) if first_val is not None else 0
+        elif isinstance(returns_data_obj, (pd.Series, np.ndarray, list, tuple)):
+            data_points = int(len(returns_data_obj))
+        else:
+            data_points = 0
         perf_cols = st.columns(4)
         
         with perf_cols[0]:
