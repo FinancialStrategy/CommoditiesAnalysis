@@ -2862,7 +2862,8 @@ class InstitutionalCommoditiesDashboard:
         """Display portfolio analysis"""
         st.markdown('<div class="section-header"><h2>🧺 Portfolio Analysis</h2></div>', unsafe_allow_html=True)
         
-        if not st.session_state.returns_data:
+        returns_data = st.session_state.get("returns_data", None)
+        if returns_data is None or (isinstance(returns_data, pd.DataFrame) and returns_data.empty) or (isinstance(returns_data, dict) and len(returns_data) == 0):
             st.warning("⚠️ No return data available. Please load data first.")
             return
         
@@ -3203,7 +3204,8 @@ class InstitutionalCommoditiesDashboard:
         """Display advanced analytics"""
         st.markdown('<div class="section-header"><h2>⚡ Advanced Analytics</h2></div>', unsafe_allow_html=True)
         
-        if not st.session_state.returns_data:
+        returns_data = st.session_state.get("returns_data", None)
+        if returns_data is None or (isinstance(returns_data, pd.DataFrame) and returns_data.empty) or (isinstance(returns_data, dict) and len(returns_data) == 0):
             st.warning("⚠️ Please load data first")
             return
         
@@ -3551,7 +3553,8 @@ class InstitutionalCommoditiesDashboard:
         """Display general analytics"""
         st.markdown('<div class="section-header"><h2>📈 Advanced Analytics</h2></div>', unsafe_allow_html=True)
         
-        if not st.session_state.returns_data:
+        returns_data = st.session_state.get("returns_data", None)
+        if returns_data is None or (isinstance(returns_data, pd.DataFrame) and returns_data.empty) or (isinstance(returns_data, dict) and len(returns_data) == 0):
             st.warning("⚠️ Please load data first")
             return
         
