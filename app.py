@@ -1,5 +1,5 @@
 """
-🏛️ ENIGMA Commodities Analytics Platform v6.0
+🏛️ Institutional Commodities Analytics Platform v6.0
 Integrated Portfolio Analytics • Advanced GARCH & Regime Detection • Machine Learning • Professional Reporting
 Streamlit Cloud Optimized with Superior Architecture & Performance
 ENHANCED VERSION WITH ADVANCED TECHNIQUES
@@ -7650,11 +7650,25 @@ class InstitutionalCommoditiesDashboard:
             st.metric("Data Points", f"{data_points:,}")
         
         with perf_cols[3]:
-            # Memory usage (simplified)
-            import psutil
-            process = psutil.Process()
-            memory_mb = process.memory_info().rss / 1024 / 1024
-            st.metric("Memory Usage", f"{memory_mb:.1f} MB")
+            # Memory usage (optional: psutil). Keep Cloud-safe if psutil isn't installed.
+            try:
+                import psutil  # type: ignore
+                process = psutil.Process()
+                memory_mb = process.memory_info().rss / 1024 / 1024
+                st.metric("Memory Usage", f"{memory_mb:.1f} MB")
+            except Exception:
+                # Fallback (Linux): resource.ru_maxrss is usually KB; show as estimate.
+                try:
+                    import resource
+                    rss_kb = float(getattr(resource.getrusage(resource.RUSAGE_SELF), "ru_maxrss", 0.0) or 0.0)
+                    memory_mb = rss_kb / 1024.0
+                    if memory_mb > 0:
+                        st.metric("Memory Usage", f"{memory_mb:.1f} MB (est.)")
+                    else:
+                        st.metric("Memory Usage", "N/A")
+                except Exception:
+                    st.metric("Memory Usage", "N/A")
+                st.caption("Tip: add `psutil` to requirements.txt for detailed memory stats.")
         
         # Error log
         if st.session_state.error_log:
