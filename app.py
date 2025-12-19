@@ -3084,98 +3084,120 @@ class InstitutionalVisualizer:
         corr_matrix: pd.DataFrame,
         title: str = "Advanced Correlation Analysis",
         show_clusters: bool = True,
-        show_network: bool = False
+        show_network: bool = False,
+        n_obs: Optional[pd.DataFrame] = None,
+        cluster_by_abs: bool = True
     ) -> go.Figure:
-        """Create interactive correlation matrix with clustering"""
-        
-        # Apply clustering if requested
-        if show_clusters and len(corr_matrix) > 2:
+        """Create an interactive correlation heatmap with robust labeling and optional clustering.
+
+        Fixes common mis-reporting issues:
+        - Ensures correlation values align with axis labels after clustering/reordering
+        - Uses correct hierarchical clustering on a *distance* matrix (squareform -> linkage)
+        - Provides observation counts (N) in hover for transparency
+        """
+        if corr_matrix is None or not isinstance(corr_matrix, pd.DataFrame) or corr_matrix.empty:
+            fig = go.Figure()
+            fig.update_layout(
+                title=title,
+                height=350,
+                template=self.template
+            )
+            return fig
+
+        # Defensive copy + numeric coercion
+        corr = corr_matrix.copy()
+        corr = corr.apply(pd.to_numeric, errors="coerce")
+        corr = corr.replace([np.inf, -np.inf], np.nan)
+
+        # If something produced NaNs, keep them but avoid crashing the heatmap
+        # (Heatmap can handle NaNs, but we also want a clean diagonal)
+        if corr.shape[0] == corr.shape[1]:
+            np.fill_diagonal(corr.values, 1.0)
+
+        # Optional clustering: reorder rows/cols consistently
+        order = np.arange(len(corr))
+        if show_clusters and len(corr) >= 3:
             try:
-                from scipy.cluster.hierarchy import linkage, dendrogram, leaves_list
-                
-                # Perform hierarchical clustering
-                dist_matrix = 1 - np.abs(corr_matrix.values)  # Convert to distance
-                np.fill_diagonal(dist_matrix, 0)
-                
-                linkage_matrix = linkage(dist_matrix, method='average')
-                leaves = leaves_list(linkage_matrix)
-                
-                # Reorder matrix
-                corr_matrix = corr_matrix.iloc[leaves, leaves]
-                
-                # Create dendrogram
-                dendro_fig = ff.create_dendrogram(
-                    dist_matrix,
-                    orientation='left',
-                    labels=corr_matrix.columns.tolist(),
-                    color_threshold=0.7
-                )
-                
-            except ImportError:
-                show_clusters = False
-        
-        # Create heatmap
+                from scipy.cluster.hierarchy import linkage, leaves_list
+                from scipy.spatial.distance import squareform
+
+                # Distance: closer if (abs) correlation is higher
+                base = corr.abs() if cluster_by_abs else corr
+                dist = 1.0 - base
+                dist = dist.clip(lower=0.0, upper=2.0)
+                np.fill_diagonal(dist.values, 0.0)
+
+                # linkage expects condensed distance vector
+                condensed = squareform(dist.values, checks=False)
+                Z = linkage(condensed, method="average", optimal_ordering=True)
+                order = leaves_list(Z)
+
+                corr = corr.iloc[order, order]
+                if isinstance(n_obs, pd.DataFrame) and n_obs.shape == corr.shape:
+                    n_obs = n_obs.iloc[order, order]
+            except Exception:
+                # If clustering fails for any reason, fall back to original order
+                order = np.arange(len(corr))
+
+        # Hover: include N if provided
+        customdata = None
+        hovertemplate = "%{y} vs %{x}<br>ρ=%{z:.3f}<extra></extra>"
+        if isinstance(n_obs, pd.DataFrame) and n_obs.shape == corr.shape:
+            customdata = n_obs.values
+            hovertemplate = "%{y} vs %{x}<br>ρ=%{z:.3f}<br>N=%{customdata}<extra></extra>"
+
+        # Heatmap
         fig = go.Figure(data=go.Heatmap(
-            z=corr_matrix.values,
-            x=corr_matrix.columns,
-            y=corr_matrix.index,
-            colorscale='RdBu',
+            z=corr.values,
+            x=corr.columns.astype(str),
+            y=corr.index.astype(str),
+            colorscale="RdBu",
             zmid=0,
             zmin=-1,
             zmax=1,
-            text=corr_matrix.round(2).values,
-            texttemplate='%{text}',
+            text=np.round(corr.values, 2),
+            texttemplate="%{text}",
             textfont=dict(size=10),
-            hoverinfo='x+y+z',
+            customdata=customdata,
+            hovertemplate=hovertemplate,
             colorbar=dict(
-                title='Correlation',
-                                tickformat='.2f',
-                len=0.75
+                title="Correlation",
+                tickformat=".2f",
+                len=0.80
             ),
             xgap=1,
             ygap=1
         ))
-        
-        # Add annotations for significant correlations
-        significant_mask = np.abs(corr_matrix.values) > 0.7
-        for i in range(len(corr_matrix)):
-            for j in range(len(corr_matrix)):
-                if i != j and significant_mask[i, j]:
-                    fig.add_annotation(
-                        x=corr_matrix.columns[j],
-                        y=corr_matrix.index[i],
-                        text=f"{corr_matrix.iloc[i, j]:.2f}",
-                        showarrow=False,
-                        font=dict(size=9, color='white' if np.abs(corr_matrix.iloc[i, j]) > 0.8 else 'black'),
-                        bgcolor='rgba(0,0,0,0.3)' if np.abs(corr_matrix.iloc[i, j]) > 0.8 else 'rgba(255,255,255,0.5)'
-                    )
-        
+
+        # Layout improvements + matrix-like orientation (top-left is (row1,col1))
         fig.update_layout(
-            title=dict(
-                text=title,
-                x=0.5,
-                font=dict(size=20, color=self.colors['dark'])
-            ),
-            height=max(600, len(corr_matrix) * 40),
-            width=max(800, len(corr_matrix) * 40),
+            title=dict(text=title, x=0.5, font=dict(size=22, color=self.colors.get("dark", "#111827"))),
+            height=min(950, max(450, 120 + 28 * len(corr))),
             template=self.template,
-            xaxis_tickangle=45,
-            xaxis=dict(
-                side="bottom",
-                tickfont=dict(size=10)
-            ),
-            yaxis=dict(
-                autorange="reversed",
-                tickfont=dict(size=10)
-            )
+            margin=dict(l=80, r=30, t=80, b=60)
         )
-        
+        fig.update_xaxes(side="top", tickangle=45)
+        fig.update_yaxes(autorange="reversed")
+
+        # Optional: highlight strong correlations (annotation markers)
+        try:
+            strong = (np.abs(corr.values) >= 0.80) & (~np.eye(len(corr), dtype=bool))
+            for i in range(len(corr)):
+                for j in range(len(corr)):
+                    if strong[i, j]:
+                        fig.add_annotation(
+                            x=str(corr.columns[j]),
+                            y=str(corr.index[i]),
+                            text="★",
+                            showarrow=False,
+                            font=dict(size=12, color=self.colors.get("accent", "#7c3aed")),
+                            opacity=0.8
+                        )
+        except Exception:
+            pass
+
         return fig
 
-
-    # -------------------------------------------------------------------------
-    # Portfolio / Asset Performance Chart (vs Benchmark) - robust
-    # -------------------------------------------------------------------------
     def create_performance_chart(
         self,
         asset_returns: pd.Series,
@@ -4568,44 +4590,84 @@ class InstitutionalCommoditiesDashboard:
         st.plotly_chart(fig, use_container_width=True)
     
     def _display_correlation_analysis(self):
-        """Display correlation analysis"""
-        if _is_empty_data(st.session_state.get("returns_data")) or (isinstance(st.session_state.get("returns_data"), pd.DataFrame) and len(st.session_state.get("returns_data").columns) < 2):
+        """Display correlation analysis (robust + correctly labeled heatmap)."""
+        returns_data = st.session_state.get("returns_data")
+
+        if _is_empty_data(returns_data):
             return
-        
+        if not isinstance(returns_data, pd.DataFrame) or returns_data.shape[1] < 2:
+            return
+
         st.markdown("### 🔗 Correlation Analysis")
-        
-        returns_df = pd.DataFrame(st.session_state.returns_data).dropna()
-        
-        if returns_df.empty or len(returns_df.columns) < 2:
-            st.warning("Insufficient data for correlation analysis")
+
+        # Prepare returns (numeric + clean infinities)
+        returns_df = returns_data.copy()
+        returns_df = returns_df.replace([np.inf, -np.inf], np.nan)
+        returns_df = returns_df.apply(pd.to_numeric, errors="coerce")
+
+        # Drop columns that are constant or too sparse (prevents misleading correlations)
+        try:
+            cfg = st.session_state.get("analysis_config")
+            base_min_obs = int(getattr(cfg, "rolling_window", 60)) if cfg is not None else 60
+        except Exception:
+            base_min_obs = 60
+        min_obs = max(30, min(252, base_min_obs))  # sensible bounds
+
+        # Remove constant series
+        nunique = returns_df.nunique(dropna=True)
+        returns_df = returns_df.loc[:, nunique > 1]
+
+        # Remove too-sparse series
+        valid_counts = returns_df.notna().sum()
+        returns_df = returns_df.loc[:, valid_counts >= min_obs]
+
+        if returns_df.empty or returns_df.shape[1] < 2:
+            st.warning("Insufficient data for correlation analysis after cleaning")
             return
-        
-        corr_matrix = returns_df.corr()
-        
-        # Create correlation matrix with clustering
+
+        # Prefer a common window so every pair uses the same sample (avoids 'wrong' looking matrices)
+        common_df = returns_df.dropna(axis=0, how="any")
+        use_common_window = len(common_df) >= min_obs
+
+        if use_common_window:
+            df_for_corr = common_df
+            corr_matrix = df_for_corr.corr(method="pearson")
+            n_obs = pd.DataFrame(len(df_for_corr), index=corr_matrix.index, columns=corr_matrix.columns)
+            st.caption(f"Correlation computed on common dates: N={len(df_for_corr):,} observations across all assets.")
+        else:
+            # Fall back to pairwise deletion if intersection is too small
+            df_for_corr = returns_df.dropna(axis=0, how="all")
+            corr_matrix = df_for_corr.corr(method="pearson")
+            mask = df_for_corr.notna().astype(np.int16)
+            n_obs = pd.DataFrame(mask.T @ mask, index=df_for_corr.columns, columns=df_for_corr.columns)
+            st.caption("Correlation computed with pairwise deletion (insufficient common overlap across all assets).")
+
+        # Clean numerical issues
+        corr_matrix = corr_matrix.replace([np.inf, -np.inf], np.nan)
+        if corr_matrix.shape[0] == corr_matrix.shape[1]:
+            np.fill_diagonal(corr_matrix.values, 1.0)
+
+        # Create correlation matrix with correct clustering + hover N
         fig = self.visualizer.create_interactive_correlation_matrix(
             corr_matrix,
             "Asset Correlations",
-            show_clusters=True
+            show_clusters=True,
+            n_obs=n_obs
         )
-        
-        st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': True})
-        
-        # Additional correlation metrics
+        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": True})
+
+        # Additional correlation metrics (ignore NaNs)
+        tri = corr_matrix.values[np.triu_indices_from(corr_matrix, k=1)]
+        tri = tri[~np.isnan(tri)]
+
         col1, col2, col3 = st.columns(3)
-        
         with col1:
-            avg_corr = corr_matrix.values[np.triu_indices_from(corr_matrix, k=1)].mean()
-            st.metric("Average Correlation", f"{avg_corr:.3f}")
-        
+            st.metric("Average Correlation", f"{(float(np.mean(tri)) if tri.size else np.nan):.3f}" if tri.size else "N/A")
         with col2:
-            max_corr = corr_matrix.values[np.triu_indices_from(corr_matrix, k=1)].max()
-            st.metric("Maximum Correlation", f"{max_corr:.3f}")
-        
+            st.metric("Maximum Correlation", f"{(float(np.max(tri)) if tri.size else np.nan):.3f}" if tri.size else "N/A")
         with col3:
-            min_corr = corr_matrix.values[np.triu_indices_from(corr_matrix, k=1)].min()
-            st.metric("Minimum Correlation", f"{min_corr:.3f}")
-    
+            st.metric("Minimum Correlation", f"{(float(np.min(tri)) if tri.size else np.nan):.3f}" if tri.size else "N/A")
+
     def _display_market_overview(self):
         """Display market overview"""
         st.markdown("### 🌐 Market Overview")
