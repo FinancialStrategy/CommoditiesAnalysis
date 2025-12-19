@@ -2337,6 +2337,271 @@ class InstitutionalCommoditiesDashboard:
         """, height=115)
 
 
+
+
+    def _render_sidebar_controls(self):
+        """Sidebar: universe/asset selection + dates + load button."""
+        with st.sidebar:
+            st.markdown("## ⚙️ Controls")
+
+            # --- Universe / Asset selection ---
+            categories = list(COMMODITIES_UNIVERSE.keys())
+            # Prefer common defaults if available
+            preferred_defaults = [
+                AssetCategory.PRECIOUS_METALS.value,
+                AssetCategory.ENERGY.value,
+            ]
+            default_categories = [c for c in preferred_defaults if c in categories] or (categories[:2] if categories else [])
+            selected_categories = st.multiselect(
+                "Commodity Groups",
+                options=categories,
+                default=default_categories,
+                key="sidebar_groups",
+                help="Select one or more commodity groups to populate the asset list."
+            )
+
+            ticker_to_label = {}
+            for cat in selected_categories:
+                for t, meta in COMMODITIES_UNIVERSE.get(cat, {}).items():
+                    ticker_to_label[t] = f"{t} — {getattr(meta, 'name', str(t))}"
+
+            asset_options = list(ticker_to_label.keys())
+            preferred_assets = ["GC=F", "SI=F", "CL=F", "HG=F"]
+            default_assets = [t for t in preferred_assets if t in asset_options]
+            if not default_assets and asset_options:
+                default_assets = asset_options[: min(4, len(asset_options))]
+
+            selected_assets = st.multiselect(
+                "Assets",
+                options=asset_options,
+                default=default_assets,
+                format_func=lambda x: ticker_to_label.get(x, x),
+                key="sidebar_assets",
+                help="Select the assets to analyze."
+            )
+
+            # --- Benchmarks ---
+            bench_options = list(BENCHMARKS.keys())
+            bench_to_label = {k: f"{k} — {v.name}" for k, v in BENCHMARKS.items()}
+            preferred_bench = ["SPY", "BCOM", "DBC"]
+            default_bench = [b for b in preferred_bench if b in bench_options][:1] or (bench_options[:1] if bench_options else [])
+            selected_benchmarks = st.multiselect(
+                "Benchmarks",
+                options=bench_options,
+                default=default_bench,
+                format_func=lambda x: bench_to_label.get(x, x),
+                key="sidebar_benchmarks",
+                help="Select one or more benchmarks for relative metrics."
+            )
+
+            st.markdown("---")
+
+            # --- Dates ---
+            today = datetime.now().date()
+            default_start = today - timedelta(days=365 * 2)
+
+            # Persist dates across reruns
+            prev_cfg = st.session_state.get("analysis_config", None)
+            prev_start = getattr(prev_cfg, "start_date", None)
+            prev_end = getattr(prev_cfg, "end_date", None)
+
+            c1, c2 = st.columns(2)
+            start_date = c1.date_input(
+                "Start",
+                value=(prev_start.date() if prev_start else default_start),
+                key="sidebar_start_date"
+            )
+            end_date = c2.date_input(
+                "End",
+                value=(prev_end.date() if prev_end else today),
+                key="sidebar_end_date"
+            )
+
+            # --- Runtime / actions ---
+            auto_reload = st.checkbox(
+                "Auto-reload on changes",
+                value=False,
+                key="sidebar_autoreload",
+                help="If enabled, any change in selections triggers reloading data automatically."
+            )
+            load_clicked = st.button("🚀 Load Data", use_container_width=True, key="sidebar_load_btn")
+            clear_clicked = st.button("🧹 Clear cached data", use_container_width=True, key="sidebar_clear_cache_btn")
+
+            if clear_clicked:
+                try:
+                    if hasattr(st, "cache_data"):
+                        st.cache_data.clear()
+                    if hasattr(st, "cache_resource"):
+                        st.cache_resource.clear()
+                    st.success("Cache cleared.")
+                except Exception as e:
+                    self._log_error(e, context="cache_clear")
+                    st.warning("Cache clear attempted. If the issue persists, reload the app.")
+
+            return {
+                "selected_assets": selected_assets,
+                "selected_benchmarks": selected_benchmarks,
+                "start_date": start_date,
+                "end_date": end_date,
+                "auto_reload": auto_reload,
+                "load_clicked": load_clicked,
+            }
+
+    def _load_sidebar_selection(self, sidebar_state: dict):
+        """Load data based on sidebar state and populate session_state."""
+        selected_assets = sidebar_state.get("selected_assets", [])
+        selected_benchmarks = sidebar_state.get("selected_benchmarks", [])
+        start_date = sidebar_state.get("start_date")
+        end_date = sidebar_state.get("end_date")
+
+        if not selected_assets:
+            st.warning("Please select at least one asset from the sidebar.")
+            st.session_state.data_loaded = False
+            return
+
+        # Normalize dates
+        start_dt = datetime.combine(start_date, datetime.min.time())
+        end_dt = datetime.combine(end_date, datetime.min.time())
+        if end_dt <= start_dt:
+            st.warning("End date must be after the start date.")
+            st.session_state.data_loaded = False
+            return
+
+        # Hash selections to avoid unnecessary reloads
+        selection_fingerprint = json.dumps(
+            {
+                "assets": selected_assets,
+                "benchmarks": selected_benchmarks,
+                "start": start_date.isoformat(),
+                "end": end_date.isoformat(),
+            },
+            sort_keys=True,
+        )
+        selection_hash = hashlib.sha256(selection_fingerprint.encode("utf-8")).hexdigest()
+
+        if st.session_state.get("last_selection_hash") == selection_hash and st.session_state.get("data_loaded", False):
+            return
+
+        st.session_state.last_selection_hash = selection_hash
+        st.session_state.selected_assets = selected_assets
+        st.session_state.selected_benchmarks = selected_benchmarks
+
+        # Update analysis config dates (keep other defaults)
+        cfg = st.session_state.get("analysis_config", AnalysisConfiguration())
+        cfg.start_date = start_dt
+        cfg.end_date = end_dt
+        st.session_state.analysis_config = cfg
+
+        with st.spinner("Loading market data..."):
+            try:
+                raw_assets = self.data_manager.fetch_multiple_assets(selected_assets, start_dt, end_dt, max_workers=4)
+                raw_bench = self.data_manager.fetch_multiple_assets(selected_benchmarks, start_dt, end_dt, max_workers=3) if selected_benchmarks else {}
+
+                asset_data = {}
+                missing_assets = []
+                for sym, df in (raw_assets or {}).items():
+                    if df is None or df.empty:
+                        missing_assets.append(sym)
+                        continue
+                    # Ensure Close exists
+                    if "Close" not in df.columns and "Adj Close" in df.columns:
+                        df["Close"] = df["Adj Close"]
+                    df_feat = self.data_manager.calculate_technical_features(df)
+                    asset_data[sym] = df_feat
+
+                bench_data = {}
+                missing_bench = []
+                for sym, df in (raw_bench or {}).items():
+                    if df is None or df.empty:
+                        missing_bench.append(sym)
+                        continue
+                    if "Close" not in df.columns and "Adj Close" in df.columns:
+                        df["Close"] = df["Adj Close"]
+                    df_feat = self.data_manager.calculate_technical_features(df)
+                    bench_data[sym] = df_feat
+
+                if not asset_data:
+                    st.session_state.data_loaded = False
+                    st.error("No valid market data could be loaded for the selected assets. Try a wider date range or fewer tickers.")
+                    if missing_assets:
+                        st.info("Missing assets: " + ", ".join(missing_assets))
+                    return
+
+                # Build returns matrix (aligned)
+                returns_df = pd.DataFrame({sym: df["Returns"] for sym, df in asset_data.items() if "Returns" in df.columns})
+                returns_df = returns_df.dropna(how="all")
+
+                bench_returns_df = pd.DataFrame({sym: df["Returns"] for sym, df in bench_data.items() if "Returns" in df.columns})
+                bench_returns_df = bench_returns_df.dropna(how="all") if not bench_returns_df.empty else bench_returns_df
+
+                st.session_state.asset_data = asset_data
+                st.session_state.benchmark_data = bench_data
+                st.session_state.returns_data = returns_df
+                st.session_state.benchmark_returns_data = bench_returns_df
+                st.session_state.data_loaded = True
+
+                # Surface missing data as a soft warning
+                if missing_assets:
+                    st.sidebar.warning("Some assets returned no data: " + ", ".join(missing_assets))
+                if missing_bench:
+                    st.sidebar.warning("Some benchmarks returned no data: " + ", ".join(missing_bench))
+
+                st.sidebar.success("Data loaded.")
+            except Exception as e:
+                self._log_error(e, context="data_load")
+                st.session_state.data_loaded = False
+                st.error(f"Data load failed: {e}")
+
+    def run(self):
+        """Main app runner (Streamlit entry)."""
+        try:
+            self.display_header()
+
+            sidebar_state = self._render_sidebar_controls()
+
+            # Auto reload on changes (optional)
+            if sidebar_state.get("auto_reload", False):
+                # trigger load if fingerprint changed
+                self._load_sidebar_selection(sidebar_state)
+            # Explicit load button
+            if sidebar_state.get("load_clicked", False):
+                self._load_sidebar_selection(sidebar_state)
+
+            if not st.session_state.get("data_loaded", False):
+                self._display_welcome()
+                return
+
+            tab_labels = [
+                "📊 Dashboard",
+                "🧠 Advanced Analytics",
+                "🧮 Risk Analytics",
+                "📈 Portfolio",
+                "🧪 Stress Testing",
+                "📑 Reporting",
+                "⚙️ Settings",
+            ]
+            tabs = st.tabs(tab_labels)
+
+            with tabs[0]:
+                self._display_dashboard()
+            with tabs[1]:
+                self._display_advanced_analytics()
+            with tabs[2]:
+                self._display_risk_analytics()
+            with tabs[3]:
+                self._display_portfolio()
+            with tabs[4]:
+                self._display_stress_testing()
+            with tabs[5]:
+                self._display_reporting()
+            with tabs[6]:
+                self._display_settings()
+
+        except Exception as e:
+            self._log_error(e, context="run")
+            st.error(f"🚨 Application Error: {e}")
+            st.code(traceback.format_exc())
+
     def _display_welcome(self):
         """Display welcome screen (clean)."""
 
