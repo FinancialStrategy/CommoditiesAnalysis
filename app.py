@@ -7,6 +7,7 @@ Streamlit Cloud Optimized with Superior Architecture & Performance
 import os
 import math
 import warnings
+import textwrap
 import json
 import hashlib
 import traceback
@@ -664,8 +665,8 @@ class DependencyManager:
             }
         except ImportError:
             self.dependencies['statsmodels'] = {'available': False}
-            st.warning("⚠️ statsmodels not available - some features disabled")
-        
+            if st.session_state.get('show_system_diagnostics', False):
+                st.warning("⚠️ statsmodels not available - some features disabled")
         # arch
         try:
             from arch import arch_model
@@ -675,8 +676,8 @@ class DependencyManager:
             }
         except ImportError:
             self.dependencies['arch'] = {'available': False}
-            st.warning("⚠️ arch not available - GARCH features disabled")
-        
+            if st.session_state.get('show_system_diagnostics', False):
+                st.warning("⚠️ arch not available - GARCH features disabled")
         # hmmlearn & sklearn
         try:
             from hmmlearn.hmm import GaussianHMM
@@ -2344,6 +2345,14 @@ class InstitutionalCommoditiesDashboard:
         with st.sidebar:
             st.markdown("## ⚙️ Controls")
 
+            with st.expander("System", expanded=False):
+                st.checkbox(
+                    "Show system diagnostics",
+                    key="show_system_diagnostics",
+                    value=False,
+                    help="When enabled, shows optional dependency notices and low-level system warnings."
+                )
+
             # --- Universe / Asset selection ---
             categories = list(COMMODITIES_UNIVERSE.keys())
             # Prefer common defaults if available
@@ -2382,7 +2391,7 @@ class InstitutionalCommoditiesDashboard:
 
             # --- Benchmarks ---
             bench_options = list(BENCHMARKS.keys())
-            bench_to_label = {k: f"{k} — {v.name}" for k, v in BENCHMARKS.items()}
+            bench_to_label = {k: f"{k} — {(v.get('name', '') if isinstance(v, dict) else getattr(v, 'name', str(v)))}" for k, v in BENCHMARKS.items()}
             preferred_bench = ["SPY", "BCOM", "DBC"]
             default_bench = [b for b in preferred_bench if b in bench_options][:1] or (bench_options[:1] if bench_options else [])
             selected_benchmarks = st.multiselect(
@@ -2628,49 +2637,49 @@ class InstitutionalCommoditiesDashboard:
         with col1:
             returns_df = pd.DataFrame(st.session_state.returns_data).dropna()
             avg_return = returns_df.mean().mean() * 252 * 100 if not returns_df.empty else 0
-            st.markdown(f"""
+            st.markdown(textwrap.dedent(f"""
             <div class="metric-card">
                 <div class="metric-label">📈 Avg Annual Return</div>
                 <div class="metric-value {'positive' if avg_return > 0 else 'negative'}">
                     {avg_return:.2f}%
                 </div>
             </div>
-            """, unsafe_allow_html=True)
+            """), unsafe_allow_html=True)
         
         with col2:
             avg_vol = returns_df.std().mean() * np.sqrt(252) * 100 if not returns_df.empty else 0
-            st.markdown(f"""
+            st.markdown(textwrap.dedent(f"""
             <div class="metric-card">
                 <div class="metric-label">📉 Avg Volatility</div>
                 <div class="metric-value">{avg_vol:.2f}%</div>
             </div>
-            """, unsafe_allow_html=True)
+            """), unsafe_allow_html=True)
         
         with col3:
             if len(returns_df.columns) > 1:
                 avg_corr = returns_df.corr().values[np.triu_indices(len(returns_df.columns), 1)].mean()
-                st.markdown(f"""
+                st.markdown(textwrap.dedent(f"""
                 <div class="metric-card">
                     <div class="metric-label">🔗 Avg Correlation</div>
                     <div class="metric-value">{avg_corr:.3f}</div>
                 </div>
-                """, unsafe_allow_html=True)
+                """), unsafe_allow_html=True)
             else:
-                st.markdown("""
+                st.markdown(textwrap.dedent("""
                 <div class="metric-card">
                     <div class="metric-label">🔗 Avg Correlation</div>
                     <div class="metric-value">N/A</div>
                 </div>
-                """, unsafe_allow_html=True)
+                """), unsafe_allow_html=True)
         
         with col4:
             total_days = len(returns_df) if not returns_df.empty else 0
-            st.markdown(f"""
+            st.markdown(textwrap.dedent(f"""
             <div class="metric-card">
                 <div class="metric-label">📅 Trading Days</div>
                 <div class="metric-value">{total_days:,}</div>
             </div>
-            """, unsafe_allow_html=True)
+            """), unsafe_allow_html=True)
         
         # Asset performance table
         st.markdown("### 📈 Asset Performance Overview")
@@ -2806,7 +2815,7 @@ class InstitutionalCommoditiesDashboard:
                                 status = "Current"
                                 color = "var(--primary)"
                             
-                            st.markdown(f"""
+                            st.markdown(textwrap.dedent(f"""
                             <div class="metric-card" style="border-left-color: {color};">
                                 <div class="metric-label">{name}</div>
                                 <div class="metric-value" style="color: {color};">{value:.2f}</div>
@@ -2814,7 +2823,7 @@ class InstitutionalCommoditiesDashboard:
                                     {status}
                                 </div>
                             </div>
-                            """, unsafe_allow_html=True)
+                            """), unsafe_allow_html=True)
         
         # Correlation matrix
         if len(st.session_state.returns_data) > 1:
@@ -2929,7 +2938,7 @@ class InstitutionalCommoditiesDashboard:
                 })
             
             for item in sorted(weight_data, key=lambda x: x['Weight'], reverse=True):
-                st.markdown(f"""
+                st.markdown(textwrap.dedent(f"""
                 <div style="margin-bottom: 10px;">
                     <div style="display: flex; justify-content: space-between; margin-bottom: 5px;">
                         <span style="color: {item['Color']}; font-weight: 600;">{item['Asset']}</span>
@@ -2939,7 +2948,7 @@ class InstitutionalCommoditiesDashboard:
                         <div style="background: {item['Color']}; width: {item['Weight']*100}%; height: 100%;"></div>
                     </div>
                 </div>
-                """, unsafe_allow_html=True)
+                """), unsafe_allow_html=True)
         
         # Calculate portfolio metrics
         portfolio_returns = returns_df @ weights
@@ -2988,12 +2997,12 @@ class InstitutionalCommoditiesDashboard:
         for i, (label, key, fmt, color_class, tooltip) in enumerate(metric_configs):
             with cols[i % 4]:
                 value = portfolio_metrics.get(key, 0)
-                st.markdown(f"""
+                st.markdown(textwrap.dedent(f"""
                 <div class="metric-card custom-tooltip" data-tooltip="{tooltip}">
                     <div class="metric-label">{label}</div>
                     <div class="metric-value {color_class}">{fmt.format(value)}</div>
                 </div>
-                """, unsafe_allow_html=True)
+                """), unsafe_allow_html=True)
         
         st.markdown('</div>', unsafe_allow_html=True)
         
@@ -3013,12 +3022,12 @@ class InstitutionalCommoditiesDashboard:
         for i, (label, key, fmt, color_class, tooltip) in enumerate(risk_configs):
             with risk_cols[i]:
                 value = portfolio_metrics.get(key, 0)
-                st.markdown(f"""
+                st.markdown(textwrap.dedent(f"""
                 <div class="metric-card custom-tooltip" data-tooltip="{tooltip}">
                     <div class="metric-label">{label}</div>
                     <div class="metric-value {color_class}">{fmt.format(value)}</div>
                 </div>
-                """, unsafe_allow_html=True)
+                """), unsafe_allow_html=True)
         
         st.markdown('</div>', unsafe_allow_html=True)
         
@@ -4305,14 +4314,14 @@ def main():
         st.markdown(hide_streamlit_style, unsafe_allow_html=True)
         
         # Add custom CSS for additional styling
-        st.markdown("""
+        st.markdown(textwrap.dedent("""
         <style>
             .stAlert { border-radius: 10px; }
             .stButton > button { border-radius: 8px; }
             .stSelectbox, .stMultiselect { border-radius: 8px; }
             .stSlider { border-radius: 8px; }
         </style>
-        """, unsafe_allow_html=True)
+        """), unsafe_allow_html=True)
         
         # Initialize and run dashboard
         dashboard = InstitutionalCommoditiesDashboard()
