@@ -3365,7 +3365,12 @@ class InstitutionalCommoditiesDashboard:
                     else:
                         st.warning(f"⚠️ {result.get('message', 'Regime detection failed')}")
     
-    def _display_risk_analysis(self, config: AnalysisConfiguration):
+    
+    def _display_risk_analytics(self, config: AnalysisConfiguration):
+        """Backward-compatible alias for _display_risk_analysis (older call sites)."""
+        return self._display_risk_analysis(config)
+
+def _display_risk_analysis(self, config: AnalysisConfiguration):
         """Display risk analysis"""
         st.markdown("### ⚠️ Risk Analysis")
         
