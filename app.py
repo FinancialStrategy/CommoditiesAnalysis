@@ -2576,8 +2576,23 @@ class InstitutionalCommoditiesDashboard:
             if sidebar_state.get("load_clicked", False):
                 self._load_sidebar_selection(sidebar_state)
 
+            # --- Ensure AnalysisConfiguration exists (used by all display tabs) ---
+
+
+            cfg = st.session_state.get("analysis_config")
+
+
+            if cfg is None or not isinstance(cfg, AnalysisConfiguration):
+
+
+                cfg = AnalysisConfiguration()
+
+
+                st.session_state["analysis_config"] = cfg
+
+
             if not st.session_state.get("data_loaded", False):
-                self._display_welcome()
+                self._display_welcome(cfg)
                 return
 
             tab_labels = [
@@ -2592,19 +2607,19 @@ class InstitutionalCommoditiesDashboard:
             tabs = st.tabs(tab_labels)
 
             with tabs[0]:
-                self._display_dashboard()
+                self._display_dashboard(cfg)
             with tabs[1]:
-                self._display_advanced_analytics()
+                self._display_advanced_analytics(cfg)
             with tabs[2]:
-                self._display_risk_analytics()
+                self._display_risk_analytics(cfg)
             with tabs[3]:
-                self._display_portfolio()
+                self._display_portfolio(cfg)
             with tabs[4]:
-                self._display_stress_testing()
+                self._display_stress_testing(cfg)
             with tabs[5]:
-                self._display_reporting()
+                self._display_reporting(cfg)
             with tabs[6]:
-                self._display_settings()
+                self._display_settings(cfg)
 
         except Exception as e:
             self._log_error(e, context="run")
