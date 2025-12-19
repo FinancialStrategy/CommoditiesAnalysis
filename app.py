@@ -21,6 +21,7 @@ from pathlib import Path
 import pickle
 import contextlib
 import sys
+import importlib
 
 import numpy as np
 import pandas as pd
@@ -62,6 +63,84 @@ def yf_download_safe(params: Dict[str, Any]) -> pd.DataFrame:
 # =============================================================================
 # ADVANCED OPTIMIZATION DECORATORS
 # =============================================================================
+
+
+# =============================================================================
+# OPTIONAL DEPENDENCY MANAGER (STREAMLIT CLOUD-SAFE)
+# =============================================================================
+
+class DependencyManager:
+    """Lightweight optional dependency manager.
+
+    Keeps the app resilient on Streamlit Cloud where some heavy packages (arch, hmmlearn)
+    may not be installed. Code can query availability safely without crashing.
+    """
+
+    def __init__(self):
+        self.dependencies: Dict[str, Dict[str, Any]] = {}
+        self._load_defaults()
+
+    @staticmethod
+    def _safe_import(module_name: str):
+        try:
+            return importlib.import_module(module_name)
+        except Exception:
+            return None
+
+    def _load_defaults(self):
+        # --- ARCH / GARCH (arch) ---
+        arch_mod = self._safe_import("arch")
+        if arch_mod is not None:
+            try:
+                from arch import arch_model as _arch_model
+                self.dependencies["arch"] = {
+                    "available": True,
+                    "module": arch_mod,
+                    "arch_model": _arch_model
+                }
+            except Exception:
+                self.dependencies["arch"] = {
+                    "available": False,
+                    "module": None,
+                    "arch_model": None
+                }
+        else:
+            self.dependencies["arch"] = {
+                "available": False,
+                "module": None,
+                "arch_model": None
+            }
+
+        # --- HMM (hmmlearn) ---
+        hmm_mod = self._safe_import("hmmlearn")
+        if hmm_mod is not None:
+            try:
+                from hmmlearn.hmm import GaussianHMM as _GaussianHMM
+                self.dependencies["hmmlearn"] = {
+                    "available": True,
+                    "module": hmm_mod,
+                    "GaussianHMM": _GaussianHMM
+                }
+            except Exception:
+                self.dependencies["hmmlearn"] = {
+                    "available": False,
+                    "module": None,
+                    "GaussianHMM": None
+                }
+        else:
+            self.dependencies["hmmlearn"] = {
+                "available": False,
+                "module": None,
+                "GaussianHMM": None
+            }
+
+    def is_available(self, name: str) -> bool:
+        info = self.dependencies.get(name, {})
+        return bool(info.get("available", False))
+
+
+# Global singleton used across the app
+dep_manager = DependencyManager()
 
 class PerformanceOptimizer:
     """Advanced performance optimization utilities"""
@@ -2485,6 +2564,166 @@ class InstitutionalAnalytics:
             }
         }
 
+
+
+    # -------------------------------------------------------------------------
+    # Regime Detection (HMM / fallback)
+    # -------------------------------------------------------------------------
+    def detect_regimes(
+        self,
+        returns: pd.Series,
+        n_regimes: int = 3,
+        features: Optional[List[str]] = None,
+        random_state: int = 42,
+        lookback: int = 21,
+        n_iter: int = 500
+    ) -> Dict[str, Any]:
+        """Detect market regimes using HMM (preferred) with robust fallbacks.
+
+        Parameters
+        ----------
+        returns : pd.Series
+            Return series (daily). Index must be datetime-like.
+        n_regimes : int
+            Number of latent regimes to detect.
+        features : list[str]
+            Feature names from: returns, volatility, momentum, range, volume.
+            (volume is not available if only returns are provided; it will be ignored.)
+        """
+        if features is None:
+            features = ["returns", "volatility"]
+
+        if returns is None:
+            return {"available": False, "message": "No returns provided"}
+
+        rets = pd.Series(returns).dropna()
+        if len(rets) < max(200, lookback * 10):
+            return {"available": False, "message": "Insufficient data for regime detection (min ~200 obs required)"}
+
+        # Build features from returns only (volume not available here)
+        feat = pd.DataFrame(index=rets.index)
+
+        if "returns" in features:
+            feat["returns"] = rets
+
+        if "volatility" in features:
+            feat["volatility"] = rets.rolling(lookback).std()
+
+        if "momentum" in features:
+            feat["momentum"] = rets.rolling(lookback).mean()
+
+        if "range" in features:
+            feat["range"] = rets.rolling(lookback).max() - rets.rolling(lookback).min()
+
+        if "volume" in features:
+            # Not available when only returns are provided
+            feat["volume"] = np.nan
+
+        feat = feat.dropna()
+        if feat.empty or len(feat) < 50:
+            return {"available": False, "message": "Feature matrix is empty after preprocessing"}
+
+        # Standardize features (robust to zero variance)
+        mu = feat.mean()
+        sigma = feat.std(ddof=0).replace(0, np.nan)
+        X = ((feat - mu) / sigma).dropna()
+        if X.empty:
+            return {"available": False, "message": "Feature matrix became empty after standardization"}
+
+        # Preferred: HMM (hmmlearn)
+        hmm_cls = dep_manager.dependencies.get("hmmlearn", {}).get("GaussianHMM")
+        if hmm_cls is None:
+            try:
+                from hmmlearn.hmm import GaussianHMM as hmm_cls  # type: ignore
+            except Exception:
+                hmm_cls = None
+
+        if hmm_cls is None:
+            # Fallback: KMeans clustering (if sklearn exists)
+            try:
+                from sklearn.cluster import KMeans
+                km = KMeans(n_clusters=n_regimes, random_state=random_state, n_init=10)
+                states = km.fit_predict(X.values)
+                model = km
+                probs = None
+            except Exception:
+                return {"available": False, "message": "Neither hmmlearn nor sklearn KMeans is available"}
+        else:
+            try:
+                model = hmm_cls(
+                    n_components=int(n_regimes),
+                    covariance_type="full",
+                    n_iter=int(n_iter),
+                    random_state=int(random_state)
+                )
+                model.fit(X.values)
+                states = model.predict(X.values)
+                try:
+                    probs = model.predict_proba(X.values)
+                except Exception:
+                    probs = None
+            except Exception as e:
+                return {"available": False, "message": f"Regime model fitting failed: {str(e)[:160]}"}
+
+        states_series = pd.Series(states, index=X.index, name="regime_raw")
+
+        # Relabel regimes by mean return (low -> high) for stable interpretation
+        aligned_rets = rets.loc[states_series.index]
+        state_means = {}
+        for s in sorted(states_series.unique()):
+            subset = aligned_rets[states_series == s]
+            state_means[int(s)] = float(subset.mean()) if len(subset) else -1e9
+
+        ordered = sorted(state_means.keys(), key=lambda k: state_means[k])
+        mapping = {old: new for new, old in enumerate(ordered)}
+        regimes = states_series.map(mapping).astype(int)
+        regimes.name = "regime"
+
+        # Regime stats (values in % where UI expects)
+        stats_records: List[Dict[str, Any]] = []
+        for r in sorted(regimes.unique()):
+            subset = aligned_rets[regimes == r]
+            if subset.empty:
+                continue
+
+            mean_ann_pct = float(subset.mean() * self.annual_trading_days * 100)
+            vol_ann_pct = float(subset.std(ddof=0) * np.sqrt(self.annual_trading_days) * 100)
+            sharpe = (mean_ann_pct / 100 - self.risk_free_rate) / (vol_ann_pct / 100) if vol_ann_pct > 0 else np.nan
+            freq_pct = float(len(subset) / len(aligned_rets) * 100)
+
+            # Historical daily 95% VaR (5th percentile) in %
+            var_95_pct = float(np.percentile(subset.values, 5) * 100)
+
+            stats_records.append({
+                "regime": int(r),
+                "frequency": freq_pct,
+                "mean_return": mean_ann_pct,
+                "volatility": vol_ann_pct,
+                "sharpe": float(sharpe) if sharpe == sharpe else np.nan,  # NaN-safe
+                "var_95": var_95_pct,
+                "n_obs": int(len(subset))
+            })
+
+        result = {
+            "available": True,
+            "regimes": regimes,
+            "regime_stats": stats_records,
+            "model": model
+        }
+
+        if probs is not None:
+            try:
+                prob_df = pd.DataFrame(probs, index=X.index)
+                prob_df.columns = [f"state_{i}" for i in range(prob_df.shape[1])]
+                result["probabilities"] = prob_df
+            except Exception:
+                pass
+
+        # Also return features used (non-standardized) for transparency
+        result["features_df"] = feat.loc[X.index]
+
+        return result
+
 # =============================================================================
 # ENHANCED VISUALIZATION ENGINE
 # =============================================================================
@@ -2930,6 +3169,310 @@ class InstitutionalVisualizer:
         )
         
         return fig
+
+
+    # -------------------------------------------------------------------------
+    # Portfolio / Asset Performance Chart (vs Benchmark) - robust
+    # -------------------------------------------------------------------------
+    def create_performance_chart(
+        self,
+        asset_returns: pd.Series,
+        benchmark_returns: Optional[pd.Series] = None,
+        title: str = "Performance Analysis",
+        rolling_window: int = 21
+    ) -> go.Figure:
+        """Create a robust performance chart (cumulative + drawdown)."""
+        ar = pd.Series(asset_returns).dropna()
+        if ar.empty:
+            fig = go.Figure()
+            fig.update_layout(title=f"{title} (no data)", template=self.template, height=450)
+            return fig
+
+        br = None
+        if benchmark_returns is not None:
+            br = pd.Series(benchmark_returns).dropna()
+
+        # Align
+        if br is not None and not br.empty:
+            df = pd.concat([ar.rename("asset"), br.rename("bench")], axis=1).dropna()
+            ar = df["asset"]
+            br = df["bench"]
+
+        # Cumulative returns
+        cum_a = (1 + ar).cumprod() - 1
+        dd_a = (cum_a + 1) / (cum_a + 1).cummax() - 1
+
+        fig = make_subplots(
+            rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
+            row_heights=[0.65, 0.35],
+            subplot_titles=("Cumulative Return", "Drawdown")
+        )
+
+        fig.add_trace(
+            go.Scatter(
+                x=cum_a.index, y=cum_a.values,
+                name="Asset",
+                mode="lines",
+                line=dict(width=2.5, color=self.colors["primary"])
+            ),
+            row=1, col=1
+        )
+
+        if br is not None and not br.empty:
+            cum_b = (1 + br).cumprod() - 1
+            dd_b = (cum_b + 1) / (cum_b + 1).cummax() - 1
+
+            fig.add_trace(
+                go.Scatter(
+                    x=cum_b.index, y=cum_b.values,
+                    name="Benchmark",
+                    mode="lines",
+                    line=dict(width=2.0, color=self.colors["secondary"], dash="dash")
+                ),
+                row=1, col=1
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=dd_b.index, y=dd_b.values,
+                    name="Benchmark DD",
+                    mode="lines",
+                    line=dict(width=1.6, color=self.colors["gray"], dash="dot"),
+                    showlegend=False
+                ),
+                row=2, col=1
+            )
+
+        fig.add_trace(
+            go.Scatter(
+                x=dd_a.index, y=dd_a.values,
+                name="Drawdown",
+                mode="lines",
+                line=dict(width=2.0, color=self.colors["danger"]),
+                showlegend=False
+            ),
+            row=2, col=1
+        )
+
+        # Rolling Sharpe (optional hover)
+        try:
+            rmean = ar.rolling(rolling_window).mean() * 252
+            rstd = ar.rolling(rolling_window).std() * np.sqrt(252)
+            rsh = (rmean - 0.0) / rstd
+            fig.add_trace(
+                go.Scatter(
+                    x=rsh.index, y=rsh.values,
+                    name=f"Rolling Sharpe ({rolling_window}d)",
+                    mode="lines",
+                    line=dict(width=1.5, color=self.colors["accent"]),
+                    opacity=0.35
+                ),
+                row=1, col=1
+            )
+        except Exception:
+            pass
+
+        fig.update_layout(
+            title=title,
+            height=650,
+            template=self.template,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+            hovermode="x unified"
+        )
+        fig.update_yaxes(tickformat=".0%", row=1, col=1)
+        fig.update_yaxes(tickformat=".0%", row=2, col=1)
+        return fig
+
+    # -------------------------------------------------------------------------
+    # GARCH Volatility Chart - robust (in-sample + forecast + realized)
+    # -------------------------------------------------------------------------
+    def create_garch_volatility(
+        self,
+        returns: pd.Series,
+        conditional_volatility: pd.Series,
+        volatility_forecast: Optional[Any] = None,
+        title: str = "GARCH Volatility"
+    ) -> go.Figure:
+        rets = pd.Series(returns).dropna()
+        cv = pd.Series(conditional_volatility).dropna()
+
+        if rets.empty or cv.empty:
+            fig = go.Figure()
+            fig.update_layout(title=f"{title} (no data)", template=self.template, height=450)
+            return fig
+
+        # Align by index where possible
+        df = pd.concat([rets.rename("returns"), cv.rename("cond_vol")], axis=1).dropna()
+        rets = df["returns"]
+        cv = df["cond_vol"]
+
+        # If cv looks like percent (typical arch output), annualize accordingly
+        cv_vals = cv.values.astype(float)
+        if np.nanmedian(np.abs(cv_vals)) > 1.0:
+            vol_daily = cv_vals / 100.0
+        else:
+            vol_daily = cv_vals
+
+        vol_ann = vol_daily * np.sqrt(252)
+
+        # Realized volatility (21d)
+        rv = rets.rolling(21).std() * np.sqrt(252)
+
+        fig = go.Figure()
+        fig.add_trace(
+            go.Scatter(
+                x=cv.index, y=vol_ann,
+                name="GARCH Vol (ann.)",
+                mode="lines",
+                line=dict(width=2.5, color=self.colors["primary"])
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=rv.index, y=rv.values,
+                name="Realized Vol (21d, ann.)",
+                mode="lines",
+                line=dict(width=1.8, color=self.colors["secondary"], dash="dash"),
+                opacity=0.9
+            )
+        )
+
+        # Forecast (if provided)
+        try:
+            if volatility_forecast is not None:
+                if isinstance(volatility_forecast, (list, tuple, np.ndarray, pd.Series)):
+                    f = np.array(volatility_forecast, dtype=float).flatten()
+                elif isinstance(volatility_forecast, dict) and "forecast" in volatility_forecast:
+                    f = np.array(volatility_forecast["forecast"], dtype=float).flatten()
+                else:
+                    f = None
+
+                if f is not None and len(f) > 0:
+                    # Assume forecast is daily vol (same scale as vol_daily)
+                    if np.nanmedian(np.abs(f)) > 1.0:
+                        f_daily = f / 100.0
+                    else:
+                        f_daily = f
+                    f_ann = f_daily * np.sqrt(252)
+
+                    last_dt = cv.index.max()
+                    # create forward dates (business days)
+                    f_idx = pd.bdate_range(last_dt, periods=len(f_ann) + 1, closed="right")
+                    fig.add_trace(
+                        go.Scatter(
+                            x=f_idx, y=f_ann,
+                            name="Forecast (ann.)",
+                            mode="lines",
+                            line=dict(width=2.2, color=self.colors["accent"], dash="dot")
+                        )
+                    )
+        except Exception:
+            pass
+
+        fig.update_layout(
+            title=title,
+            height=520,
+            template=self.template,
+            yaxis_title="Annualized Volatility",
+            xaxis_title="Date",
+            hovermode="x unified",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0)
+        )
+        fig.update_yaxes(tickformat=".1%")
+        return fig
+
+    # -------------------------------------------------------------------------
+    # Regime Chart (price + regime shading) - robust
+    # -------------------------------------------------------------------------
+    def create_regime_chart(
+        self,
+        price: pd.Series,
+        regimes: pd.Series,
+        regime_labels: Optional[Dict[int, Dict[str, Any]]] = None,
+        title: str = "Market Regimes"
+    ) -> go.Figure:
+        p = pd.Series(price).dropna()
+        r = pd.Series(regimes).dropna()
+
+        if p.empty or r.empty:
+            fig = go.Figure()
+            fig.update_layout(title=f"{title} (no data)", template=self.template, height=450)
+            return fig
+
+        # Align by intersection
+        df = pd.concat([p.rename("price"), r.rename("regime")], axis=1).dropna()
+        p = df["price"]
+        r = df["regime"].astype(int)
+
+        fig = go.Figure()
+        fig.add_trace(
+            go.Scatter(
+                x=p.index, y=p.values,
+                name="Price",
+                mode="lines",
+                line=dict(width=2.2, color=self.colors["primary"])
+            )
+        )
+
+        # Shading by consecutive regime segments
+        if regime_labels is None:
+            regime_labels = {}
+
+        # Choose colors
+        default_palette = [
+            self.colors["danger"],
+            self.colors["warning"],
+            self.colors["success"],
+            self.colors["secondary"],
+            self.colors["accent"]
+        ]
+
+        def _color_for(regime_id: int):
+            lab = regime_labels.get(int(regime_id), {})
+            return lab.get("color", default_palette[int(regime_id) % len(default_palette)])
+
+        # Build segments
+        segments = []
+        curr = int(r.iloc[0])
+        seg_start = r.index[0]
+        for dt, reg in r.iloc[1:].items():
+            reg = int(reg)
+            if reg != curr:
+                segments.append((seg_start, dt, curr))
+                seg_start = dt
+                curr = reg
+        segments.append((seg_start, r.index[-1], curr))
+
+        for (a, b, reg) in segments:
+            fig.add_vrect(
+                x0=a, x1=b,
+                fillcolor=_color_for(reg),
+                opacity=0.10,
+                line_width=0,
+                layer="below"
+            )
+
+        # Annotate legend-like markers
+        uniq = sorted(r.unique())
+        for u in uniq:
+            name = regime_labels.get(int(u), {}).get("name", f"Regime {int(u)}")
+            fig.add_trace(
+                go.Scatter(
+                    x=[p.index[0]], y=[None],
+                    mode="markers",
+                    marker=dict(size=10, color=_color_for(u)),
+                    name=name
+                )
+            )
+
+        fig.update_layout(
+            title=title,
+            height=520,
+            template=self.template,
+            hovermode="x unified",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0)
+        )
+        return fig
+
 
 # =============================================================================
 # ENHANCED DASHBOARD METHODS
