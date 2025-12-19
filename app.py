@@ -2064,60 +2064,46 @@ class InstitutionalVisualizer:
         fig.update_xaxes(title_text="Theoretical Quantiles", row=3, col=2)
         
         return fig
-
-def create_correlation_matrix(
-    self,
-    corr_matrix: pd.DataFrame,
-    title: str = "Correlation Matrix",
-    counts_matrix: Optional[pd.DataFrame] = None,
-    show_values: bool = True
-) -> go.Figure:
-    """Create interactive correlation heatmap (optionally with overlap counts)."""
-
-    # Optional overlap counts (N) for hover
-    customdata = None
-    hovertemplate = "%{y} vs %{x}<br>Corr=%{z:.3f}<extra></extra>"
-    if counts_matrix is not None:
-        try:
-            aligned_counts = counts_matrix.reindex(index=corr_matrix.index, columns=corr_matrix.columns)
-            customdata = aligned_counts.values
-            hovertemplate = "%{y} vs %{x}<br>Corr=%{z:.3f}<br>N=%{customdata}<extra></extra>"
-        except Exception:
-            customdata = None
-
-    hm_kwargs = dict(
-        z=corr_matrix.values,
-        x=corr_matrix.columns,
-        y=corr_matrix.index,
-        colorscale='RdBu',
-        zmid=0,
-        zmin=-1,
-        zmax=1,
-        hovertemplate=hovertemplate,
-        customdata=customdata,
-        colorbar=dict(
-            title=dict(text='Correlation'),
-            tickformat='.2f'
+    
+    def create_correlation_matrix(
+        self,
+        corr_matrix: pd.DataFrame,
+        title: str = "Correlation Matrix"
+    ) -> go.Figure:
+        """Create interactive correlation heatmap"""
+        
+        fig = go.Figure(data=go.Heatmap(
+            z=corr_matrix.values,
+            x=corr_matrix.columns,
+            y=corr_matrix.index,
+            colorscale='RdBu',
+            zmid=0,
+            zmin=-1,
+            zmax=1,
+            text=corr_matrix.round(2).values,
+            texttemplate='%{text}',
+            hoverinfo='x+y+z',
+	            # Plotly Heatmap ColorBar does NOT support a top-level `titleside`.
+	            # Some snippets online use `titleside`, but it will raise on
+	            # Streamlit Cloud's Plotly versions.
+	            # Use the supported nested form: colorbar.title.text.
+	            colorbar=dict(
+	                title=dict(text='Correlation'),
+	                tickformat='.2f'
+	            )
+        ))
+        
+        fig.update_layout(
+            title=dict(text=title, x=0.5, font=dict(size=20)),
+            height=600,
+            width=max(800, len(corr_matrix.columns) * 100),
+            template=self.template,
+            xaxis_tickangle=45,
+            xaxis=dict(side="bottom"),
+            yaxis=dict(autorange="reversed")
         )
-    )
-
-    if show_values:
-        hm_kwargs["text"] = corr_matrix.round(2).values
-        hm_kwargs["texttemplate"] = '%{text}'
-
-    fig = go.Figure(data=go.Heatmap(**hm_kwargs))
-
-    fig.update_layout(
-        title=dict(text=title, x=0.5, font=dict(size=20)),
-        height=600,
-        width=max(800, len(corr_matrix.columns) * 100),
-        template=self.template,
-        xaxis_tickangle=45,
-        xaxis=dict(side="bottom"),
-        yaxis=dict(autorange="reversed")
-    )
-
-    return fig
+        
+        return fig
     
     def create_risk_decomposition(
         self,
@@ -2330,131 +2316,7 @@ class InstitutionalCommoditiesDashboard:
             'traceback': traceback.format_exc()
         }
         st.session_state.error_log.append(error_entry)
-
-
-# =========================================================================
-# CORRELATION ENGINE (SMART + ROBUST)
-# =========================================================================
-
-def _build_returns_matrix(self, return_type: str = "Simple Returns") -> pd.DataFrame:
-    """Build a returns matrix from loaded asset_data (date-aligned by index).
-
-    Notes
-    - Uses the feature columns computed by EnhancedDataManager.calculate_technical_features().
-    - Falls back gracefully if a specific return series is missing.
-    """
-    asset_data = st.session_state.get("asset_data", {})
-    if not isinstance(asset_data, dict) or not asset_data:
-        # Fallback: use what is already stored
-        rd = st.session_state.get("returns_data", pd.DataFrame())
-        return rd.copy() if isinstance(rd, pd.DataFrame) else pd.DataFrame()
-
-    col = "Returns"
-    if isinstance(return_type, str) and "log" in return_type.lower():
-        col = "Log_Returns"
-
-    data = {}
-    for sym, df in asset_data.items():
-        if isinstance(df, pd.DataFrame) and col in df.columns:
-            data[sym] = pd.to_numeric(df[col], errors="coerce")
-        elif isinstance(df, pd.DataFrame) and "Returns" in df.columns:
-            data[sym] = pd.to_numeric(df["Returns"], errors="coerce")
-
-    out = pd.DataFrame(data).sort_index()
-    out = out.dropna(how="all")
-    return out
-
-def _compute_correlation_pack(
-    self,
-    returns_df: pd.DataFrame,
-    method: str = "pearson",
-    lookback: int = 504,
-    align_mode: str = "Intersection",
-    winsorize: bool = True,
-    winsor_q: Tuple[float, float] = (0.01, 0.99),
-    min_overlap: int = 60,
-    cluster_order: bool = True
-) -> Dict[str, Any]:
-    """Compute correlation matrix + overlap counts with optional clustering reorder."""
-    if returns_df is None or not isinstance(returns_df, pd.DataFrame) or returns_df.empty:
-        return {}
-
-    df = returns_df.copy()
-    df = df.sort_index()
-    df = df.dropna(how="all")
-
-    if df.shape[1] < 2:
-        return {}
-
-    # Lookback window (rows)
-    if lookback is not None and lookback > 0 and len(df) > lookback:
-        df = df.tail(int(lookback))
-
-    # Winsorize to reduce outlier-driven correlation artifacts
-    if winsorize and len(df) > 10:
-        ql, qh = winsor_q
-
-        def _clip(s: pd.Series) -> pd.Series:
-            s2 = pd.to_numeric(s, errors="coerce")
-            s2 = s2.replace([np.inf, -np.inf], np.nan)
-            if s2.dropna().empty:
-                return s2
-            lo = s2.quantile(ql)
-            hi = s2.quantile(qh)
-            return s2.clip(lower=lo, upper=hi)
-
-        df = df.apply(_clip, axis=0)
-
-    # Alignment mode
-    if isinstance(align_mode, str) and align_mode.lower().startswith("inter"):
-        df_use = df.dropna(how="any")
-    else:
-        df_use = df
-
-    if df_use.empty or df_use.shape[1] < 2:
-        return {}
-
-    # Overlap counts (N) per pair
-    mask = df_use.notna().astype(int)
-    counts = (mask.T @ mask).astype(int)
-
-    # Correlation with minimum overlap constraint
-    method = (method or "pearson").lower().strip()
-    if method not in ("pearson", "spearman", "kendall"):
-        method = "pearson"
-
-    corr = df_use.corr(method=method, min_periods=int(min_overlap) if min_overlap else None)
-
-    # Cluster & reorder (brings similar assets together)
-    if cluster_order and corr.shape[0] > 2:
-        try:
-            import scipy.cluster.hierarchy as sch
-            import scipy.spatial.distance as ssd
-
-            corr_f = corr.fillna(0.0).clip(-1, 1)
-            dist = (1.0 - corr_f).clip(lower=0.0)
-            condensed = ssd.squareform(dist.values, checks=False)
-            linkage = sch.linkage(condensed, method="average")
-            order = sch.leaves_list(linkage)
-            cols = corr.index[order].tolist()
-            corr = corr.loc[cols, cols]
-            counts = counts.loc[cols, cols]
-        except Exception:
-            pass
-
-    # Pair list (upper triangle) for summary tables
-    try:
-        tri_mask = np.triu(np.ones(corr.shape), k=1).astype(bool)
-        pairs = corr.where(tri_mask).stack().dropna()
-    except Exception:
-        pairs = pd.Series(dtype=float)
-
-    return {
-        "returns": df_use,
-        "corr": corr,
-        "counts": counts,
-        "pairs": pairs
-    }    
+    
     # =========================================================================
     # HEADER & SIDEBAR
     # =========================================================================
@@ -2981,126 +2843,193 @@ def _compute_correlation_pack(
                             </div>
                             """), unsafe_allow_html=True)
 
-# Correlation matrix (SMART)
-returns_data = st.session_state.get("returns_data", None)
-if isinstance(returns_data, pd.DataFrame) and returns_data.shape[1] > 1:
-    st.markdown("### 🔗 Correlation Analysis")
+        # Correlation matrix (SMART + ROBUST)
+        try:
+            returns_src = st.session_state.get("returns_data", None)
 
-    with st.expander("⚙️ Correlation Settings", expanded=False):
-        return_type = st.selectbox(
-            "Return series",
-            ["Simple Returns", "Log Returns"],
-            index=0,
-            key="dash_corr_return_type"
-        )
-        corr_method_ui = st.selectbox(
-            "Correlation method",
-            ["Pearson (linear)", "Spearman (rank)", "Kendall (rank)"],
-            index=0,
-            key="dash_corr_method"
-        )
-        align_mode_ui = st.radio(
-            "Date alignment",
-            ["Intersection (same dates)", "Pairwise (max data)"],
-            horizontal=True,
-            key="dash_corr_align"
-        )
-        lookback = st.slider(
-            "Lookback window (trading days)",
-            min_value=60,
-            max_value=2520,
-            value=504,
-            step=20,
-            key="dash_corr_lookback"
-        )
-        min_overlap = st.slider(
-            "Minimum overlap (days) for each pair",
-            min_value=20,
-            max_value=252,
-            value=60,
-            step=5,
-            key="dash_corr_min_overlap"
-        )
-        winsorize = st.checkbox(
-            "Winsorize returns (1% / 99%) to reduce outlier impact",
-            value=True,
-            key="dash_corr_winsor"
-        )
-        cluster_order = st.checkbox(
-            "Cluster & reorder assets",
-            value=True,
-            key="dash_corr_cluster"
-        )
+            # Normalize to DataFrame
+            if isinstance(returns_src, pd.DataFrame):
+                returns_df = returns_src.copy()
+            elif isinstance(returns_src, dict):
+                returns_df = pd.DataFrame(returns_src)
+            else:
+                returns_df = pd.DataFrame()
 
-    method_map = {
-        "Pearson (linear)": "pearson",
-        "Spearman (rank)": "spearman",
-        "Kendall (rank)": "kendall"
-    }
-    align_map = {
-        "Intersection (same dates)": "Intersection",
-        "Pairwise (max data)": "Pairwise"
-    }
+            if isinstance(returns_df, pd.DataFrame) and returns_df.shape[1] > 1:
+                st.markdown("### 🔗 Correlation Analysis (Smart)")
 
-    base_df = self._build_returns_matrix(return_type=return_type)
-    pack = self._compute_correlation_pack(
-        base_df,
-        method=method_map.get(corr_method_ui, "pearson"),
-        lookback=int(lookback),
-        align_mode=align_map.get(align_mode_ui, "Intersection"),
-        winsorize=bool(winsorize),
-        min_overlap=int(min_overlap),
-        cluster_order=bool(cluster_order)
-    )
+                with st.expander("⚙️ Correlation Settings", expanded=False):
+                    c1, c2, c3, c4 = st.columns(4)
 
-    corr_matrix = pack.get("corr", pd.DataFrame())
-    counts_matrix = pack.get("counts", None)
-    pairs = pack.get("pairs", pd.Series(dtype=float))
-    used_df = pack.get("returns", pd.DataFrame())
+                    with c1:
+                        corr_return_type = st.selectbox(
+                            "Return Series",
+                            ["Simple Returns", "Log Returns"],
+                            index=0,
+                            key="corr_return_type"
+                        )
+                    with c2:
+                        corr_method = st.selectbox(
+                            "Method",
+                            ["Pearson", "Spearman", "Kendall"],
+                            index=0,
+                            key="corr_method"
+                        )
+                    with c3:
+                        corr_alignment = st.selectbox(
+                            "Date Alignment",
+                            ["Pairwise (max data)", "Intersection (same dates)"],
+                            index=0,
+                            key="corr_alignment"
+                        )
+                    with c4:
+                        corr_lookback = st.slider(
+                            "Lookback (trading days)",
+                            min_value=60,
+                            max_value=min(2520, max(60, int(returns_df.shape[0]))),
+                            value=min(252, max(60, int(returns_df.shape[0]))),
+                            step=10,
+                            key="corr_lookback"
+                        )
 
-    if isinstance(corr_matrix, pd.DataFrame) and not corr_matrix.empty and corr_matrix.shape[1] > 1:
-        k1, k2, k3, k4 = st.columns(4)
-        n_obs = int(used_df.shape[0]) if isinstance(used_df, pd.DataFrame) else 0
-        avg_corr = float(np.nanmean(pairs.values)) if len(pairs) else np.nan
-        avg_abs = float(np.nanmean(np.abs(pairs.values))) if len(pairs) else np.nan
+                    c5, c6, c7, c8 = st.columns(4)
+                    with c5:
+                        min_overlap = st.slider(
+                            "Min overlap (days)",
+                            min_value=20,
+                            max_value=min(260, max(20, int(returns_df.shape[0]))),
+                            value=min(60, max(20, int(returns_df.shape[0]//4) if returns_df.shape[0] >= 80 else 20)),
+                            step=5,
+                            key="corr_min_overlap"
+                        )
+                    with c6:
+                        winsorize_on = st.checkbox("Winsorize (1%/99%)", value=True, key="corr_winsorize")
+                    with c7:
+                        cluster_on = st.checkbox("Cluster & reorder", value=True, key="corr_cluster")
+                    with c8:
+                        show_pairs = st.checkbox("Show top pairs", value=True, key="corr_show_pairs")
 
-        k1.metric("Observations used", f"{n_obs:,}")
-        k2.metric("Avg Corr", f"{avg_corr:.2f}" if not np.isnan(avg_corr) else "—")
-        k3.metric("Avg |Corr|", f"{avg_abs:.2f}" if not np.isnan(avg_abs) else "—")
-        k4.metric("Assets", f"{corr_matrix.shape[0]}")
+                # --- Build working frame
+                df = returns_df.tail(int(corr_lookback)).copy()
 
-        fig = self.visualizer.create_correlation_matrix(
-            corr_matrix,
-            "Asset Correlations (Smart)",
-            counts_matrix=counts_matrix,
-            show_values=True
-        )
-        st.plotly_chart(fig, use_container_width=True)
+                # Return type
+                if isinstance(corr_return_type, str) and "log" in corr_return_type.lower():
+                    df = np.log1p(df)
 
-        # Smart summary: strongest positive/negative pairs
-        if isinstance(pairs, pd.Series) and len(pairs) > 0:
-            top_pos = pairs.sort_values(ascending=False).head(8)
-            top_neg = pairs.sort_values(ascending=True).head(8)
+                # Winsorize (per-series) to reduce outlier-driven distortion
+                if winsorize_on:
+                    def _winsorize_col(s: pd.Series) -> pd.Series:
+                        s = pd.to_numeric(s, errors="coerce")
+                        if s.dropna().shape[0] < 20:
+                            return s
+                        lo = s.quantile(0.01)
+                        hi = s.quantile(0.99)
+                        return s.clip(lower=lo, upper=hi)
+                    df = df.apply(_winsorize_col, axis=0)
 
-            cpos, cneg = st.columns(2)
-            with cpos:
-                st.markdown("**Top Positive Pairs**")
-                st.dataframe(
-                    top_pos.reset_index().rename(
-                        columns={"level_0": "Asset A", "level_1": "Asset B", 0: "Correlation"}
-                    ),
-                    use_container_width=True
+                # Alignment mode
+                if isinstance(corr_alignment, str) and "intersection" in corr_alignment.lower():
+                    df_work = df.dropna(how="any")
+                else:
+                    df_work = df
+
+                # Overlap counts (pairwise)
+                mask = df_work.notna().astype(int)
+                overlap = (mask.T @ mask).astype(int)
+
+                # Correlation (pairwise by default in pandas; min_periods enforces data quality)
+                corr = df_work.corr(method=str(corr_method).lower(), min_periods=int(min_overlap))
+
+                # Optional clustering reorder (using distance = 1 - corr)
+                if cluster_on:
+                    try:
+                        from scipy.cluster.hierarchy import linkage, leaves_list
+                        from scipy.spatial.distance import squareform
+
+                        cfill = corr.fillna(0.0).copy()
+                        # Ensure diagonal = 1 for stable distance
+                        np.fill_diagonal(cfill.values, 1.0)
+                        dist = 1.0 - cfill.values
+                        # Condense distance matrix for linkage
+                        Z = linkage(squareform(dist, checks=False), method="average")
+                        order = leaves_list(Z)
+                        cols = corr.columns.to_numpy()[order].tolist()
+                        corr = corr.loc[cols, cols]
+                        overlap = overlap.loc[cols, cols]
+                    except Exception:
+                        pass
+
+                # Build hovertext with overlap N
+                hover = []
+                corr_vals = corr.values
+                cols = corr.columns.tolist()
+                for i, rname in enumerate(cols):
+                    row = []
+                    for j, cname in enumerate(cols):
+                        v = corr_vals[i, j]
+                        n = int(overlap.iloc[i, j]) if (rname in overlap.index and cname in overlap.columns) else 0
+                        if pd.isna(v):
+                            row.append(f"<b>{rname}</b> vs <b>{cname}</b><br>Corr: N/A<br>N: {n}")
+                        else:
+                            row.append(f"<b>{rname}</b> vs <b>{cname}</b><br>Corr: {v:.3f}<br>N: {n}")
+                    hover.append(row)
+
+                # Plot heatmap (directly, to include N in hover)
+                fig = go.Figure(
+                    data=go.Heatmap(
+                        z=corr.values,
+                        x=corr.columns,
+                        y=corr.index,
+                        zmin=-1, zmax=1, zmid=0,
+                        colorscale="RdBu",
+                        text=corr.round(2).values,
+                        texttemplate="%{text}",
+                        hoverinfo="text",
+                        hovertext=hover,
+                        colorbar=dict(
+                            title=dict(text="Correlation"),
+                            tickformat=".2f"
+                        ),
+                    )
                 )
-            with cneg:
-                st.markdown("**Top Negative Pairs**")
-                st.dataframe(
-                    top_neg.reset_index().rename(
-                        columns={"level_0": "Asset A", "level_1": "Asset B", 0: "Correlation"}
-                    ),
-                    use_container_width=True
+                fig.update_layout(
+                    title=dict(text="Asset Correlations (Robust)", x=0.5, font=dict(size=20)),
+                    height=650,
+                    template=self.visualizer.template if hasattr(self, "visualizer") else "plotly_white",
+                    xaxis_tickangle=45,
+                    xaxis=dict(side="bottom"),
+                    yaxis=dict(autorange="reversed"),
+                    margin=dict(t=70, l=40, r=20, b=40)
                 )
-    else:
-        st.info("Not enough overlapping data to compute a stable correlation matrix. Try a wider date range or reduce the minimum overlap.")
+
+                st.plotly_chart(fig, use_container_width=True)
+
+                # Pair summaries
+                if show_pairs:
+                    try:
+                        upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
+                        s = upper.stack().dropna()
+                        if not s.empty:
+                            top_pos = s.sort_values(ascending=False).head(10).reset_index()
+                            top_pos.columns = ["Asset A", "Asset B", "Correlation"]
+                            top_neg = s.sort_values(ascending=True).head(10).reset_index()
+                            top_neg.columns = ["Asset A", "Asset B", "Correlation"]
+
+                            cpos, cneg = st.columns(2)
+                            with cpos:
+                                st.markdown("**Top Positive Pairs**")
+                                st.dataframe(top_pos.style.format({"Correlation": "{:.3f}"}), use_container_width=True, hide_index=True)
+                            with cneg:
+                                st.markdown("**Top Negative Pairs**")
+                                st.dataframe(top_neg.style.format({"Correlation": "{:.3f}"}), use_container_width=True, hide_index=True)
+                    except Exception:
+                        pass
+        except Exception as _corr_e:
+            # Never hard-fail the page due to correlation viz
+            try:
+                self._log_error(_corr_e, context="correlation_analysis")
+            except Exception:
+                pass
     
     def _display_portfolio(self, config: AnalysisConfiguration):
         """Display portfolio analysis"""
@@ -3929,176 +3858,227 @@ if isinstance(returns_data, pd.DataFrame) and returns_data.shape[1] > 1:
                     )
                     
                     st.plotly_chart(fig, use_container_width=True)
-
-def _display_stress_testing(self, config: AnalysisConfiguration):
-    """Display stress testing interface (scenario + cross-asset heatmap)."""
-    st.markdown('<div class="section-header"><h2>🧪 Stress Testing</h2></div>', unsafe_allow_html=True)
-
-    if not st.session_state.get("data_loaded", False):
-        st.warning("⚠️ Please load data first to run stress tests.")
-        return
-
-    returns_data = st.session_state.get("returns_data", None)
-    if returns_data is None or not isinstance(returns_data, pd.DataFrame) or returns_data.empty:
-        st.warning("⚠️ No return data available. Please load data first.")
-        return
-
-    # Controls
-    c1, c2 = st.columns(2)
-    with c1:
-        target_mode = st.radio(
-            "Stress Target",
-            ["Single Asset", "Equal-Weight Portfolio", "Current Portfolio Weights"],
-            horizontal=True,
-            key="stress_target_mode"
-        )
-    with c2:
-        return_type = st.selectbox(
-            "Return series",
-            ["Simple Returns", "Log Returns"],
-            index=0,
-            key="stress_return_type"
-        )
-
-    base_df = self._build_returns_matrix(return_type=return_type)
-    base_df = base_df.sort_index().dropna(how="all")
-
-    if base_df.empty or base_df.shape[1] == 0:
-        st.warning("⚠️ Insufficient return history for stress testing.")
-        return
-
-    # Target series
-    target_label = ""
-    if target_mode == "Single Asset":
-        asset = st.selectbox(
-            "Select Asset",
-            options=base_df.columns.tolist(),
-            key="stress_asset_select"
-        )
-        target_returns = base_df[asset].dropna()
-        target_label = asset
-
-    elif target_mode == "Current Portfolio Weights":
-        weights = st.session_state.get("portfolio_weights", {}) or {}
-        w = np.array([float(weights.get(c, 0.0)) for c in base_df.columns], dtype=float)
-        if w.sum() <= 0:
-            st.info("ℹ️ No saved portfolio weights found (or all-zero). Using equal weights.")
-            w = np.repeat(1.0 / base_df.shape[1], base_df.shape[1])
-        else:
-            w = w / w.sum()
-        target_returns = (base_df.fillna(0.0) @ w).rename("Portfolio")
-        target_label = "Portfolio (saved weights)"
-
-    else:
-        w = np.repeat(1.0 / base_df.shape[1], base_df.shape[1])
-        target_returns = (base_df.fillna(0.0) @ w).rename("Portfolio")
-        target_label = "Portfolio (equal-weight)"
-
-    if len(target_returns.dropna()) < 60:
-        st.warning("⚠️ Not enough observations for stable stress testing (need ~60+ daily points).")
-        return
-
-    # Scenario configuration
-    with st.expander("⚙️ Scenario Settings", expanded=True):
-        default_shocks = [-1.0, -2.0, -5.0, -10.0]
-        shock_pcts = st.multiselect(
-            "Shock scenarios (daily additive return shock, in %)",
-            options=[-0.5, -1.0, -2.0, -3.0, -5.0, -7.5, -10.0, -15.0, -20.0],
-            default=default_shocks,
-            key="stress_shock_pcts"
-        )
-        custom_shock = st.number_input(
-            "Add custom shock (%)",
-            value=0.0,
-            step=0.5,
-            key="stress_custom_shock"
-        )
-        if custom_shock != 0.0 and float(custom_shock) not in shock_pcts:
-            shock_pcts = list(shock_pcts) + [float(custom_shock)]
-
-        shock_pcts = sorted(set([float(s) for s in shock_pcts]))
-        shock_decimals = [s / 100.0 for s in shock_pcts]
-        st.caption("Example: a -5% shock means we add -0.05 to each daily return in the selected window.")
-
-    # Run stress test on the selected target
-    results = self.analytics.stress_test(target_returns, scenarios=shock_decimals)
-    if not results:
-        st.warning("⚠️ Stress test returned no results.")
-        return
-
-    rows = []
-    for _, v in results.items():
-        rows.append({
-            "Shock (%)": v.get("shock", np.nan),
-            "Mean Return (%)": v.get("shocked_return", np.nan),
-            "Volatility (%)": v.get("shocked_volatility", np.nan),
-            "Max Drawdown": v.get("max_drawdown", np.nan),
-            "VaR 95 (%)": v.get("var_95", np.nan),
-            "Loss (base=100)": v.get("loss", np.nan),
-        })
-
-    df_res = pd.DataFrame(rows).sort_values("Shock (%)")
-
-    st.markdown(f"### 📉 Scenario Results — **{target_label}**")
-    st.dataframe(df_res, use_container_width=True)
-
-    # Visualizations
-    v1, v2 = st.columns(2)
-    with v1:
-        fig_loss = px.bar(
-            df_res,
-            x="Shock (%)",
-            y="Loss (base=100)",
-            title="Loss under shock scenarios"
-        )
-        fig_loss.update_layout(template=self.visualizer.template, height=380)
-        st.plotly_chart(fig_loss, use_container_width=True)
-
-    with v2:
-        fig_var = px.line(
-            df_res,
-            x="Shock (%)",
-            y="VaR 95 (%)",
-            markers=True,
-            title="VaR(95%) under shock scenarios"
-        )
-        fig_var.update_layout(template=self.visualizer.template, height=380)
-        st.plotly_chart(fig_var, use_container_width=True)
-
-    # Cross-asset view
-    if base_df.shape[1] > 1:
-        st.markdown("### 🧯 Cross-Asset Stress Heatmap (Loss, base=100)")
-
-        loss_map = {}
-        for col in base_df.columns:
-            ser = base_df[col].dropna()
-            if len(ser) < 60:
-                continue
-            r = self.analytics.stress_test(ser, scenarios=shock_decimals)
-            # map: shock(%) -> loss
-            loss_map[col] = {float(v.get("shock", np.nan)): float(v.get("loss", np.nan)) for v in r.values()}
-
-        if loss_map:
-            loss_df = pd.DataFrame(loss_map).T
-            loss_df = loss_df.reindex(sorted(loss_df.columns), axis=1)
-
-            fig_hm = go.Figure(data=go.Heatmap(
-                z=loss_df.values,
-                x=[f"{c:.0f}%" for c in loss_df.columns],
-                y=loss_df.index,
-                colorscale="Reds",
-                hovertemplate="%{y}<br>Shock=%{x}<br>Loss=%{z:.2f}<extra></extra>",
-                colorbar=dict(title="Loss")
-            ))
-            fig_hm.update_layout(
-                template=self.visualizer.template,
-                height=max(450, 26 * len(loss_df.index)),
-                title=dict(text="Stress Loss Heatmap", x=0.5, font=dict(size=18))
-            )
-            st.plotly_chart(fig_hm, use_container_width=True)
-        else:
-            st.info("No assets had enough data to compute the cross-asset stress heatmap.")
     
+
+    def _display_stress_testing(self, config: AnalysisConfiguration):
+        """Display stress testing tab (required by run())."""
+        st.markdown('<div class="section-header"><h2>🧪 Stress Testing</h2></div>', unsafe_allow_html=True)
+
+        returns_src = st.session_state.get("returns_data", None)
+        if returns_src is None:
+            st.warning("⚠️ No return data available. Please load data first.")
+            return
+
+        # Normalize to DataFrame
+        if isinstance(returns_src, pd.DataFrame):
+            returns_df = returns_src.copy()
+        elif isinstance(returns_src, dict):
+            returns_df = pd.DataFrame(returns_src)
+        else:
+            returns_df = pd.DataFrame()
+
+        if returns_df.empty or returns_df.shape[1] == 0:
+            st.warning("⚠️ Insufficient data for stress testing.")
+            return
+
+        assets = returns_df.columns.tolist()
+
+        # Controls
+        c0, c1, c2 = st.columns([2, 1, 1])
+        with c0:
+            scope = st.radio(
+                "Scope",
+                ["Portfolio", "Single Asset", "All Assets (Heatmap)"],
+                horizontal=True,
+                key="stress_scope"
+            )
+        with c1:
+            notional = st.number_input(
+                "Notional (base currency)",
+                min_value=1000.0,
+                value=1_000_000.0,
+                step=50_000.0,
+                format="%.0f",
+                key="stress_notional"
+            )
+        with c2:
+            conf = st.select_slider(
+                "VaR Confidence",
+                options=[0.90, 0.95, 0.99],
+                value=0.95,
+                key="stress_var_conf"
+            )
+
+        shock_options = [-1, -2, -5, -10, -15, -20, -30]
+        shocks_pct = st.multiselect(
+            "Shock scenarios (%)",
+            options=shock_options,
+            default=[-1, -2, -5, -10],
+            key="stress_shocks_pct"
+        )
+        if not shocks_pct:
+            st.info("Select at least one shock scenario.")
+            return
+
+        shocks = [float(s) / 100.0 for s in shocks_pct]  # decimals (negative)
+
+        # Helpers
+        def _safe_series(x) -> pd.Series:
+            s = pd.to_numeric(x, errors="coerce").dropna()
+            return s
+
+        def _var_cvar(series: pd.Series, cl: float) -> Tuple[float, float]:
+            r = _safe_series(series)
+            if r.empty:
+                return (np.nan, np.nan)
+            # Historical VaR/CVaR (%)
+            q = np.quantile(r, 1 - cl)
+            cvar = r[r <= q].mean() if (r <= q).any() else np.nan
+            return (float(q) * 100.0, float(cvar) * 100.0)
+
+        run_btn = st.button("⚡ Run Stress Testing", type="primary", use_container_width=True, key="btn_run_stress_tab")
+        if not run_btn:
+            st.caption("Configure scenarios above, then click **Run Stress Testing**.")
+            return
+
+        with st.spinner("Running stress testing..."):
+            # --- Portfolio scope
+            if scope == "Portfolio":
+                # Try to use current weights; fallback equal weight
+                w = st.session_state.get("portfolio_weights", {}) or {}
+                weights = {}
+                if isinstance(w, dict) and len(w) > 0:
+                    for a in assets:
+                        if a in w:
+                            try:
+                                weights[a] = float(w[a])
+                            except Exception:
+                                pass
+                if len(weights) != len(assets):
+                    weights = {a: 1.0 / len(assets) for a in assets}
+
+                # Normalize weights
+                ssum = sum(weights.values())
+                if ssum <= 0:
+                    weights = {a: 1.0 / len(assets) for a in assets}
+                    ssum = 1.0
+                weights = {a: v / ssum for a, v in weights.items()}
+
+                port_rets = (returns_df[assets].apply(pd.to_numeric, errors="coerce") * pd.Series(weights)).sum(axis=1)
+                port_rets = _safe_series(port_rets)
+
+                if port_rets.empty:
+                    st.warning("⚠️ Portfolio returns are empty after cleaning.")
+                    return
+
+                var_val, cvar_val = _var_cvar(port_rets, float(conf))
+                ann_vol = float(port_rets.std() * np.sqrt(config.annual_trading_days) * 100.0) if port_rets.std() == port_rets.std() else np.nan
+                ann_ret = float(port_rets.mean() * config.annual_trading_days * 100.0) if port_rets.mean() == port_rets.mean() else np.nan
+
+                st.markdown("#### Portfolio baseline (historical)")
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Annualized Return", f"{ann_ret:.2f}%")
+                m2.metric("Annualized Volatility", f"{ann_vol:.2f}%")
+                m3.metric(f"VaR / CVaR ({conf:.0%})", f"{var_val:.2f}% / {cvar_val:.2f}%")
+
+                # Shock P&L table
+                rows = []
+                for sh in shocks:
+                    pnl = -sh * float(notional)  # positive loss for negative shock
+                    rows.append({
+                        "Shock (%)": sh * 100.0,
+                        "Notional Loss": pnl,
+                        "Post-shock Notional": float(notional) * (1.0 + sh)
+                    })
+                df_out = pd.DataFrame(rows)
+                st.markdown("#### Portfolio scenario losses (instantaneous shock)")
+                st.dataframe(
+                    df_out.style.format({"Shock (%)": "{:.1f}", "Notional Loss": "{:,.0f}", "Post-shock Notional": "{:,.0f}"}),
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+            # --- Single asset scope
+            elif scope == "Single Asset":
+                sel = st.selectbox("Select Asset", options=assets, key="stress_single_asset")
+                s = _safe_series(returns_df[sel])
+
+                if s.empty:
+                    st.warning("⚠️ Selected asset has no usable return data.")
+                    return
+
+                var_val, cvar_val = _var_cvar(s, float(conf))
+                ann_vol = float(s.std() * np.sqrt(config.annual_trading_days) * 100.0) if s.std() == s.std() else np.nan
+                ann_ret = float(s.mean() * config.annual_trading_days * 100.0) if s.mean() == s.mean() else np.nan
+
+                st.markdown("#### Baseline (historical)")
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Annualized Return", f"{ann_ret:.2f}%")
+                m2.metric("Annualized Volatility", f"{ann_vol:.2f}%")
+                m3.metric(f"VaR / CVaR ({conf:.0%})", f"{var_val:.2f}% / {cvar_val:.2f}%")
+
+                rows = []
+                for sh in shocks:
+                    pnl = -sh * float(notional)
+                    rows.append({
+                        "Shock (%)": sh * 100.0,
+                        "Notional Loss": pnl,
+                        "Post-shock Notional": float(notional) * (1.0 + sh)
+                    })
+                df_out = pd.DataFrame(rows)
+
+                st.markdown("#### Scenario losses (instantaneous shock)")
+                st.dataframe(
+                    df_out.style.format({"Shock (%)": "{:.1f}", "Notional Loss": "{:,.0f}", "Post-shock Notional": "{:,.0f}"}),
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+                # Optional: show analytics-based stress table (legacy)
+                with st.expander("Legacy stress metrics (distribution shocked by adding shock to all days)", expanded=False):
+                    legacy = {}
+                    for sh in shocks:
+                        legacy.update(self.analytics.stress_test(s, scenarios=[sh]))
+                    if legacy:
+                        ldf = pd.DataFrame.from_dict(legacy, orient="index").reset_index().rename(columns={"index": "Scenario"})
+                        st.dataframe(ldf, use_container_width=True)
+
+            # --- All assets heatmap
+            else:
+                # Heatmap of notional losses by asset & shock
+                loss_mat = pd.DataFrame(
+                    index=assets,
+                    columns=[f"{sh*100:.0f}%" for sh in shocks],
+                    dtype=float
+                )
+                for a in assets:
+                    for sh in shocks:
+                        loss_mat.loc[a, f"{sh*100:.0f}%"] = -sh * float(notional)
+
+                fig = go.Figure(
+                    data=go.Heatmap(
+                        z=loss_mat.values,
+                        x=loss_mat.columns,
+                        y=loss_mat.index,
+                        hovertemplate="<b>%{y}</b><br>Shock: %{x}<br>Loss: %{z:,.0f}<extra></extra>",
+                        colorbar=dict(title=dict(text="Loss"))
+                    )
+                )
+                fig.update_layout(
+                    title=dict(text="Stress Loss Heatmap (Instantaneous Shock)", x=0.5),
+                    height=max(450, 28 * len(assets)),
+                    template=self.visualizer.template if hasattr(self, "visualizer") else "plotly_white",
+                    margin=dict(t=70, l=40, r=20, b=40)
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+                st.caption("Losses are computed as: **Loss = -Shock × Notional** (shock is negative).")
+
+    def _display_reporting(self, config: AnalysisConfiguration):
+        """Compatibility wrapper: run() calls _display_reporting; older code uses _display_reports."""
+        return self._display_reports(config)
+
+
     def _display_reports(self, config: AnalysisConfiguration):
         """Display reporting interface"""
         st.markdown('<div class="section-header"><h2>📋 Professional Reports</h2></div>', unsafe_allow_html=True)
@@ -4611,10 +4591,6 @@ making investment decisions. Data source: Yahoo Finance.
         )
         
         return markdown
-
-def _display_reporting(self, config: AnalysisConfiguration):
-    """Backward-compatible alias for older routing."""
-    return self._display_reports(config)
     
     def _display_settings(self, config: AnalysisConfiguration):
         """Display settings and system information"""
