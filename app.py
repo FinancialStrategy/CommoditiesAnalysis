@@ -770,14 +770,14 @@ class SmartCache:
         def decorator(func):
             @wraps(func)
             @st.cache_data(ttl=ttl, max_entries=max_entries, show_spinner=False)
-            def wrapper(*args, **kwargs):
+            def wrapper(_arg0, *args, **kwargs):
                 try:
-                    return func(*args, **kwargs)
+                    return func(_arg0, *args, **kwargs)
                 except Exception as e:
                     st.warning(f"Cache miss for {func.__name__}: {str(e)[:100]}")
                     # Clear cache for this function on error
                     st.cache_data.clear()
-                    return func(*args, **kwargs)
+                    return func(_arg0, *args, **kwargs)
             return wrapper
         return decorator
     
@@ -787,8 +787,8 @@ class SmartCache:
         def decorator(func):
             @wraps(func)
             @st.cache_resource(max_entries=max_entries)
-            def wrapper(*args, **kwargs):
-                return func(*args, **kwargs)
+            def wrapper(_arg0, *args, **kwargs):
+                return func(_arg0, *args, **kwargs)
             return wrapper
         return decorator
 
