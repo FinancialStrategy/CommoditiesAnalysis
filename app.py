@@ -107,8 +107,8 @@ class AssetMetadata:
 @dataclass
 class AnalysisConfiguration:
     """Comprehensive analysis configuration"""
-    start_date: datetime
-    end_date: datetime
+    start_date: datetime= field(default_factory=lambda: (datetime.now() - timedelta(days=1095)))
+    end_date: datetime= field(default_factory=lambda: datetime.now())
     risk_free_rate: float = 0.02
     annual_trading_days: int = 252
     confidence_levels: Tuple[float, ...] = (0.90, 0.95, 0.99)
@@ -2391,7 +2391,7 @@ class InstitutionalCommoditiesDashboard:
 
             # --- Benchmarks ---
             bench_options = list(BENCHMARKS.keys())
-            bench_to_label = {k: f"{k} — {(v.get('name', '') if isinstance(v, dict) else getattr(v, 'name', str(v)))}" for k, v in BENCHMARKS.items()}
+            bench_to_label = {k: f"{k} — { (v.get('name','') if isinstance(v, dict) else getattr(v, 'name', str(v))) }" for k, v in BENCHMARKS.items()}
             preferred_bench = ["SPY", "BCOM", "DBC"]
             default_bench = [b for b in preferred_bench if b in bench_options][:1] or (bench_options[:1] if bench_options else [])
             selected_benchmarks = st.multiselect(
@@ -2496,7 +2496,7 @@ class InstitutionalCommoditiesDashboard:
         st.session_state.selected_benchmarks = selected_benchmarks
 
         # Update analysis config dates (keep other defaults)
-        cfg = st.session_state.get("analysis_config", AnalysisConfiguration())
+        cfg = st.session_state.get("analysis_config", AnalysisConfiguration(start_date=start_dt, end_date=end_dt))
         cfg.start_date = start_dt
         cfg.end_date = end_dt
         st.session_state.analysis_config = cfg
