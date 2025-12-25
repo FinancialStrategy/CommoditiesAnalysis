@@ -1,799 +1,1084 @@
-"""
-🏛️ Institutional Commodities Analytics Platform v8.0 (Regime Science Edition)
-Enhanced Scientific Analytics • Gaussian HMM • Advanced Correlation • Risk Metrics
-Institutional-Grade Computational Finance Platform
-"""
+# ==============================================================================
+# 🏛️ Institutional Commodities Analytics Platform v7.1 (Cloud-Safe, Long Complete)
+# Enhanced Scientific Analytics • Advanced Correlation Methods • Professional Risk Metrics
+# ------------------------------------------------------------------------------
+# Key upgrades (v7.1)
+# - FIXED correlation reporting: strict overlap alignment + robust NaN handling
+# - Added Ledoit-Wolf shrinkage correlation (with safe fallback if sklearn missing)
+# - Added SMART SIGNAL TAB:
+#   Ratio = (EWMA 22D Vol) / (EWMA 33D Vol + EWMA 99D Vol)
+#   + Bollinger Bands (upper/lower lines) + Alarm Zones (green/orange/red bands)
+# - Added fully-implemented Stress Testing tab to prevent missing-method errors
+# - Cloud-safe: no hard dependency on psutil / hmmlearn / arch / quantstats (optional)
+# - Stronger data-quality gating + reproducibility config
+#
+# NOTE:
+# - For Streamlit Cloud: add sklearn to requirements.txt to enable shrinkage corr.
+# - If you want HMM regimes: add hmmlearn to requirements.txt.
+# ==============================================================================
 
 import os
 import math
-import warnings
 import json
-import hashlib
+import warnings
 import traceback
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Dict, Any, Optional, Tuple, List, Union, Callable
-from dataclasses import dataclass, field, asdict
-from functools import lru_cache, wraps
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from enum import Enum
-from pathlib import Path
-import pickle
+from typing import Dict, Any, Optional, Tuple, List
 
 import numpy as np
 import pandas as pd
 import streamlit as st
+
 import yfinance as yf
 import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
-from scipy import stats, optimize, signal, linalg
-import seaborn as sns
-from io import BytesIO, StringIO
-import base64
 
-# =============================================================================
-# CONFIGURATION & SETUP
-# =============================================================================
+from scipy import stats
 
-# Environment optimization for scientific computing
-os.environ["NUMEXPR_MAX_THREADS"] = "8"
-os.environ["OMP_NUM_THREADS"] = "4"
-os.environ["MKL_NUM_THREADS"] = "4"
-os.environ["OPENBLAS_NUM_THREADS"] = "4"
-os.environ["PYTHONWARNINGS"] = "ignore"
 warnings.filterwarnings("ignore")
-np.seterr(all='ignore')  # Suppress numpy warnings for stability
 
-# Scientific precision settings
-np.set_printoptions(precision=6, suppress=True)
-pd.set_option('display.precision', 6)
-
-# Streamlit configuration for institutional interface
+# ==============================================================================
+# STREAMLIT PAGE CONFIG (MUST BE FIRST STREAMLIT COMMAND)
+# ==============================================================================
 st.set_page_config(
-    page_title="Institutional Commodities Platform v8.0",
-    page_icon="🧬",
+    page_title="Institutional Commodities Analytics Platform v7.1",
+    page_icon="🏛️",
     layout="wide",
     initial_sidebar_state="expanded",
-    menu_items={
-        'Get Help': 'https://github.com/institutional-commodities',
-        'Report a bug': "https://github.com/institutional-commodities/issues",
-        'About': """🏛️ Institutional Commodities Analytics v8.0
-                    Scientific Computing Division • Regime Switching & HMM Analytics
-                    © 2024 Institutional Trading Analytics"""
-    }
 )
 
-# =============================================================================
-# SCIENTIFIC DATA STRUCTURES & VALIDATION
-# =============================================================================
+# ==============================================================================
+# OPTIONAL DEPENDENCIES (CLOUD SAFE)
+# ==============================================================================
+HAS_SKLEARN = False
+HAS_ARCH = False
+HAS_QS = False
+HAS_HMMLEARN = False
 
-class AssetCategory(Enum):
-    """Scientific asset classification with validation"""
-    PRECIOUS_METALS = "Precious Metals"
-    INDUSTRIAL_METALS = "Industrial Metals"
-    ENERGY = "Energy"
-    AGRICULTURE = "Agriculture"
-    BENCHMARK = "Benchmark"
+try:
+    from sklearn.covariance import LedoitWolf
+    HAS_SKLEARN = True
+except Exception:
+    HAS_SKLEARN = False
 
-@dataclass
-class ScientificAssetMetadata:
-    """Enhanced scientific metadata with validation"""
-    symbol: str
-    name: str
-    category: AssetCategory
-    color: str
-    description: str = ""
-    exchange: str = "CME"
-    contract_size: str = "Standard"
-    margin_requirement: float = field(default=0.05, metadata={'range': (0.01, 0.50)})
-    tick_size: float = field(default=0.01, metadata={'min': 0.0001})
-    enabled: bool = True
-    risk_level: str = "Medium"
-    beta_to_spx: float = field(default=0.0, metadata={'range': (-2.0, 5.0)})
-    liquidity_score: float = field(default=0.5, metadata={'range': (0.0, 1.0)})
-    fundamental_score: float = field(default=0.5, metadata={'range': (0.0, 1.0)})
-    
-    def __post_init__(self):
-        """Validate metadata upon initialization"""
-        self.validate()
-    
-    def validate(self) -> bool:
-        """Scientific validation of metadata"""
-        if not isinstance(self.symbol, str) or len(self.symbol) < 1:
-            raise ValueError(f"Invalid symbol: {self.symbol}")
-        if self.margin_requirement < 0.01 or self.margin_requirement > 0.50:
-            raise ValueError(f"Margin requirement out of range: {self.margin_requirement}")
-        if self.tick_size <= 0:
-            raise ValueError(f"Invalid tick size: {self.tick_size}")
-        if not -2.0 <= self.beta_to_spx <= 5.0:
-            raise ValueError(f"Beta to SPX out of range: {self.beta_to_spx}")
-        return True
-    
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+try:
+    from arch import arch_model
+    HAS_ARCH = True
+except Exception:
+    HAS_ARCH = False
 
-@dataclass
-class ScientificAnalysisConfiguration:
-    """Comprehensive scientific analysis configuration with validation"""
-    start_date: datetime
-    end_date: datetime
-    risk_free_rate: float = field(default=0.02, metadata={'range': (0.0, 0.10)})
-    annual_trading_days: int = field(default=252, metadata={'options': [252, 365]})
-    confidence_levels: Tuple[float, ...] = (0.90, 0.95, 0.99)
-    garch_p_range: Tuple[int, int] = (1, 3)
-    garch_q_range: Tuple[int, int] = (1, 3)
-    regime_states: int = field(default=3, metadata={'range': (2, 5)})
-    backtest_window: int = field(default=250, metadata={'range': (60, 1000)})
-    rolling_window: int = field(default=60, metadata={'range': (20, 250)})
-    volatility_window: int = field(default=20, metadata={'range': (10, 100)})
-    monte_carlo_simulations: int = field(default=10000, metadata={'range': (1000, 100000)})
-    optimization_method: str = field(default="sharpe", metadata={'options': ['sharpe', 'min_vol', 'risk_parity']})
-    correlation_method: str = field(default="pearson", metadata={'options': ['pearson', 'spearman', 'kendall', 'ewma']})
-    ewma_lambda: float = field(default=0.94, metadata={'range': (0.90, 0.99)})
-    significance_level: float = field(default=0.05, metadata={'range': (0.01, 0.10)})
-    
-    def validate(self) -> Tuple[bool, List[str]]:
-        """Comprehensive validation with error messages"""
-        errors = []
-        if self.start_date >= self.end_date:
-            errors.append("Start date must be before end date")
-        if not (0.0 <= self.risk_free_rate <= 0.10):
-            errors.append(f"Risk-free rate {self.risk_free_rate} outside valid range [0.0, 0.10]")
-        if not all(0.5 <= cl <= 0.999 for cl in self.confidence_levels):
-            errors.append("Confidence levels must be between 0.5 and 0.999")
-        if not (2 <= self.regime_states <= 5):
-            errors.append(f"Regime states {self.regime_states} outside valid range [2, 5]")
-        if not (0.90 <= self.ewma_lambda <= 0.99):
-            errors.append(f"EWMA lambda {self.ewma_lambda} outside valid range [0.90, 0.99]")
-        if not (0.01 <= self.significance_level <= 0.10):
-            errors.append(f"Significance level {self.significance_level} outside valid range [0.01, 0.10]")
-        return len(errors) == 0, errors
-    
-    def get_ewma_halflife(self) -> float:
-        """Calculate half-life for EWMA decay factor"""
-        return math.log(0.5) / math.log(self.ewma_lambda)
+try:
+    import quantstats as qs
+    HAS_QS = True
+except Exception:
+    HAS_QS = False
 
-# Enhanced scientific commodities universe
-COMMODITIES_UNIVERSE = {
-    AssetCategory.PRECIOUS_METALS.value: {
-        "GC=F": ScientificAssetMetadata("GC=F", "Gold Futures", AssetCategory.PRECIOUS_METALS, "#FFD700", "COMEX Gold Futures", "COMEX", "100 oz", 0.045, 0.10, True, "Low", 0.15, 0.95),
-        "SI=F": ScientificAssetMetadata("SI=F", "Silver Futures", AssetCategory.PRECIOUS_METALS, "#C0C0C0", "COMEX Silver Futures", "COMEX", "5000 oz", 0.065, 0.005, True, "Medium", 0.25, 0.85),
-        "PL=F": ScientificAssetMetadata("PL=F", "Platinum Futures", AssetCategory.PRECIOUS_METALS, "#E5E4E2", "NYMEX Platinum Futures", "NYMEX", "50 oz", 0.075, 0.10, True, "High", 0.35, 0.70),
-    },
-    AssetCategory.ENERGY.value: {
-        "CL=F": ScientificAssetMetadata("CL=F", "Crude Oil WTI", AssetCategory.ENERGY, "#000000", "NYMEX WTI Crude", "NYMEX", "1000 bbl", 0.085, 0.01, True, "High", 0.60, 0.98),
-        "NG=F": ScientificAssetMetadata("NG=F", "Natural Gas", AssetCategory.ENERGY, "#4169E1", "NYMEX Natural Gas", "NYMEX", "10000 MMBtu", 0.095, 0.001, True, "High", 0.30, 0.88),
-    },
-    AssetCategory.INDUSTRIAL_METALS.value: {
-        "HG=F": ScientificAssetMetadata("HG=F", "Copper Futures", AssetCategory.INDUSTRIAL_METALS, "#B87333", "COMEX Copper", "COMEX", "25000 lbs", 0.085, 0.0005, True, "Medium", 0.45, 0.90),
-    },
-    AssetCategory.AGRICULTURE.value: {
-        "ZC=F": ScientificAssetMetadata("ZC=F", "Corn Futures", AssetCategory.AGRICULTURE, "#FFD700", "CBOT Corn", "CBOT", "5000 bu", 0.065, 0.25, True, "Medium", 0.20, 0.82),
-        "ZW=F": ScientificAssetMetadata("ZW=F", "Wheat Futures", AssetCategory.AGRICULTURE, "#F5DEB3", "CBOT Wheat", "CBOT", "5000 bu", 0.075, 0.25, True, "Medium", 0.18, 0.80),
+try:
+    import hmmlearn  # noqa: F401
+    HAS_HMMLEARN = True
+except Exception:
+    HAS_HMMLEARN = False
+
+# ==============================================================================
+# UTILITIES
+# ==============================================================================
+def _now_str() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def safe_pct(x: float) -> str:
+    if x is None or (isinstance(x, float) and (np.isnan(x) or np.isinf(x))):
+        return "—"
+    return f"{x*100:.2f}%"
+
+def safe_float(x: float, fmt: str = "{:.4f}") -> str:
+    if x is None:
+        return "—"
+    try:
+        if np.isnan(x) or np.isinf(x):
+            return "—"
+        return fmt.format(float(x))
+    except Exception:
+        return "—"
+
+def clamp_int(x: int, lo: int, hi: int) -> int:
+    try:
+        xi = int(x)
+    except Exception:
+        xi = lo
+    return max(lo, min(hi, xi))
+
+def ensure_2d(a: np.ndarray) -> np.ndarray:
+    if a.ndim == 1:
+        return a.reshape(-1, 1)
+    return a
+
+def df_nonempty(df: Optional[pd.DataFrame]) -> bool:
+    return isinstance(df, pd.DataFrame) and (df.shape[0] > 0) and (df.shape[1] > 0)
+
+def series_nonempty(s: Optional[pd.Series]) -> bool:
+    return isinstance(s, pd.Series) and (s.dropna().shape[0] > 0)
+
+# ==============================================================================
+# INSTITUTIONAL STYLE (LIGHT UI; you can flip to dark if you want)
+# ==============================================================================
+st.markdown(
+    """
+    <style>
+    .block-container { padding-top: 1.0rem; padding-bottom: 2rem; }
+    .kpi-card {
+        border-radius: 14px;
+        padding: 14px 14px 12px 14px;
+        border: 1px solid rgba(0,0,0,0.10);
+        background: rgba(255,255,255,0.75);
+        box-shadow: 0 2px 14px rgba(0,0,0,0.05);
     }
+    .kpi-title { font-size: 0.85rem; opacity: 0.75; margin-bottom: 6px; }
+    .kpi-value { font-size: 1.35rem; font-weight: 700; margin: 0; }
+    .kpi-sub   { font-size: 0.78rem; opacity: 0.70; margin-top: 4px; }
+    .small-note { font-size: 0.85rem; opacity: 0.75; }
+    .section-title { font-size: 1.25rem; font-weight: 800; margin-top: 0.2rem; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# ==============================================================================
+# CONFIGURATION
+# ==============================================================================
+@dataclass
+class AppConfig:
+    title: str = "Institutional Commodities Analytics Platform v7.1"
+    # Data
+    default_years_back: int = 5
+    min_overlap_days: int = 90
+    max_missing_frac: float = 0.15
+    max_gap_days: int = 10
+    # Returns
+    returns_mode: str = "log"  # "simple" or "log"
+    # Risk
+    var_levels: Tuple[float, ...] = (0.90, 0.95, 0.99)
+    annualization: int = 252
+    # Ratio Signal defaults
+    ewma_short: int = 22
+    ewma_mid: int = 33
+    ewma_long: int = 99
+    boll_window: int = 20
+    boll_k: float = 2.0
+    # Alarm thresholds (ratio)
+    ratio_green_max: float = 0.80
+    ratio_orange_max: float = 1.00
+    # Portfolio
+    default_weight_mode: str = "equal"
+
+CFG = AppConfig()
+
+# ==============================================================================
+# UNIVERSE (Classified)
+# ==============================================================================
+UNIVERSE: Dict[str, Dict[str, str]] = {
+    "Precious Metals": {
+        "Gold (GC=F)": "GC=F",
+        "Silver (SI=F)": "SI=F",
+        "Platinum (PL=F)": "PL=F",
+        "Palladium (PA=F)": "PA=F",
+    },
+    "Energy": {
+        "Crude Oil WTI (CL=F)": "CL=F",
+        "Brent (BZ=F)": "BZ=F",
+        "Natural Gas (NG=F)": "NG=F",
+        "Heating Oil (HO=F)": "HO=F",
+        "Gasoline RBOB (RB=F)": "RB=F",
+    },
+    "Industrial Metals": {
+        "Copper (HG=F)": "HG=F",
+        "Aluminum (ALI=F)*": "ALI=F",
+        "Nickel (NICKEL=F)*": "NICKEL=F",
+    },
+    "Agriculture": {
+        "Corn (ZC=F)": "ZC=F",
+        "Wheat (ZW=F)": "ZW=F",
+        "Soybeans (ZS=F)": "ZS=F",
+        "Soybean Oil (ZL=F)": "ZL=F",
+        "Soybean Meal (ZM=F)": "ZM=F",
+        "Rice (ZR=F)": "ZR=F",
+    },
+    "Softs": {
+        "Coffee (KC=F)": "KC=F",
+        "Sugar (SB=F)": "SB=F",
+        "Cotton (CT=F)": "CT=F",
+        "Cocoa (CC=F)": "CC=F",
+        "Orange Juice (OJ=F)": "OJ=F",
+    },
+    "Rates / FX Proxies": {
+        "US Dollar Index (DX-Y.NYB)": "DX-Y.NYB",
+        "EURUSD (EURUSD=X)": "EURUSD=X",
+        "USDJPY (JPY=X)": "JPY=X",
+    },
 }
 
-BENCHMARKS = {
-    "^GSPC": {"name": "S&P 500 Index", "type": "equity", "color": "#1E90FF", "description": "US Large Cap"},
-    "DX-Y.NYB": {"name": "US Dollar Index", "type": "currency", "color": "#32CD32", "description": "USD Strength"},
-    "TLT": {"name": "20+ Year Treasury", "type": "fixed_income", "color": "#8A2BE2", "description": "Long-term Bonds"}
-}
+def flatten_universe(universe: Dict[str, Dict[str, str]]) -> Dict[str, str]:
+    out = {}
+    for cat, mp in universe.items():
+        for label, ticker in mp.items():
+            out[f"{cat} — {label}"] = ticker
+    return out
 
-# =============================================================================
-# SCIENTIFIC THEMING & INSTITUTIONAL STYLING
-# =============================================================================
+UNIVERSE_FLAT = flatten_universe(UNIVERSE)
 
-class ScientificThemeManager:
-    """Institutional scientific theming"""
-    THEMES = {
-        "institutional": {
-            "primary": "#1a237e", "secondary": "#283593", "accent": "#3949ab", 
-            "success": "#2e7d32", "warning": "#f57c00", "danger": "#c62828", 
-            "dark": "#0d1b2a", "light": "#e0e1dd", "gray": "#415a77", 
-            "background": "#ffffff", "grid": "#e8eaf6", "border": "#c5cae9"
-        }
-    }
-    
+# ==============================================================================
+# DATA ENGINE
+# ==============================================================================
+class DataEngine:
+    def __init__(self, cfg: AppConfig):
+        self.cfg = cfg
+
     @staticmethod
-    def get_styles(theme: str = "institutional") -> str:
-        colors = ScientificThemeManager.THEMES.get(theme, ScientificThemeManager.THEMES["institutional"])
-        return f"""
-        <style>
-            :root {{ --primary: {colors['primary']}; --secondary: {colors['secondary']}; --accent: {colors['accent']}; --success: {colors['success']}; --warning: {colors['warning']}; --danger: {colors['danger']}; --dark: {colors['dark']}; --light: {colors['light']}; --gray: {colors['gray']}; --background: {colors['background']}; --grid: {colors['grid']}; --border: {colors['border']}; }}
-            .scientific-header {{ background: linear-gradient(135deg, var(--dark) 0%, var(--primary) 100%); padding: 2rem; border-radius: 8px; color: white; margin-bottom: 1.5rem; box-shadow: 0 4px 6px rgba(0,0,0,0.1); border: 1px solid var(--border); }}
-            .institutional-card {{ background: var(--background); padding: 1.5rem; border-radius: 6px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); border: 1px solid var(--border); margin-bottom: 1rem; transition: all 0.2s ease-in-out; }}
-            .institutional-card:hover {{ box-shadow: 0 4px 6px rgba(0,0,0,0.1); border-color: var(--primary); }}
-            .metric-value {{ font-family: 'SF Mono', 'Roboto Mono', monospace; font-size: 1.8rem; font-weight: 700; color: var(--dark); }}
-            .scientific-badge {{ display: inline-flex; align-items: center; gap: 0.4rem; padding: 0.25rem 0.75rem; border-radius: 20px; font-size: 0.75rem; font-weight: 600; text-transform: uppercase; border: 1px solid transparent; }}
-            .scientific-badge.info {{ background: rgba(41, 98, 255, 0.1); color: var(--primary); border-color: rgba(41, 98, 255, 0.2); }}
-            .scientific-badge.warning {{ background: rgba(245, 124, 0, 0.1); color: var(--warning); border-color: rgba(245, 124, 0, 0.2); }}
-            .scientific-badge.danger {{ background: rgba(198, 40, 40, 0.1); color: var(--danger); border-color: rgba(198, 40, 40, 0.2); }}
-            .section-header {{ display: flex; align-items: center; justify-content: space-between; margin: 2rem 0 1rem; padding-bottom: 0.75rem; border-bottom: 2px solid var(--border); }}
-            .stTabs [data-baseweb="tab-list"] {{ gap: 8px; background-color: var(--light); padding: 8px; border-radius: 8px; margin-bottom: 1.5rem; border: 1px solid var(--border); }}
-            .stTabs [data-baseweb="tab"] {{ border-radius: 6px; padding: 8px 16px; background-color: var(--background); border: 1px solid var(--border); font-weight: 600; }}
-            .stTabs [aria-selected="true"] {{ background: linear-gradient(135deg, var(--primary) 0%, var(--secondary) 100%); color: white; border-color: var(--primary); }}
-        </style>
-        """
-
-st.markdown(ScientificThemeManager.get_styles("institutional"), unsafe_allow_html=True)
-
-# =============================================================================
-# ADVANCED DEPENDENCY MANAGEMENT WITH VALIDATION
-# =============================================================================
-
-class ScientificDependencyManager:
-    """Scientific dependency management with validation"""
-    
-    def __init__(self):
-        self.dependencies = {}
-        self._scientific_imports()
-    
-    def _scientific_imports(self):
-        """Load scientific dependencies with validation"""
-        # statsmodels
-        try:
-            import statsmodels.api as sm
-            from statsmodels.stats.diagnostic import het_arch, acorr_ljungbox
-            self.dependencies['statsmodels'] = {'available': True, 'version': sm.__version__, 'module': sm}
-        except ImportError as e:
-            self.dependencies['statsmodels'] = {'available': False, 'error': str(e)}
-        
-        # arch
-        try:
-            import arch
-            from arch import arch_model
-            self.dependencies['arch'] = {'available': True, 'version': arch.__version__, 'module': arch}
-        except ImportError as e:
-            self.dependencies['arch'] = {'available': False, 'error': str(e)}
-        
-        # hmmlearn & sklearn
-        try:
-            import sklearn
-            import hmmlearn
-            from hmmlearn.hmm import GaussianHMM
-            from sklearn.preprocessing import StandardScaler
-            self.dependencies['hmmlearn'] = {'available': True, 'version': sklearn.__version__, 'module': hmmlearn}
-        except ImportError as e:
-            self.dependencies['hmmlearn'] = {'available': False, 'error': str(e)}
-            
-    def display_status(self):
-        status_html = '<div class="institutional-card"><div class="metric-title">🧪 Scientific Dependencies</div><div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 0.5rem; margin-top: 0.5rem;">'
-        for dep, info in self.dependencies.items():
-            status = "🟢" if info.get('available') else "🔴"
-            version = info.get('version', 'N/A') if info.get('available') else 'Missing'
-            status_html += f'<div style="display: flex; justify-content: space-between;"><span style="font-size:0.85rem;color:#415a77;">{dep}</span><div><span style="font-size:0.75rem;color:#415a77;margin-right:0.5rem;">{version}</span><span>{status}</span></div></div>'
-        status_html += "</div></div>"
-        return status_html
-
-sci_dep_manager = ScientificDependencyManager()
-
-# =============================================================================
-# SCIENTIFIC CACHING SYSTEM WITH VALIDATION
-# =============================================================================
-
-class ScientificCache:
-    @staticmethod
-    def generate_scientific_key(*args, **kwargs) -> str:
-        key_string = str(args) + str(kwargs)
-        return hashlib.sha256(key_string.encode()).hexdigest()
-    
-    @staticmethod
-    def cache_scientific_data(ttl: int = 7200, max_entries: int = 100):
-        return st.cache_data(ttl=ttl, max_entries=max_entries, show_spinner=False)
-
-# =============================================================================
-# SCIENTIFIC DATA MANAGER
-# =============================================================================
-
-class ScientificDataManager:
-    def __init__(self):
-        self.cache = ScientificCache()
-    
-    @ScientificCache.cache_scientific_data(ttl=10800, max_entries=150)
-    def fetch_multiple_assets_scientific(self, symbols: List[str], start_date: datetime, end_date: datetime, max_workers: int = 6) -> Dict[str, pd.DataFrame]:
-        results = {}
-        with ThreadPoolExecutor(max_workers=min(max_workers, len(symbols))) as executor:
-            future_to_symbol = {
-                executor.submit(self._fetch_single_asset, symbol, start_date, end_date): symbol 
-                for symbol in symbols
-            }
-            for future in as_completed(future_to_symbol):
-                symbol = future_to_symbol[future]
-                try:
-                    df = future.result()
-                    if not df.empty and len(df) > 20:
-                        results[symbol] = df
-                except Exception as e:
-                    print(f"Failed to fetch {symbol}: {e}")
-        return results
-
-    def _fetch_single_asset(self, symbol: str, start: datetime, end: datetime) -> pd.DataFrame:
-        # Force single thread download inside the worker to prevent rate limits
-        df = yf.download(symbol, start=start, end=end + timedelta(days=1), interval="1d", progress=False, auto_adjust=True, threads=False)
+    def _yf_download(tickers: List[str], start: str, end: str) -> pd.DataFrame:
+        df = yf.download(
+            tickers=tickers,
+            start=start,
+            end=end,
+            interval="1d",
+            auto_adjust=True,
+            group_by="column",
+            threads=True,
+            progress=False,
+        )
+        if df is None or len(df) == 0:
+            return pd.DataFrame()
         if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        df.columns = [str(col).strip().replace(' ', '_') for col in df.columns]
-        if 'Close' in df.columns and 'Adj_Close' not in df.columns:
-            df['Adj_Close'] = df['Close']
-        return df.dropna()
-
-    def calculate_scientific_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        df = df.copy()
-        if 'Close' not in df.columns: return df
-        df['Returns'] = df['Close'].pct_change()
-        df['Log_Returns'] = np.log(df['Close'] / df['Close'].shift(1))
-        df['Vol_20D'] = df['Returns'].rolling(20).std() * np.sqrt(252)
-        df['SMA_50'] = df['Close'].rolling(50).mean()
-        df['SMA_200'] = df['Close'].rolling(200).mean()
-        return df.dropna()
-
-# =============================================================================
-# SCIENTIFIC CORRELATION ENGINE (Higham & EWMA)
-# =============================================================================
-
-class ScientificCorrelationEngine:
-    """Advanced scientific correlation analysis with Higham's Algorithm"""
-    
-    def __init__(self, config: ScientificAnalysisConfiguration):
-        self.config = config
-        
-    def calculate_correlation_matrix(self, returns_dict: Dict[str, pd.Series], method: str = "pearson", min_common_periods: int = 50) -> Dict[str, Any]:
-        df = pd.DataFrame(returns_dict)
-        df = df.dropna(thresh=min_common_periods, axis=1).dropna()
-        if df.empty: return {'correlation_matrix': pd.DataFrame()}
-        
-        # 
-
-[Image of covariance matrix heatmap]
-
-        if method == "ewma":
-            corr_matrix = self._calculate_ewma_correlation(df)
+            level1 = df.columns.get_level_values(0)
+            fields = list(dict.fromkeys(level1))
+            prefer = "Adj Close" if "Adj Close" in fields else ("Close" if "Close" in fields else fields[0])
+            out = df[prefer].copy()
         else:
-            corr_matrix = df.corr(method=method)
-            
-        corr_matrix = self._ensure_valid_correlation_matrix(corr_matrix)
-        
-        # Calculate significance (p-values) - Fallback safe implementation
-        p_values = pd.DataFrame(np.ones(corr_matrix.shape), index=corr_matrix.index, columns=corr_matrix.columns)
-        for c1 in df.columns:
-            for c2 in df.columns:
-                if c1 != c2:
-                    try:
-                        _, p = stats.pearsonr(df[c1], df[c2])
-                        p_values.loc[c1, c2] = p
-                    except: pass
-        
+            if "Adj Close" in df.columns:
+                out = df[["Adj Close"]].copy()
+                out.columns = [tickers[0]]
+            elif "Close" in df.columns:
+                out = df[["Close"]].copy()
+                out.columns = [tickers[0]]
+            else:
+                out = df.copy()
+        if out.columns.dtype != object:
+            out.columns = out.columns.astype(str)
+        return out
+
+    @staticmethod
+    def _max_consecutive_nan_run(s: pd.Series) -> int:
+        is_na = s.isna().astype(int).values
+        if is_na.size == 0:
+            return 0
+        max_run = 0
+        run = 0
+        for v in is_na:
+            if v == 1:
+                run += 1
+                max_run = max(max_run, run)
+            else:
+                run = 0
+        return int(max_run)
+
+    def data_quality_gate(self, prices: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+        info: Dict[str, Any] = {"dropped": {}, "kept": []}
+        if not df_nonempty(prices):
+            return prices, info
+
+        out = prices.copy().sort_index()
+        out = out.replace([np.inf, -np.inf], np.nan)
+
+        for c in list(out.columns):
+            s = out[c]
+            missing_frac = float(s.isna().mean())
+            max_gap = self._max_consecutive_nan_run(s)
+            if missing_frac > self.cfg.max_missing_frac or max_gap > self.cfg.max_gap_days:
+                info["dropped"][c] = {"missing_frac": missing_frac, "max_gap": max_gap}
+                out = out.drop(columns=[c])
+            else:
+                info["kept"].append(c)
+
+        out = out.ffill(limit=self.cfg.max_gap_days)
+        return out, info
+
+    def compute_returns(self, prices: pd.DataFrame) -> pd.DataFrame:
+        if not df_nonempty(prices):
+            return pd.DataFrame()
+        px_ = prices.copy()
+        if self.cfg.returns_mode == "log":
+            rets = np.log(px_ / px_.shift(1))
+        else:
+            rets = px_.pct_change()
+        rets = rets.replace([np.inf, -np.inf], np.nan)
+        return rets.dropna(how="all")
+
+    def fetch(self, tickers: List[str], start: str, end: str) -> Dict[str, Any]:
+        raw = self._yf_download(tickers, start, end)
+        cleaned, dq = self.data_quality_gate(raw)
+        rets = self.compute_returns(cleaned)
+        return {"raw_prices": raw, "prices": cleaned, "returns": rets, "dq": dq}
+
+# ==============================================================================
+# ANALYTICS
+# ==============================================================================
+class Analytics:
+    def __init__(self, cfg: AppConfig):
+        self.cfg = cfg
+
+    def ewma_vol(self, returns: pd.Series, span: int) -> pd.Series:
+        if not series_nonempty(returns):
+            return pd.Series(dtype=float)
+        return returns.ewm(span=int(span), adjust=False).std(bias=False)
+
+    def ratio_signal(self, returns: pd.Series) -> pd.DataFrame:
+        if not series_nonempty(returns):
+            return pd.DataFrame()
+
+        vol_s = self.ewma_vol(returns, self.cfg.ewma_short)
+        vol_m = self.ewma_vol(returns, self.cfg.ewma_mid)
+        vol_l = self.ewma_vol(returns, self.cfg.ewma_long)
+
+        denom = (vol_m + vol_l).replace(0, np.nan)
+        ratio = (vol_s / denom).replace([np.inf, -np.inf], np.nan)
+
+        df = pd.DataFrame({
+            "ret": returns,
+            f"ewma_vol_{self.cfg.ewma_short}": vol_s,
+            f"ewma_vol_{self.cfg.ewma_mid}": vol_m,
+            f"ewma_vol_{self.cfg.ewma_long}": vol_l,
+            "ratio": ratio,
+        }).dropna(how="all")
+
+        w = int(self.cfg.boll_window)
+        k = float(self.cfg.boll_k)
+        ma = df["ratio"].rolling(w).mean()
+        sd = df["ratio"].rolling(w).std(ddof=0)
+        df["bb_mid"] = ma
+        df["bb_upper"] = ma + k * sd
+        df["bb_lower"] = ma - k * sd
+        return df
+
+    def _overlap_align_returns(self, rets: pd.DataFrame, min_overlap_days: int) -> pd.DataFrame:
+        if not df_nonempty(rets):
+            return pd.DataFrame()
+        df = rets.copy().replace([np.inf, -np.inf], np.nan).dropna(how="all")
+        keep_cols = [c for c in df.columns if df[c].dropna().shape[0] >= min_overlap_days]
+        df = df[keep_cols]
+        if df.shape[1] < 2:
+            return pd.DataFrame()
+        df = df.dropna(axis=0, how="any")
+        if df.shape[0] < min_overlap_days:
+            return pd.DataFrame()
+        return df
+
+    def correlation_matrix(
+        self,
+        returns: pd.DataFrame,
+        method: str = "pearson",
+        min_overlap_days: Optional[int] = None,
+    ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+        meta = {
+            "method": method,
+            "min_overlap_days": min_overlap_days if min_overlap_days is not None else self.cfg.min_overlap_days,
+            "n_obs": 0,
+            "assets": 0,
+            "notes": [],
+        }
+
+        if not df_nonempty(returns):
+            meta["notes"].append("Empty returns.")
+            return pd.DataFrame(), meta
+
+        min_ov = int(min_overlap_days if min_overlap_days is not None else self.cfg.min_overlap_days)
+        aligned = self._overlap_align_returns(returns, min_ov)
+        if not df_nonempty(aligned) or aligned.shape[1] < 2:
+            meta["notes"].append("Insufficient overlap after alignment.")
+            return pd.DataFrame(), meta
+
+        meta["n_obs"] = int(aligned.shape[0])
+        meta["assets"] = int(aligned.shape[1])
+
+        m = method.lower()
+        if m in ["pearson", "spearman", "kendall"]:
+            corr = aligned.corr(method=m)
+            return corr, meta
+
+        if m in ["ledoitwolf", "lw", "shrinkage"]:
+            if not HAS_SKLEARN:
+                meta["notes"].append("sklearn not available; fallback to Pearson.")
+                corr = aligned.corr(method="pearson")
+                return corr, meta
+
+            lw = LedoitWolf().fit(aligned.values)
+            cov = lw.covariance_
+            d = np.sqrt(np.diag(cov))
+            denom = np.outer(d, d)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                corr = cov / denom
+            corr = np.clip(corr, -1.0, 1.0)
+            corr_df = pd.DataFrame(corr, index=aligned.columns, columns=aligned.columns)
+            meta["notes"].append("Ledoit-Wolf shrinkage correlation computed from shrinkage covariance.")
+            return corr_df, meta
+
+        meta["notes"].append(f"Unknown method '{method}', fallback Pearson.")
+        corr = aligned.corr(method="pearson")
+        return corr, meta
+
+    def var_historical(self, r: pd.Series, alpha: float) -> float:
+        if not series_nonempty(r):
+            return np.nan
+        q = np.nanquantile(r.dropna().values, 1.0 - alpha)
+        return float(-q)
+
+    def cvar_historical(self, r: pd.Series, alpha: float) -> float:
+        if not series_nonempty(r):
+            return np.nan
+        arr = r.dropna().values
+        q = np.nanquantile(arr, 1.0 - alpha)
+        tail = arr[arr <= q]
+        if tail.size == 0:
+            return np.nan
+        return float(-np.nanmean(tail))
+
+    def var_parametric_normal(self, r: pd.Series, alpha: float) -> float:
+        if not series_nonempty(r):
+            return np.nan
+        mu = float(r.mean())
+        sig = float(r.std(ddof=1))
+        z = stats.norm.ppf(1.0 - alpha)
+        return float(-(mu + z * sig))
+
+    def cvar_parametric_normal(self, r: pd.Series, alpha: float) -> float:
+        if not series_nonempty(r):
+            return np.nan
+        mu = float(r.mean())
+        sig = float(r.std(ddof=1))
+        z = stats.norm.ppf(1.0 - alpha)
+        pdf = stats.norm.pdf(z)
+        cvar = -(mu - sig * pdf / (1.0 - alpha))
+        return float(cvar)
+
+    def var_cornish_fisher(self, r: pd.Series, alpha: float) -> float:
+        if not series_nonempty(r):
+            return np.nan
+        x = r.dropna().values
+        mu = np.mean(x)
+        sig = np.std(x, ddof=1)
+        if sig <= 0:
+            return np.nan
+        s = stats.skew(x, bias=False)
+        k = stats.kurtosis(x, fisher=True, bias=False)  # excess
+        z = stats.norm.ppf(1.0 - alpha)
+        z_cf = (
+            z
+            + (1/6) * (z**2 - 1) * s
+            + (1/24) * (z**3 - 3*z) * k
+            - (1/36) * (2*z**3 - 5*z) * (s**2)
+        )
+        return float(-(mu + z_cf * sig))
+
+    def equal_weights(self, n: int) -> np.ndarray:
+        if n <= 0:
+            return np.array([])
+        return np.ones(n) / n
+
+# ==============================================================================
+# VISUALIZATION
+# ==============================================================================
+class Viz:
+    def __init__(self, cfg: AppConfig):
+        self.cfg = cfg
+
+    def kpi_row(self, kpis: List[Tuple[str, str, str]]):
+        cols = st.columns(len(kpis))
+        for i, (t, v, s) in enumerate(kpis):
+            with cols[i]:
+                st.markdown(
+                    f"""
+                    <div class="kpi-card">
+                      <div class="kpi-title">{t}</div>
+                      <p class="kpi-value">{v}</p>
+                      <div class="kpi-sub">{s}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+    def line_chart(self, df: pd.DataFrame, title: str, y_cols: List[str], height: int = 520) -> go.Figure:
+        fig = go.Figure()
+        for c in y_cols:
+            fig.add_trace(go.Scatter(x=df.index, y=df[c], mode="lines", name=c))
+        fig.update_layout(
+            title=title,
+            height=height,
+            template="plotly_white",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+            margin=dict(l=30, r=30, t=60, b=30),
+        )
+        fig.update_xaxes(showgrid=True)
+        fig.update_yaxes(showgrid=True)
+        return fig
+
+    def price_chart(self, prices: pd.DataFrame, title: str) -> go.Figure:
+        fig = go.Figure()
+        for c in prices.columns:
+            fig.add_trace(go.Scatter(x=prices.index, y=prices[c], mode="lines", name=c))
+        fig.update_layout(
+            title=title,
+            height=520,
+            template="plotly_white",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+            margin=dict(l=30, r=30, t=60, b=30),
+        )
+        return fig
+
+    def correlation_heatmap(self, corr: pd.DataFrame, title: str) -> go.Figure:
+        fig = px.imshow(
+            corr.values,
+            x=list(corr.columns),
+            y=list(corr.index),
+            aspect="auto",
+            text_auto=".2f",
+        )
+        fig.update_layout(
+            title=title,
+            height=650,
+            template="plotly_white",
+            margin=dict(l=30, r=30, t=70, b=30),
+        )
+        return fig
+
+    def ratio_signal_chart(
+        self,
+        df_ratio: pd.DataFrame,
+        title: str,
+        green_max: float,
+        orange_max: float,
+        show_bbands: bool = True,
+    ) -> go.Figure:
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=df_ratio.index, y=df_ratio["ratio"],
+            mode="lines", name="Ratio (EWMA22 / (EWMA33+EWMA99))"
+        ))
+
+        if show_bbands and ("bb_upper" in df_ratio.columns):
+            fig.add_trace(go.Scatter(
+                x=df_ratio.index, y=df_ratio["bb_upper"], mode="lines", name="BB Upper", line=dict(width=2)
+            ))
+            fig.add_trace(go.Scatter(
+                x=df_ratio.index, y=df_ratio["bb_mid"], mode="lines", name="BB Mid", line=dict(width=1, dash="dot")
+            ))
+            fig.add_trace(go.Scatter(
+                x=df_ratio.index, y=df_ratio["bb_lower"], mode="lines", name="BB Lower", line=dict(width=2)
+            ))
+
+        y_min = float(np.nanmin(df_ratio["ratio"].values)) if df_ratio["ratio"].notna().any() else 0.0
+        y_max = float(np.nanmax(df_ratio["ratio"].values)) if df_ratio["ratio"].notna().any() else 1.0
+        pad = 0.08 * (y_max - y_min) if (y_max > y_min) else 0.2
+        y_min2 = y_min - pad
+        y_max2 = y_max + pad
+
+        fig.add_hrect(
+            y0=y_min2, y1=green_max,
+            fillcolor="rgba(0, 200, 0, 0.08)", line_width=0,
+            annotation_text="GREEN (OK)", annotation_position="top left"
+        )
+        fig.add_hrect(
+            y0=green_max, y1=orange_max,
+            fillcolor="rgba(255, 165, 0, 0.10)", line_width=0,
+            annotation_text="ORANGE (Watch)", annotation_position="top left"
+        )
+        fig.add_hrect(
+            y0=orange_max, y1=y_max2,
+            fillcolor="rgba(255, 0, 0, 0.08)", line_width=0,
+            annotation_text="RED (Risk)", annotation_position="top left"
+        )
+
+        fig.update_layout(
+            title=title,
+            height=650,
+            template="plotly_white",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+            margin=dict(l=30, r=30, t=70, b=30),
+        )
+        fig.update_yaxes(title="Ratio", showgrid=True)
+        fig.update_xaxes(showgrid=True)
+        return fig
+
+# ==============================================================================
+# DASHBOARD APP
+# ==============================================================================
+class InstitutionalCommoditiesDashboard:
+    def __init__(self, cfg: AppConfig):
+        self.cfg = cfg
+        self.data = DataEngine(cfg)
+        self.an = Analytics(cfg)
+        self.viz = Viz(cfg)
+
+    def _sidebar(self) -> Dict[str, Any]:
+        st.sidebar.markdown(f"### 🏛️ {self.cfg.title}")
+        st.sidebar.caption(f"Run time: **{_now_str()}**")
+
+        end = datetime.today().date()
+        start_default = (datetime.today() - timedelta(days=365 * self.cfg.default_years_back)).date()
+
+        st.sidebar.markdown("#### Data Window")
+        start_date = st.sidebar.date_input("Start date", value=start_default, key="sb_start")
+        end_date = st.sidebar.date_input("End date", value=end, key="sb_end")
+        if start_date >= end_date:
+            st.sidebar.warning("Start date must be earlier than end date. Resetting to defaults.")
+            start_date = start_default
+            end_date = end
+
+        st.sidebar.markdown("#### Universe Selection")
+        categories = list(UNIVERSE.keys())
+        cat = st.sidebar.selectbox("Category", categories, index=0, key="sb_cat")
+
+        labels = list(UNIVERSE[cat].keys())
+        default_sel = labels[: min(4, len(labels))]
+        selected_labels = st.sidebar.multiselect(
+            "Select Instruments",
+            options=labels,
+            default=default_sel,
+            key="sb_assets",
+        )
+        tickers = [UNIVERSE[cat][lbl] for lbl in selected_labels] if selected_labels else []
+
+        st.sidebar.markdown("#### Data Quality Gate")
+        min_overlap = st.sidebar.slider(
+            "Min overlap days (correlation)",
+            min_value=60,
+            max_value=520,
+            value=self.cfg.min_overlap_days,
+            step=10,
+            key="sb_min_overlap",
+        )
+        max_missing = st.sidebar.slider(
+            "Max missing fraction per series",
+            min_value=0.05,
+            max_value=0.50,
+            value=self.cfg.max_missing_frac,
+            step=0.01,
+            key="sb_max_missing",
+        )
+        max_gap = st.sidebar.slider(
+            "Max consecutive missing days",
+            min_value=2,
+            max_value=30,
+            value=self.cfg.max_gap_days,
+            step=1,
+            key="sb_max_gap",
+        )
+
+        st.sidebar.markdown("#### Signal Ratio Thresholds")
+        green_max = st.sidebar.number_input(
+            "Green max (<=)",
+            min_value=0.05,
+            max_value=5.00,
+            value=float(self.cfg.ratio_green_max),
+            step=0.05,
+            key="sb_green_max",
+        )
+        orange_max = st.sidebar.number_input(
+            "Orange max (<=)",
+            min_value=green_max + 0.01,
+            max_value=7.00,
+            value=float(self.cfg.ratio_orange_max),
+            step=0.05,
+            key="sb_orange_max",
+        )
+
+        st.sidebar.markdown("#### Correlation Method")
+        corr_method = st.sidebar.selectbox(
+            "Method",
+            options=["pearson", "spearman", "kendall", "ledoitwolf"],
+            index=3 if HAS_SKLEARN else 0,
+            key="sb_corr_method",
+        )
+        if corr_method == "ledoitwolf" and not HAS_SKLEARN:
+            st.sidebar.warning("sklearn not installed. Ledoit-Wolf will fallback to Pearson.")
+
+        st.sidebar.markdown("#### Portfolio Weights")
+        weight_mode = st.sidebar.selectbox(
+            "Weight mode",
+            options=["equal", "custom"],
+            index=0,
+            key="sb_wmode",
+        )
+
         return {
-            'correlation_matrix': corr_matrix,
-            'significance_matrix': p_values,
-            'summary_stats': {
-                'mean_correlation': float(corr_matrix.values[np.triu_indices_from(corr_matrix, k=1)].mean()),
-                'max_correlation': float(corr_matrix.values[np.triu_indices_from(corr_matrix, k=1)].max())
-            }
+            "start_date": start_date,
+            "end_date": end_date,
+            "tickers": tickers,
+            "labels": selected_labels,
+            "category": cat,
+            "min_overlap": int(min_overlap),
+            "max_missing": float(max_missing),
+            "max_gap": int(max_gap),
+            "green_max": float(green_max),
+            "orange_max": float(orange_max),
+            "corr_method": corr_method,
+            "weight_mode": weight_mode,
         }
 
-    def _calculate_ewma_correlation(self, df: pd.DataFrame) -> pd.DataFrame:
-        decay = self.config.ewma_lambda
-        weights = np.array([(1 - decay) * (decay ** i) for i in range(len(df))])[::-1]
-        weights /= weights.sum()
-        centered = df - df.mean()
-        cov = centered.T @ (centered.mul(weights, axis=0))
-        v = np.sqrt(np.diag(cov))
-        outer_v = np.outer(v, v)
-        corr = cov / outer_v
-        return pd.DataFrame(corr, index=df.columns, columns=df.columns)
+    @st.cache_data(show_spinner=False)
+    def _load_data_cached(self, tickers: Tuple[str, ...], start: str, end: str, max_missing: float, max_gap: int) -> Dict[str, Any]:
+        cfg2 = AppConfig(**{**self.cfg.__dict__})
+        cfg2.max_missing_frac = float(max_missing)
+        cfg2.max_gap_days = int(max_gap)
+        de = DataEngine(cfg2)
+        return de.fetch(list(tickers), start=start, end=end)
 
-    def _ensure_valid_correlation_matrix(self, matrix: pd.DataFrame) -> pd.DataFrame:
-        # Higham's Algorithm (Simplified)
-        A = (matrix.values + matrix.values.T) / 2
-        vals, vecs = np.linalg.eigh(A)
-        vals[vals < 1e-8] = 1e-8
-        B = vecs @ np.diag(vals) @ vecs.T
-        D = np.diag(1 / np.sqrt(np.diag(B)))
-        B = D @ B @ D
-        return pd.DataFrame(B, index=matrix.index, columns=matrix.columns)
-
-    def calculate_rolling_correlation(self, s1: pd.Series, s2: pd.Series, window: int) -> pd.Series:
-        return s1.rolling(window).corr(s2).dropna()
-
-# =============================================================================
-# ENHANCED ANALYTICS ENGINE (HMM REGIME SWITCHING)
-# =============================================================================
-
-class ScientificAnalyticsEngine:
-    """Enhanced scientific analytics with HMM and Regime Detection"""
-    
-    def __init__(self, config: ScientificAnalysisConfiguration):
-        self.config = config
-        self.correlation_engine = ScientificCorrelationEngine(config)
-        
-    def calculate_scientific_risk_metrics(self, returns: pd.Series) -> Dict[str, Any]:
-        if len(returns) < 20: return {}
-        # Winsorize for robustness
-        clean_ret = returns.clip(lower=returns.quantile(0.01), upper=returns.quantile(0.99))
-        
-        ann_factor = np.sqrt(self.config.annual_trading_days)
-        vol = clean_ret.std() * ann_factor
-        ret = clean_ret.mean() * self.config.annual_trading_days
-        sharpe = (ret - self.config.risk_free_rate) / vol if vol > 0 else 0
-        
-        cum_ret = (1 + clean_ret).cumprod()
-        drawdown = (cum_ret - cum_ret.expanding().max()) / cum_ret.expanding().max()
-        max_dd = drawdown.min()
-        
-        var_95 = np.percentile(clean_ret, 5)
-        cvar_95 = clean_ret[clean_ret <= var_95].mean()
-        
-        # Calculate additional advanced metrics
-        downside = clean_ret[clean_ret < 0]
-        sortino = (ret - self.config.risk_free_rate) / (downside.std() * ann_factor + 1e-9)
-        calmar = (ret - self.config.risk_free_rate) / abs(max_dd) if max_dd != 0 else 0
-        
-        metrics = {
-            'Annualized_Return': ret,
-            'Annualized_Volatility': vol,
-            'Sharpe_Ratio': sharpe,
-            'Maximum_Drawdown': max_dd * 100,
-            'VaR_95_Historical': abs(var_95) * 100,
-            'CVaR_95': abs(cvar_95) * 100,
-            'Sortino_Ratio': sortino,
-            'Calmar_Ratio': calmar
-        }
-        return {'metrics': metrics, 'validation': {'valid': True, 'n_observations': len(clean_ret)}}
-
-    # -------------------------------------------------------------------------
-    # HMM REGIME SWITCHING IMPLEMENTATION
-    # -------------------------------------------------------------------------
-    
-    def detect_market_regimes(self, returns: pd.Series, n_states: int = 2, covariance_type: str = "full", n_iter: int = 100) -> Dict[str, Any]:
-        """Fits a Gaussian HMM to detect market regimes. """
-        if len(returns) < 100: return {'valid': False, 'error': "Insufficient data for HMM (min 100 points)"}
-            
-        try:
-            from hmmlearn.hmm import GaussianHMM
-            from sklearn.preprocessing import StandardScaler
-        except ImportError: return {'valid': False, 'error': "hmmlearn/sklearn not installed"}
-            
-        X = returns.values.reshape(-1, 1)
-        scaler = StandardScaler()
-        X_scaled = scaler.fit_transform(X)
-        
-        model = GaussianHMM(n_components=n_states, covariance_type=covariance_type, n_iter=n_iter, random_state=42, verbose=False)
-        try: model.fit(X_scaled)
-        except Exception as e: return {'valid': False, 'error': f"HMM Fit Failed: {str(e)}"}
-            
-        hidden_states = model.predict(X_scaled)
-        posterior_probs = model.predict_proba(X_scaled)
-        
-        # STATE SORTING (0=Low Vol, 1=High Vol)
-        if covariance_type == "full":
-            state_vars = np.array([cov[0][0] for cov in model.covars_])
-        elif covariance_type == "diag":
-            state_vars = np.array([cov[0] for cov in model.covars_])
-        else:
-            state_vars = model.covars_.flatten()
-            
-        sorted_indices = np.argsort(state_vars)
-        state_map = {old: new for new, old in enumerate(sorted_indices)}
-        sorted_hidden_states = np.array([state_map[s] for s in hidden_states])
-        sorted_posterior_probs = posterior_probs[:, sorted_indices]
-        
-        # Regime Statistics
-        regime_stats = {}
-        df_analysis = pd.DataFrame({'Return': returns.values, 'State': sorted_hidden_states}, index=returns.index)
-        for state in range(n_states):
-            state_data = df_analysis[df_analysis['State'] == state]['Return']
-            if len(state_data) > 0:
-                ann_vol = state_data.std() * np.sqrt(252)
-                ann_ret = state_data.mean() * 252
-                regime_stats[state] = {'count': len(state_data), 'frequency': len(state_data)/len(returns), 'volatility': ann_vol, 'sharpe': (ann_ret - self.config.risk_free_rate)/(ann_vol if ann_vol > 0 else 1.0)}
-            else:
-                regime_stats[state] = {'count': 0, 'frequency': 0.0, 'volatility': 0.0, 'sharpe': 0.0}
-                
-        return {'valid': True, 'hidden_states': pd.Series(sorted_hidden_states, index=returns.index), 'regime_stats': regime_stats}
-
-    def calculate_conditional_correlations(self, returns_dict: Dict[str, pd.Series], benchmark_symbol: str, n_states: int = 2) -> Dict[str, Any]:
-        """Calculate correlation matrices conditional on the benchmark's regime"""
-        if benchmark_symbol not in returns_dict: return {'valid': False, 'error': "Benchmark symbol not found"}
-            
-        hmm_result = self.detect_market_regimes(returns_dict[benchmark_symbol], n_states=n_states)
-        if not hmm_result['valid']: return hmm_result
-            
-        regimes = hmm_result['hidden_states']
-        df_returns = pd.DataFrame(returns_dict).dropna()
-        common_idx = df_returns.index.intersection(regimes.index)
-        df_returns = df_returns.loc[common_idx]
-        regimes = regimes.loc[common_idx]
-        
-        conditional_matrices = {}
-        for state in range(n_states):
-            state_returns = df_returns.loc[regimes == state]
-            if len(state_returns) > 30:
-                res = self.correlation_engine.calculate_correlation_matrix(state_returns.to_dict('series'), method="pearson")
-                conditional_matrices[state] = res['correlation_matrix']
-            else:
-                conditional_matrices[state] = pd.DataFrame()
-                
-        return {'valid': True, 'regimes_used': regimes, 'conditional_matrices': conditional_matrices, 'regime_stats': hmm_result['regime_stats']}
-
-# =============================================================================
-# SCIENTIFIC VISUALIZATION ENGINE
-# =============================================================================
-
-class ScientificVisualizationEngine:
-    """Institutional scientific visualization engine"""
-    
-    def __init__(self):
-        self.theme = ScientificThemeManager()
-        
-    def create_scientific_correlation_matrix(self, corr_data: Dict[str, Any], title: str) -> go.Figure:
-        if not corr_data or 'correlation_matrix' not in corr_data: return go.Figure()
-        matrix = corr_data['correlation_matrix']
-        fig = go.Figure(data=go.Heatmap(z=matrix.values, x=matrix.columns, y=matrix.index, colorscale='RdBu', zmin=-1, zmax=1, text=matrix.round(2).values, texttemplate='%{text}'))
-        fig.update_layout(title=title, height=600, template="plotly_white")
-        return fig
-
-    def create_regime_chart(self, price_series: pd.Series, regimes: pd.Series, stats: Dict[int, Any]) -> go.Figure:
-        """Create institutional regime chart with colored background regions"""
-        common_idx = price_series.index.intersection(regimes.index)
-        price = price_series.loc[common_idx]
-        regime = regimes.loc[common_idx]
-        
-        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.7, 0.3])
-        fig.add_trace(go.Scatter(x=price.index, y=price.values, name="Price", line=dict(color='black', width=1)), row=1, col=1)
-        
-        colors = ['rgba(46, 125, 50, 0.2)', 'rgba(198, 40, 40, 0.2)', 'rgba(255, 143, 0, 0.2)']
-        state_names = ['Low Volatility', 'High Volatility', 'Transition']
-        
-        df_regime = pd.DataFrame({'state': regime})
-        df_regime['group'] = (df_regime['state'] != df_regime['state'].shift()).cumsum()
-        
-        for _, block in df_regime.groupby('group'):
-            start, end = block.index[0], block.index[-1]
-            state = block['state'].iloc[0]
-            if state < len(colors):
-                fig.add_vrect(x0=start, x1=end, fillcolor=colors[state], opacity=1, layer="below", line_width=0, row=1, col=1)
-                
-        fig.add_trace(go.Scatter(x=regime.index, y=regime.values, mode='lines', name="Regime", line=dict(shape='hv', width=2, color='#1a237e'), fill='tozeroy', fillcolor='rgba(26, 35, 126, 0.1)'), row=2, col=1)
-        
-        stats_text = []
-        for state, metrics in stats.items():
-            s_name = state_names[state] if state < len(state_names) else f"State {state}"
-            stats_text.append(f"<b>{s_name}</b>: Vol {metrics['volatility']:.1%} | Freq {metrics['frequency']:.1%}")
-            
-        fig.add_annotation(text="<br>".join(stats_text), xref="paper", yref="paper", x=0.02, y=0.98, showarrow=False, bgcolor="rgba(255,255,255,0.9)", bordercolor="gray")
-        fig.update_layout(title="Scientific Regime Detection (Gaussian HMM)", height=600, template="plotly_white", yaxis2=dict(tickmode='array', tickvals=[0, 1, 2], ticktext=state_names))
-        return fig
-
-    def create_conditional_matrix_comparison(self, conditional_matrices: Dict[int, pd.DataFrame], state_names: List[str]) -> go.Figure:
-        n_states = len(conditional_matrices)
-        fig = make_subplots(rows=1, cols=n_states, subplot_titles=[f"{state_names[i] if i < len(state_names) else f'State {i}'}" for i in range(n_states)], horizontal_spacing=0.05)
-        
-        for i, (state, matrix) in enumerate(conditional_matrices.items()):
-            if matrix.empty: continue
-            fig.add_trace(go.Heatmap(z=matrix.values, x=matrix.columns, y=matrix.index, colorscale='RdBu', zmin=-1, zmax=1, showscale=(i==n_states-1), text=matrix.round(2).values, texttemplate='%{text}', textfont={"size": 10}), row=1, col=i+1)
-        fig.update_layout(title="Regime-Conditional Correlation Structure", height=500, template="plotly_white")
-        return fig
-
-    def create_rolling_correlation_chart(self, rolling_corr: pd.Series, asset1: str, asset2: str, title: str) -> go.Figure:
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=rolling_corr.index, y=rolling_corr.values, name="Correlation", line=dict(color='#1a237e', width=2)))
-        fig.update_layout(title=title, height=400, template="plotly_white", yaxis=dict(range=[-1, 1]))
-        return fig
-    
-    def create_comparison_chart(self, comparison_df: pd.DataFrame) -> go.Figure:
-        fig = go.Figure()
-        metrics = ['Sharpe_Ratio', 'Annualized_Volatility', 'Maximum_Drawdown']
-        colors = ['#1a237e', '#283593', '#3949ab']
-        for metric, color in zip(metrics, colors):
-            if metric in comparison_df.columns:
-                fig.add_trace(go.Bar(x=comparison_df['Asset'], y=comparison_df[metric], name=metric, marker_color=color, opacity=0.7))
-        fig.update_layout(title="Risk Metrics Comparison", barmode='group', template="plotly_white", height=500)
-        return fig
-
-    def _create_empty_plot(self, message: str) -> go.Figure:
-        fig = go.Figure()
-        fig.add_annotation(text=message, xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False)
-        return fig
-
-# =============================================================================
-# MAIN SCIENTIFIC APPLICATION
-# =============================================================================
-
-class ScientificCommoditiesPlatform:
-    """Main scientific Streamlit application"""
-    
-    def __init__(self):
-        self.data_manager = ScientificDataManager()
-        self.visualization = ScientificVisualizationEngine()
-        self.config = None
-        self.analytics_engine = None
-        
-        if 'scientific_analysis_results' not in st.session_state: st.session_state.scientific_analysis_results = {}
-        if 'selected_scientific_assets' not in st.session_state: st.session_state.selected_scientific_assets = []
-        if 'selected_benchmarks' not in st.session_state: st.session_state.selected_benchmarks = []
-        if 'correlation_methods' not in st.session_state: st.session_state.correlation_methods = ['pearson', 'ewma']
-
-    def render_scientific_header(self):
-        st.markdown("""
-        <div class="scientific-header">
-            <h1>📈 Institutional Commodities Platform v8.0</h1>
-            <p>Scientific Computing Division • Regime Analytics • HMM • Risk Management</p>
-            <div style="display: flex; gap: 1rem; margin-top: 1.5rem;">
-                <span class="scientific-badge info">🔬 Scientific Validation</span>
-                <span class="scientific-badge warning">🧬 Regime Switching</span>
-                <span class="scientific-badge success">⚡ Higham Algo</span>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-        st.markdown(sci_dep_manager.display_status(), unsafe_allow_html=True)
-
-    def render_scientific_sidebar(self):
-        with st.sidebar:
-            st.header("🔬 Configuration")
-            start_date = st.date_input("Start Date", datetime.now() - timedelta(days=365*3))
-            end_date = st.date_input("End Date", datetime.now())
-            
-            st.subheader("📊 Asset Universe")
-            selected_assets = []
-            for category, assets in COMMODITIES_UNIVERSE.items():
-                with st.expander(f"{category}", expanded=False):
-                    for symbol, meta in assets.items():
-                        if st.checkbox(f"{meta.name}", value=symbol in ["GC=F", "CL=F"], key=f"sel_{symbol}"):
-                            selected_assets.append(symbol)
-            st.session_state.selected_scientific_assets = selected_assets
-            
-            st.subheader("🎯 Benchmarks")
-            benchmarks = []
-            for symbol, meta in BENCHMARKS.items():
-                if st.checkbox(meta['name'], value=symbol=="^GSPC", key=f"bench_{symbol}"):
-                    benchmarks.append(symbol)
-            st.session_state.selected_benchmarks = benchmarks
-            
-            st.subheader("⚙️ Parameters")
-            corr_methods = st.multiselect("Correlation Methods", ["pearson", "spearman", "ewma"], default=["pearson", "ewma"])
-            st.session_state.correlation_methods = corr_methods
-            ewma_lambda = st.slider("EWMA Lambda", 0.90, 0.99, 0.94) if "ewma" in corr_methods else 0.94
-            
-            self.config = ScientificAnalysisConfiguration(start_date=datetime.combine(start_date, datetime.min.time()), end_date=datetime.combine(end_date, datetime.min.time()), confidence_levels=(0.95, 0.99), ewma_lambda=ewma_lambda)
-            
-            if st.button("🚀 Run Scientific Analysis", type="primary", use_container_width=True):
-                st.session_state.run_scientific_analysis = True
-                st.rerun()
-
-    def run_scientific_analysis(self):
-        with st.spinner("🔄 Executing Institutional Analytics Pipeline..."):
-            all_symbols = st.session_state.selected_scientific_assets + st.session_state.selected_benchmarks
-            if not all_symbols:
-                st.error("No assets selected")
-                return
-
-            data_results = self.data_manager.fetch_multiple_assets_scientific(all_symbols, self.config.start_date, self.config.end_date)
-            if not data_results:
-                st.error("No data fetched. Check date range.")
-                return
-
-            features = {s: self.data_manager.calculate_scientific_features(df) for s, df in data_results.items()}
-            returns = {s: df['Returns'].dropna() for s, df in features.items() if 'Returns' in df.columns}
-            
-            self.analytics_engine = ScientificAnalyticsEngine(self.config)
-            risk_metrics = {s: self.analytics_engine.calculate_scientific_risk_metrics(r) for s, r in returns.items()}
-            
-            corr_results = {}
-            for method in st.session_state.correlation_methods:
-                corr_results[method] = self.analytics_engine.correlation_engine.calculate_correlation_matrix(returns, method=method)
-            
-            st.session_state.scientific_analysis_results = {'data': data_results, 'returns': returns, 'features': features, 'risk_metrics': risk_metrics, 'correlation_results': corr_results, 'analytics_engine': self.analytics_engine, 'config': self.config, 'timestamp': datetime.now()}
-        st.success(f"Analysis Complete! Processed {len(returns)} assets.")
-
-    def render_scientific_dashboard(self):
-        if st.session_state.get('run_scientific_analysis'):
-            self.run_scientific_analysis()
-            st.session_state.run_scientific_analysis = False
-            
-        results = st.session_state.scientific_analysis_results
-        if not results:
-            st.info("👈 Configure and Run Analysis from the Sidebar")
+    def _display_overview(self, prices: pd.DataFrame, returns: pd.DataFrame, dq: Dict[str, Any], key_ns: str = "ov"):
+        st.markdown("## Overview")
+        if not df_nonempty(prices):
+            st.warning("No data loaded. Please select instruments in the sidebar.")
             return
 
-        tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Overview", "📈 Risk Analytics", "🔗 Correlation", "📉 Portfolio", "🧬 Regime Science"])
-        
-        with tab1: # OVERVIEW
-            st.subheader("Asset Performance Overview")
-            risk_metrics = results['risk_metrics']
-            cols = st.columns(4)
-            for i, (sym, data) in enumerate(list(risk_metrics.items())[:4]):
-                metrics = data.get('metrics', {})
-                with cols[i]:
-                    st.metric(sym, f"{metrics.get('Annualized_Return', 0):.1%}", f"Sharpe: {metrics.get('Sharpe_Ratio', 0):.2f}")
+        last_date = prices.index.max()
+        n_assets = prices.shape[1]
+        n_obs = prices.shape[0]
+        daily_rets = returns.dropna(how="all")
+        k1 = ("Assets", f"{n_assets}", f"Obs: {n_obs}")
+        k2 = ("Last Date", f"{last_date.date()}", "Data end")
+        if n_assets >= 1:
+            w = np.ones(n_assets) / n_assets
+            p_rets = pd.Series(daily_rets.values @ w, index=daily_rets.index) if df_nonempty(daily_rets) else pd.Series(dtype=float)
+            ann_ret = float(p_rets.mean() * self.cfg.annualization) if series_nonempty(p_rets) else np.nan
+            ann_vol = float(p_rets.std(ddof=1) * math.sqrt(self.cfg.annualization)) if series_nonempty(p_rets) else np.nan
+            sharpe = ann_ret / ann_vol if (ann_vol and ann_vol > 0 and not np.isnan(ann_ret)) else np.nan
+            k3 = ("EqW Ann Return", safe_pct(ann_ret), "Return (annualized)")
+            k4 = ("EqW Ann Vol", safe_pct(ann_vol), "Volatility (annualized)")
+            k5 = ("EqW Sharpe", safe_float(sharpe, "{:.2f}"), "No RF adjustment")
+            self.viz.kpi_row([k1, k2, k3, k4, k5])
+        else:
+            self.viz.kpi_row([k1, k2])
 
-        with tab2: # RISK ANALYTICS
-            st.subheader("Comprehensive Risk Metrics")
-            risk_data = []
-            for sym, data in results['risk_metrics'].items():
-                m = data.get('metrics', {})
-                risk_data.append({'Asset': sym, 'Volatility': m.get('Annualized_Volatility'), 'Max Drawdown': m.get('Maximum_Drawdown'), 'VaR (95%)': m.get('VaR_95_Historical'), 'CVaR (95%)': m.get('CVaR_95'), 'Sortino': m.get('Sortino_Ratio')})
-            st.dataframe(pd.DataFrame(risk_data).style.format({'Volatility': '{:.2%}', 'Max Drawdown': '{:.2f}%', 'VaR (95%)': '{:.2f}%', 'CVaR (95%)': '{:.2f}%', 'Sortino': '{:.2f}'}), use_container_width=True)
-            if len(risk_data) > 0:
-                fig = self.visualization.create_comparison_chart(pd.DataFrame(risk_data))
-                st.plotly_chart(fig, use_container_width=True)
+        st.markdown("### Data Quality Gate Report")
+        colA, colB = st.columns([1, 1])
+        with colA:
+            st.markdown("**Kept series**")
+            st.write(dq.get("kept", []))
+        with colB:
+            st.markdown("**Dropped series**")
+            st.write(dq.get("dropped", {}))
 
-        with tab3: # CORRELATION
-            st.subheader("Scientific Correlation Analysis")
-            method = st.selectbox("Method", list(results['correlation_results'].keys()), key='corr_select')
-            corr_data = results['correlation_results'][method]
-            fig = self.visualization.create_scientific_correlation_matrix(corr_data, f"{method.upper()} Correlation Matrix")
+        st.markdown("### Prices (normalized)")
+        norm = prices / prices.iloc[0]
+        st.plotly_chart(self.viz.price_chart(norm, "Normalized Prices (Base=1.0)"), use_container_width=True)
+
+        st.markdown("### Latest Returns Snapshot")
+        st.dataframe(returns.tail(10), use_container_width=True)
+
+    def _display_prices(self, prices: pd.DataFrame, returns: pd.DataFrame, labels: List[str], key_ns: str = "px"):
+        st.markdown("## Prices & Returns")
+        if not df_nonempty(prices):
+            st.warning("No data loaded.")
+            return
+
+        st.plotly_chart(self.viz.price_chart(prices, "Prices (Auto-Adjusted)"), use_container_width=True)
+
+        st.markdown("### Return Distribution (Selected)")
+        if df_nonempty(returns):
+            cols = st.columns(2)
+            with cols[0]:
+                pick = st.selectbox("Asset", list(prices.columns), index=0, key=f"{key_ns}_asset_sel")
+            with cols[1]:
+                bins = st.slider("Histogram bins", 10, 200, 60, 5, key=f"{key_ns}_bins")
+
+            r = returns[pick].dropna()
+            fig = px.histogram(r, nbins=bins, title=f"Return Histogram: {pick}")
+            fig.update_layout(template="plotly_white", height=450, margin=dict(l=30, r=30, t=60, b=30))
             st.plotly_chart(fig, use_container_width=True)
-            
-            st.subheader("Rolling Pairwise Correlation")
-            col1, col2 = st.columns(2)
-            assets = list(results['returns'].keys())
-            if len(assets) >= 2:
-                a1 = col1.selectbox("Asset 1", assets, 0)
-                a2 = col2.selectbox("Asset 2", assets, 1)
-                if a1 != a2:
-                    rolling = self.analytics_engine.correlation_engine.calculate_rolling_correlation(results['returns'][a1], results['returns'][a2], window=60)
-                    fig_roll = self.visualization.create_rolling_correlation_chart(rolling, a1, a2, f"60-Day Rolling Correlation: {a1} vs {a2}")
-                    st.plotly_chart(fig_roll, use_container_width=True)
 
-        with tab4: # PORTFOLIO
-            # 
-            st.info("Portfolio Optimization Module (Mean-Variance, Risk Parity) ready for v8.1 activation")
-            
-        with tab5: # REGIME SCIENCE
-            st.markdown("""<div class="section-header"><h2>🧬 Regime Switching Analysis (HMM)</h2><div class="section-actions"><span class="scientific-badge high-risk">Gaussian HMM</span><span class="scientific-badge info">Conditional Stats</span></div></div>""", unsafe_allow_html=True)
-            if 'analytics_engine' in results:
-                col1, col2 = st.columns(2)
-                with col1:
-                    bench_assets = list(results['returns'].keys())
-                    def_idx = 0
-                    if "^GSPC" in bench_assets: def_idx = bench_assets.index("^GSPC")
-                    elif "CL=F" in bench_assets: def_idx = bench_assets.index("CL=F")
-                    hmm_asset = st.selectbox("Regime Indicator Asset", bench_assets, index=def_idx)
-                with col2:
-                    n_states = st.radio("Number of Regimes", [2, 3], index=0, horizontal=True)
-                
-                if st.button("🧬 Run HMM Analysis"):
-                    with st.spinner(f"Fitting Gaussian HMM to {hmm_asset}..."):
-                        hmm_output = results['analytics_engine'].calculate_conditional_correlations(results['returns'], benchmark_symbol=hmm_asset, n_states=n_states)
-                    if hmm_output['valid']:
-                        st.markdown("#### 🌊 Temporal Regime Map")
-                        price_series = results['data'][hmm_asset]['Close']
-                        fig_hmm = self.visualization.create_regime_chart(price_series, hmm_output['regimes_used'], hmm_outpu['regime_stats'])
-                        st.plotly_chart(fig_hmm, use_container_width=True)
-                        
-                        st.markdown("#### 🧩 Regime-Conditional Correlations")
-                        st.info("Correlations often converge to 1.0 (red) during High Volatility regimes.")
-                        state_labels = ["🟢 Low Volatility", "🔴 High Volatility", "🟠 Transition"]
-                        fig_cond = self.visualization.create_conditional_matrix_comparison(hmm_output['conditional_matrices'], state_names=state_labels)
-                        st.plotly_chart(fig_cond, use_container_width=True)
-                        
-                        st.markdown("#### 📊 Regime Statistics")
-                        stats_list = []
-                        for s, stats in hmm_output['regime_stats'].items():
-                            stats_list.append({"Regime": f"State {s}", "Frequency": f"{stats['frequency']:.1%}", "Volatility": f"{stats['volatility']:.1%}", "Sharpe": f"{stats['sharpe']:.2f}"})
-                        st.table(pd.DataFrame(stats_list))
-                    else:
-                        st.error(f"HMM Analysis Failed: {hmm_output.get('error')}")
+            st.markdown("### Summary Stats")
+            s = pd.Series({
+                "mean": r.mean(),
+                "std": r.std(ddof=1),
+                "skew": stats.skew(r.values, bias=False) if r.shape[0] > 10 else np.nan,
+                "kurt_excess": stats.kurtosis(r.values, fisher=True, bias=False) if r.shape[0] > 10 else np.nan,
+            })
+            st.dataframe(s.to_frame("value"), use_container_width=True)
+
+    def _display_ratio_signal(self, returns: pd.DataFrame, green_max: float, orange_max: float, key_ns: str = "ratio"):
+        st.markdown("## Smart Signal: EWMA Volatility Ratio")
+        st.markdown(
+            f"""
+            **Definition**  
+            Ratio = **EWMA({self.cfg.ewma_short}D Vol)** / ( **EWMA({self.cfg.ewma_mid}D Vol)** + **EWMA({self.cfg.ewma_long}D Vol)** )
+
+            **Interpretation (institutional risk signal)**  
+            - Lower ratio → short-term volatility is modest relative to mid+long regime  
+            - Higher ratio → short-term volatility is dominating → potential stress / acceleration
+            """.strip()
+        )
+
+        if not df_nonempty(returns):
+            st.warning("No returns available.")
+            return
+
+        col1, col2, col3 = st.columns([1, 1, 1])
+        with col1:
+            asset = st.selectbox("Asset", list(returns.columns), index=0, key=f"{key_ns}_asset")
+        with col2:
+            show_bbands = st.checkbox("Show Bollinger Bands", value=True, key=f"{key_ns}_bb")
+        with col3:
+            bb_k = st.number_input("BB k", min_value=0.5, max_value=4.0, value=float(self.cfg.boll_k), step=0.1, key=f"{key_ns}_bbk")
+
+        self.cfg.boll_k = float(bb_k)
+
+        df_ratio = self.an.ratio_signal(returns[asset].dropna())
+        if not df_nonempty(df_ratio):
+            st.warning("Ratio series could not be computed (insufficient data).")
+            return
+
+        fig = self.viz.ratio_signal_chart(
+            df_ratio=df_ratio,
+            title=f"EWMA Ratio Signal — {asset}",
+            green_max=green_max,
+            orange_max=orange_max,
+            show_bbands=show_bbands,
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        last_ratio = float(df_ratio["ratio"].dropna().iloc[-1]) if df_ratio["ratio"].dropna().shape[0] else np.nan
+        if np.isnan(last_ratio):
+            zone = "—"
+        elif last_ratio <= green_max:
+            zone = "GREEN"
+        elif last_ratio <= orange_max:
+            zone = "ORANGE"
+        else:
+            zone = "RED"
+
+        self.viz.kpi_row([
+            ("Last Ratio", safe_float(last_ratio, "{:.4f}"), "Most recent"),
+            ("Zone", zone, f"Thresholds: green ≤ {green_max:.2f}, orange ≤ {orange_max:.2f}"),
+            ("Obs", f"{df_ratio.shape[0]}", "Ratio history length"),
+        ])
+
+        st.markdown("### Under the hood (latest rows)")
+        st.dataframe(df_ratio.tail(15), use_container_width=True)
+
+    def _display_correlations(self, returns: pd.DataFrame, method: str, min_overlap: int, key_ns: str = "corr"):
+        st.markdown("## Correlations (Robust Reporting)")
+        if not df_nonempty(returns) or returns.shape[1] < 2:
+            st.warning("Need at least 2 instruments with valid returns.")
+            return
+
+        st.caption("This correlation uses **strict overlap alignment** (rows where any series is missing are removed).")
+
+        corr, meta = self.an.correlation_matrix(
+            returns=returns,
+            method=method,
+            min_overlap_days=int(min_overlap),
+        )
+
+        if not df_nonempty(corr):
+            st.error("Correlation could not be computed with the current overlap constraints.")
+            st.write(meta)
+            return
+
+        st.plotly_chart(self.viz.correlation_heatmap(corr, f"Asset Correlations ({meta['method']})"), use_container_width=True)
+        st.markdown("### Correlation Table")
+        st.dataframe(corr.round(4), use_container_width=True)
+        st.markdown("### Metadata / Diagnostics")
+        st.json(meta)
+
+    def _display_risk_analytics(self, returns: pd.DataFrame, weight_mode: str, key_ns: str = "risk"):
+        st.markdown("## Risk Analytics (VaR / CVaR / ES)")
+        if not df_nonempty(returns):
+            st.warning("No returns available.")
+            return
+
+        c1, c2, c3 = st.columns([1, 1, 1])
+        with c1:
+            target = st.selectbox("Target", options=["Single Asset", "Equal-Weight Portfolio"], index=1, key=f"{key_ns}_target")
+        with c2:
+            alpha = st.selectbox("Confidence", options=list(self.cfg.var_levels), index=1, key=f"{key_ns}_alpha")
+        with c3:
+            horizon = st.slider("Horizon (days)", 1, 20, 1, 1, key=f"{key_ns}_h")
+
+        if target == "Single Asset":
+            asset = st.selectbox("Asset", list(returns.columns), index=0, key=f"{key_ns}_asset")
+            r = returns[asset].dropna()
+            label = asset
+        else:
+            cols = list(returns.columns)
+            df = returns[cols].dropna(how="any")
+            if not df_nonempty(df):
+                st.warning("Insufficient strict-overlap returns for portfolio.")
+                return
+            w = self.an.equal_weights(df.shape[1])
+            r = pd.Series(df.values @ w, index=df.index)
+            label = "Equal-Weight Portfolio"
+
+        if r.shape[0] < 60:
+            st.warning("Short history may lead to unstable VaR estimates.")
+
+        h = int(horizon)
+        scale = math.sqrt(h)
+
+        var_hist = self.an.var_historical(r, alpha) * scale
+        cvar_hist = self.an.cvar_historical(r, alpha) * scale
+        var_norm = self.an.var_parametric_normal(r, alpha) * scale
+        cvar_norm = self.an.cvar_parametric_normal(r, alpha) * scale
+        var_cf = self.an.var_cornish_fisher(r, alpha) * scale
+
+        out = pd.DataFrame({
+            "Metric": ["VaR (Hist)", "CVaR/ES (Hist)", "VaR (Normal)", "CVaR/ES (Normal)", "VaR (Cornish-Fisher)"],
+            "Value": [var_hist, cvar_hist, var_norm, cvar_norm, var_cf],
+        })
+        out["Value %"] = out["Value"].apply(lambda x: safe_pct(x))
+        st.dataframe(out, use_container_width=True)
+
+        st.markdown("### Return Series & Tail Threshold")
+        rr = r.copy()
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=rr.index, y=rr.values, mode="lines", name="Returns"))
+        q = np.nanquantile(rr.dropna().values, 1.0 - float(alpha))
+        fig.add_hline(y=q, line_width=2, line_dash="dash", annotation_text=f"q(1-α)={q:.4f}")
+        fig.update_layout(template="plotly_white", height=480, title=f"Returns — {label}", margin=dict(l=30, r=30, t=60, b=30))
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption("Multi-day VaR scaling uses √h approximation (institutional shortcut).")
+
+    def _display_stress_testing(self, prices: pd.DataFrame, returns: pd.DataFrame, key_ns: str = "stress"):
+        st.markdown("## Stress Testing & Shock Simulator")
+        if not df_nonempty(prices) or not df_nonempty(returns):
+            st.warning("Need prices and returns to run stress tests.")
+            return
+
+        st.markdown("### A) Parametric Shock Scenarios (instant shock)")
+        cols = st.columns([1, 1, 1, 1])
+        with cols[0]:
+            shock_type = st.selectbox("Shock type", ["Return Shock", "Price Shock"], index=0, key=f"{key_ns}_stype")
+        with cols[1]:
+            shock = st.number_input("Shock magnitude (e.g., -0.05 = -5%)", value=-0.05, step=0.01, format="%.4f", key=f"{key_ns}_shock")
+        with cols[2]:
+            apply_to = st.selectbox("Apply to", ["All", "Single Asset"], index=0, key=f"{key_ns}_applyto")
+        with cols[3]:
+            asset = st.selectbox("Asset", list(prices.columns), index=0, key=f"{key_ns}_asset")
+
+        last_prices = prices.iloc[-1].copy()
+
+        if apply_to == "All":
+            stressed = last_prices * (1.0 + shock)
+        else:
+            stressed = last_prices.copy()
+            stressed.loc[asset] = last_prices.loc[asset] * (1.0 + shock)
+
+        res = pd.DataFrame({
+            "Last": last_prices,
+            "Stressed": stressed,
+            "Δ": stressed - last_prices,
+            "Δ%": (stressed / last_prices - 1.0),
+        })
+        res["Δ%"] = res["Δ%"].apply(lambda x: safe_pct(float(x)))
+        st.dataframe(res, use_container_width=True)
+
+        st.markdown("### B) Historical Stress (worst days)")
+        df = returns.dropna(how="any")
+        if df_nonempty(df) and df.shape[1] >= 2:
+            w = np.ones(df.shape[1]) / df.shape[1]
+            p = pd.Series(df.values @ w, index=df.index)
+            k = st.slider("Show worst N days", 5, 50, 10, 1, key=f"{key_ns}_worstn")
+            worst = p.sort_values().head(k)
+            st.write("Worst portfolio days (equal-weight, strict overlap):")
+            st.dataframe(worst.to_frame("portfolio_return"), use_container_width=True)
+        else:
+            st.info("Historical portfolio stress requires strict-overlap returns with ≥2 assets.")
+
+        st.markdown("### C) Drawdown Stress")
+        norm = prices / prices.iloc[0]
+        dd = norm / norm.cummax() - 1.0
+        st.plotly_chart(self.viz.line_chart(dd, "Drawdown (per asset)", list(dd.columns), height=520), use_container_width=True)
+
+    def _display_export(self, prices: pd.DataFrame, returns: pd.DataFrame, key_ns: str = "export"):
+        st.markdown("## Export")
+        if df_nonempty(prices):
+            st.download_button(
+                "Download Prices (CSV)",
+                data=prices.to_csv().encode("utf-8"),
+                file_name="prices.csv",
+                mime="text/csv",
+                key=f"{key_ns}_px",
+            )
+        if df_nonempty(returns):
+            st.download_button(
+                "Download Returns (CSV)",
+                data=returns.to_csv().encode("utf-8"),
+                file_name="returns.csv",
+                mime="text/csv",
+                key=f"{key_ns}_ret",
+            )
 
     def run(self):
-        try:
-            self.render_scientific_header()
-            self.render_scientific_sidebar()
-            self.render_scientific_dashboard()
-            self.render_scientific_footer()
-        except Exception as e:
-            st.error(f"Application Error: {str(e)}")
-            st.code(traceback.format_exc())
+        st.markdown(f"# 🏛️ {self.cfg.title}")
+        st.caption("Institutional-grade commodity analytics with robust correlation reporting and smart risk signals.")
 
-    def render_scientific_footer(self):
-        st.markdown("---")
-        st.markdown("""<div style="text-align: center; color: #415a77; font-size: 0.8rem;">Institutional Commodities Analytics Platform v8.0 • Scientific Computing Division</div>""", unsafe_allow_html=True)
+        params = self._sidebar()
+        self.cfg.max_missing_frac = float(params["max_missing"])
+        self.cfg.max_gap_days = int(params["max_gap"])
 
-# =============================================================================
-# EXECUTION
-# =============================================================================
+        if len(params["tickers"]) == 0:
+            st.info("Select instruments from the sidebar to start.")
+            return
+
+        start = str(params["start_date"])
+        end = str(params["end_date"] + timedelta(days=1))
+
+        with st.spinner("Downloading market data..."):
+            pack = self._load_data_cached(tuple(params["tickers"]), start, end, params["max_missing"], params["max_gap"])
+
+        prices = pack.get("prices", pd.DataFrame())
+        returns = pack.get("returns", pd.DataFrame())
+        dq = pack.get("dq", {})
+
+        if not HAS_SKLEARN:
+            st.info("ℹ️ For Ledoit-Wolf shrinkage correlation, add **scikit-learn** to requirements.txt.")
+        if not HAS_HMMLEARN:
+            st.caption("HMM regimes optional. Install **hmmlearn** to enable regimes (not required for v7.1 core).")
+        if not HAS_ARCH:
+            st.caption("GARCH optional. Install **arch** to enable GARCH models (not required for v7.1 core).")
+
+        tab_over, tab_px, tab_ratio, tab_corr, tab_risk, tab_stress, tab_export = st.tabs([
+            "Overview",
+            "Prices & Returns",
+            "Smart Signal (EWMA Ratio)",
+            "Correlations",
+            "Risk (VaR/CVaR/ES)",
+            "Stress Testing",
+            "Export",
+        ])
+
+        with tab_over:
+            self._display_overview(prices, returns, dq, key_ns="ov")
+        with tab_px:
+            self._display_prices(prices, returns, params["labels"], key_ns="px")
+        with tab_ratio:
+            self._display_ratio_signal(returns, params["green_max"], params["orange_max"], key_ns="ratio")
+        with tab_corr:
+            self._display_correlations(returns, params["corr_method"], params["min_overlap"], key_ns="corr")
+        with tab_risk:
+            self._display_risk_analytics(returns, params["weight_mode"], key_ns="risk")
+        with tab_stress:
+            self._display_stress_testing(prices, returns, key_ns="stress")
+        with tab_export:
+            self._display_export(prices, returns, key_ns="export")
+
+# ==============================================================================
+# MAIN
+# ==============================================================================
+def main():
+    try:
+        app = InstitutionalCommoditiesDashboard(CFG)
+        app.run()
+    except Exception as e:
+        st.error("🚨 Application Error")
+        st.code(str(e))
+        st.code(traceback.format_exc())
 
 if __name__ == "__main__":
-    app = ScientificCommoditiesPlatform()
-    app.run()
+    main()
