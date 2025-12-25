@@ -4250,7 +4250,7 @@ class ScientificCommoditiesPlatform:
             with st.expander(title, expanded=True):
                 st.write(description)
     
-    def render_scientific_footer(self):
+        def render_scientific_footer(self):
         """Render scientific footer"""
         st.markdown("---")
         
@@ -4272,10 +4272,7 @@ class ScientificCommoditiesPlatform:
                 </p>
             </div>
             """, unsafe_allow_html=True)
-    
-    class ScientificCommoditiesPlatform:
-    # ... other methods and class code ...
-    
+
     def run(self):
         """Run the scientific Streamlit application"""
         try:
