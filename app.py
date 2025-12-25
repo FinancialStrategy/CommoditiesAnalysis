@@ -4273,22 +4273,10 @@ class ScientificCommoditiesPlatform:
             </div>
             """, unsafe_allow_html=True)
     
+    class ScientificCommoditiesPlatform:
+    # ... other methods and class code ...
+    
     def run(self):
-        """Run the scientific Streamlit application"""
-        try:
-            # Render scientific header
-            self.render_scientific_header()
-            
-            # Render scientific sidebar
-            self.render_scientific_sidebar()
-            
-            # Render main dashboard
-            self.render_scientific_dashboard()
-            
-            # Render scientific footer
-            self.render_scientific_footer()
-        ###################################################################################################################################
-        def run(self):
         """Run the scientific Streamlit application"""
         try:
             # Render scientific header
