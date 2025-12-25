@@ -4251,7 +4251,7 @@ class ScientificCommoditiesPlatform:
                 st.write(description)
                 
         def render_scientific_footer(self):
-        """Render scientific footer"""
+            """Render scientific footer"""
         st.markdown("---")
         
         col1, col2, col3 = st.columns([1, 2, 1])
