@@ -3336,12 +3336,60 @@ class InstitutionalCommoditiesDashboard:
         
         with col3:
             if len(returns_df.columns) > 1:
+                # Robust Avg Correlation (off-diagonal mean) with strong data hygiene.
+                # Guardrails:
+                # - remove inf/NaN columns
+                # - remove duplicate column names
+                # - remove near-constant columns (std≈0)
+                # - remove duplicate series by CONTENT (identical returns across different labels)
+                # - compute Pearson corr with min_periods to avoid small-sample ±1 artifacts
                 _corr_src = returns_df.replace([np.inf, -np.inf], np.nan).dropna(axis=1, how="all")
                 _corr_src = _corr_src.loc[:, ~_corr_src.columns.duplicated()]
-                _corr = _corr_src.corr(method="pearson", min_periods=30)
-                _mask = np.triu(np.ones(_corr.shape, dtype=bool), k=1)
-                _vals = _corr.where(_mask).stack()
-                avg_corr = float(_vals.mean()) if not _vals.empty else np.nan
+                if not _corr_src.empty:
+                    _std = _corr_src.std(skipna=True)
+                    _corr_src = _corr_src.loc[:, _std > 1e-12]
+                # Drop duplicate series by content (exactly identical return paths ⇒ corr=1.000)
+                _dup_map = {}
+                _seen = {}
+                _keep_cols = []
+                for _c in list(_corr_src.columns):
+                    _s = _corr_src[_c].dropna()
+                    if _s.empty:
+                        continue
+                    try:
+                        _vals = np.round(_s.values.astype(float), 12)
+                    except Exception:
+                        _vals = np.round(pd.to_numeric(_s.values, errors="coerce").astype(float), 12)
+                    # include index to avoid accidental collisions
+                    try:
+                        _idx_bytes = _s.index.view("i8").tobytes()
+                    except Exception:
+                        _idx_bytes = np.asarray([hash(x) for x in _s.index], dtype=np.int64).tobytes()
+                    _h = hashlib.sha1(_idx_bytes + _vals.tobytes()).hexdigest()
+                    if _h in _seen:
+                        _base = _seen[_h]
+                        _dup_map.setdefault(_base, []).append(_c)
+                    else:
+                        _seen[_h] = _c
+                        _keep_cols.append(_c)
+                _corr_src_u = _corr_src[_keep_cols] if (_keep_cols and isinstance(_corr_src, pd.DataFrame)) else _corr_src
+                if _dup_map:
+                    with st.expander("⚠️ Correlation Diagnostics: Duplicate Series Detected", expanded=False):
+                        st.warning("Some selected assets have IDENTICAL return series (corr≈1). "
+                                   "Avg Correlation is computed after removing duplicates by content.")
+                        st.json(_dup_map)
+                if isinstance(_corr_src_u, pd.DataFrame) and _corr_src_u.shape[1] >= 2:
+                    try:
+                        _corr = _corr_src_u.corr(method="pearson", min_periods=30)
+                    except TypeError:
+                        _corr = _corr_src_u.corr(method="pearson")
+                    _mask = np.triu(np.ones(_corr.shape, dtype=bool), k=1)
+                    _vals = _corr.where(_mask).stack()
+                    # keep only finite correlations
+                    _vals = _vals[np.isfinite(_vals.values)]
+                    avg_corr = float(_vals.mean()) if len(_vals) > 0 else np.nan
+                else:
+                    avg_corr = np.nan
                 avg_corr_disp = f"{avg_corr:.3f}" if np.isfinite(avg_corr) else "N/A"
                 st.markdown(textwrap.dedent(f"""
                 <div class="metric-card">
@@ -7648,3 +7696,23 @@ except Exception:
 
 if __name__ == "__main__":
     main()
+
+
+# =============================================================================
+# SAFETY BINDERS — Prevent AttributeError if a method is accidentally outdented during manual merges
+# =============================================================================
+try:
+    _cls = InstitutionalCommoditiesDashboard
+    if not hasattr(_cls, "_display_tracking_error"):
+        def _display_tracking_error(self, cfg):
+            st.error("Tracking Error tab is not correctly bound inside InstitutionalCommoditiesDashboard (method missing).")
+            st.info("Please re-merge ensuring 'def _display_tracking_error' is indented inside the class.")
+        _cls._display_tracking_error = _display_tracking_error
+
+    if not hasattr(_cls, "_display_rolling_beta"):
+        def _display_rolling_beta(self, cfg):
+            st.error("Rolling Beta tab is not correctly bound inside InstitutionalCommoditiesDashboard (method missing).")
+            st.info("Please re-merge ensuring 'def _display_rolling_beta' is indented inside the class.")
+        _cls._display_rolling_beta = _display_rolling_beta
+except Exception:
+    pass
