@@ -3513,3 +3513,480 @@ try:
         InstitutionalCommoditiesDashboard._display_relative_risk = _icd_display_relative_risk_fallback
 except Exception:
     pass
+
+
+
+# =============================================================================
+# 🧠 ADDITIVE MODULE: Quantum Sovereign v14.0 (Integrated as a separate mode)
+# - Integrated WITHOUT removing existing InstitutionalCommoditiesDashboard features.
+# - Runs as an additional "Mode" in the same Streamlit app.
+# - Heavy ML deps (xgboost / tensorflow) are optional; the UI will degrade gracefully if missing.
+# =============================================================================
+
+def run_quantum_sovereign_v14_terminal():
+    """
+    Quantum Sovereign v14.0 (Quantum Sovereign) — integrated mode
+    Modules: Hybrid LSTM/RNN/XGBoost, ERC Portfolio Optimization, Black-Scholes Greeks,
+    Macro Sensitivity, Automated Signals, and Performance Backtesting.
+    """
+    import os
+    import math
+    import warnings
+    import json
+    import hashlib
+    import traceback
+    import logging
+    from datetime import datetime, timedelta
+    from typing import Dict, Any, Optional, Tuple, List, Union, Callable
+    from dataclasses import dataclass, field, asdict
+    from functools import lru_cache, wraps
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    import numpy as np
+    import pandas as pd
+    import streamlit as st
+    import yfinance as yf
+    import plotly.graph_objects as go
+    import plotly.express as px
+    from plotly.subplots import make_subplots
+
+    # Optional heavy deps — degrade gracefully instead of crashing Streamlit Cloud
+    _XGB_OK = False
+    _TF_OK = False
+    _SKL_OK = False
+
+    try:
+        import xgboost as xgb
+        _XGB_OK = True
+    except Exception:
+        xgb = None
+        _XGB_OK = False
+
+    try:
+        from sklearn.preprocessing import MinMaxScaler
+        _SKL_OK = True
+    except Exception:
+        MinMaxScaler = None
+        _SKL_OK = False
+
+    try:
+        from tensorflow.keras.models import Sequential
+        from tensorflow.keras.layers import LSTM, Dense, Dropout, SimpleRNN, BatchNormalization
+        from tensorflow.keras.callbacks import EarlyStopping
+        _TF_OK = True
+    except Exception:
+        Sequential = None
+        LSTM = Dense = Dropout = SimpleRNN = BatchNormalization = None
+        EarlyStopping = None
+        _TF_OK = False
+
+    from scipy import stats, optimize
+    from scipy.stats import norm
+    from scipy.optimize import minimize
+
+    # =============================================================================
+    # 1. ADVANCED METADATA & CONFIGURATION
+    # =============================================================================
+
+    @dataclass
+    class AssetMetadata:
+        symbol: str
+        name: str
+        category: str
+        color: str
+        risk_profile: str
+        exchange: str
+
+    # NOTE: Industrial Metals extended to include Aluminum (ALI=F) in addition to Copper (HG=F)
+    ASSET_UNIVERSE = {
+        "Energy": {
+            "CL=F": AssetMetadata("CL=F", "Crude Oil WTI", "Energy", "#00d4ff", "High", "NYMEX"),
+            "NG=F": AssetMetadata("NG=F", "Natural Gas", "Energy", "#4169E1", "High", "NYMEX"),
+        },
+        "Precious Metals": {
+            "GC=F": AssetMetadata("GC=F", "Gold", "Metals", "#FFD700", "Low", "COMEX"),
+            "SI=F": AssetMetadata("SI=F", "Silver", "Metals", "#C0C0C0", "Medium", "COMEX"),
+        },
+        "Industrial Metals": {
+            "HG=F": AssetMetadata("HG=F", "Copper", "Metals", "#B87333", "Medium", "COMEX"),
+            "ALI=F": AssetMetadata("ALI=F", "Aluminum", "Metals", "#A9A9A9", "Medium", "COMEX"),
+        }
+    }
+
+    # =============================================================================
+    # 2. DATA ACQUISITION & MANAGEMENT (Multi-threaded & Cached)
+    # =============================================================================
+
+    class InstitutionalDataManager:
+        def __init__(self):
+            self.session_data = {}
+
+        @st.cache_data(ttl=3600)
+        def get_data(self, tickers: List[str], period: str = "5y") -> pd.DataFrame:
+            """High-performance multi-threaded data fetching."""
+            try:
+                data = yf.download(tickers, period=period, progress=False, threads=True)
+                if isinstance(data.columns, pd.MultiIndex):
+                    return data['Adj Close'].dropna()
+                return data[['Adj Close']].rename(columns={'Adj Close': tickers[0]}).dropna()
+            except Exception as e:
+                st.error(f"Data Engine Critical Failure: {e}")
+                return pd.DataFrame()
+
+        def get_macro_data(self) -> pd.DataFrame:
+            """Global Macro Overlay (DXY, 10Y Yields)."""
+            macro = yf.download(["DX-Y.NYB", "^TNX"], period="5y", progress=False)['Adj Close']
+            macro.columns = ["DXY", "US10Y"]
+            return macro.pct_change().dropna()
+
+    # =============================================================================
+    # 3. HYBRID QUANTUM AI ENGINE (LSTM + ELMAN RNN + XGBOOST)
+    # =============================================================================
+
+    class QuantumAIEngine:
+        def __init__(self, lookback: int = 60):
+            self.lookback = lookback
+            self.scalers = {}
+
+        def _prepare_data(self, data: pd.Series):
+            if not _SKL_OK or MinMaxScaler is None:
+                raise RuntimeError("scikit-learn is required for MinMaxScaler.")
+            scaler = MinMaxScaler(feature_range=(0, 1))
+            scaled_data = scaler.fit_transform(data.values.reshape(-1, 1))
+            X, y = [], []
+            for i in range(self.lookback, len(scaled_data)):
+                X.append(scaled_data[i-self.lookback:i, 0])
+                y.append(scaled_data[i, 0])
+            return np.array(X), np.array(y), scaled_data, scaler
+
+        def build_lstm(self):
+            if not _TF_OK or Sequential is None:
+                raise RuntimeError("tensorflow is required for LSTM model.")
+            model = Sequential([
+                LSTM(100, return_sequences=True, input_shape=(self.lookback, 1)),
+                BatchNormalization(),
+                Dropout(0.3),
+                LSTM(50, return_sequences=False),
+                Dropout(0.3),
+                Dense(25, activation='relu'),
+                Dense(1)
+            ])
+            model.compile(optimizer='adam', loss='mse')
+            return model
+
+        def run_prediction(self, data: pd.Series, steps: int = 15) -> Dict[str, np.ndarray]:
+            X, y, scaled_full, scaler = self._prepare_data(data)
+
+            # 1. XGBoost Fit
+            if not _XGB_OK or xgb is None:
+                raise RuntimeError("xgboost is required for XGBoost model.")
+            xgb_model = xgb.XGBRegressor(n_estimators=1000, max_depth=7, learning_rate=0.03, subsample=0.8)
+            xgb_model.fit(X, y)
+
+            # 2. LSTM Fit
+            lstm_model = self.build_lstm()
+            early_stop = EarlyStopping(monitor='loss', patience=5) if EarlyStopping is not None else None
+            callbacks = [early_stop] if early_stop is not None else []
+            lstm_model.fit(X.reshape(X.shape[0], X.shape[1], 1), y, epochs=20, batch_size=32, verbose=0, callbacks=callbacks)
+
+            # Recursive Forecasting
+            preds_xgb, preds_lstm = [], []
+            curr_window_xgb = scaled_full[-self.lookback:].flatten()
+            curr_window_lstm = scaled_full[-self.lookback:].reshape(1, self.lookback, 1)
+
+            for _ in range(steps):
+                # XGB Prediction
+                p_xgb = xgb_model.predict(curr_window_xgb.reshape(1, -1))[0]
+                preds_xgb.append(p_xgb)
+                curr_window_xgb = np.append(curr_window_xgb[1:], p_xgb)
+
+                # LSTM Prediction
+                p_lstm = lstm_model.predict(curr_window_lstm, verbose=0)[0, 0]
+                preds_lstm.append(p_lstm)
+                curr_window_lstm = np.append(curr_window_lstm[:, 1:, :], [[[p_lstm]]], axis=1)
+
+            return {
+                "XGBoost": scaler.inverse_transform(np.array(preds_xgb).reshape(-1, 1)),
+                "LSTM": scaler.inverse_transform(np.array(preds_lstm).reshape(-1, 1))
+            }
+
+    # =============================================================================
+    # 4. SIGNAL & RISK INTELLIGENCE
+    # =============================================================================
+
+    class SignalIntelligence:
+        @staticmethod
+        def generate_trade_parameters(current_p, forecast_df, ann_vol):
+            ensemble_forecast = forecast_df.mean(axis=1)
+            target = ensemble_forecast.iloc[-1]
+            expected_ret = (target - current_p) / current_p
+
+            # Volatility adjusted Stop Loss (2.0x ATR Approximation)
+            daily_vol = ann_vol / math.sqrt(252)
+            sl_buffer = current_p * daily_vol * 2.0
+
+            if expected_ret > 0.04:
+                return {"Action": "STRONG BUY", "Color": "#00ff88", "SL": current_p - sl_buffer, "TP": current_p + (sl_buffer * 3)}
+            elif expected_ret < -0.04:
+                return {"Action": "STRONG SELL", "Color": "#ff3b3b", "SL": current_p + sl_buffer, "TP": current_p - (sl_buffer * 3)}
+            return {"Action": "HOLD / NEUTRAL", "Color": "#888888", "SL": None, "TP": None}
+
+    # =============================================================================
+    # 5. DERIVATIVES & PORTFOLIO ENGINE
+    # =============================================================================
+
+    class QuantLibrary:
+        @staticmethod
+        def black_scholes_greeks(S, K, T, r, sigma, option_type="call"):
+            d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+            d2 = d1 - sigma * np.sqrt(T)
+            if option_type == "call":
+                price = S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
+                delta = norm.cdf(d1)
+            else:
+                price = K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
+                delta = norm.cdf(d1) - 1
+            vega = S * norm.pdf(d1) * np.sqrt(T)
+            return price, delta, vega
+
+        @staticmethod
+        def calculate_erc_weights(returns):
+            cov = returns.cov().values * 252
+            n = len(returns.columns)
+
+            def objective(w):
+                w = w.reshape(-1, 1)
+                p_vol = np.sqrt(w.T @ cov @ w)
+                rc = (w * (cov @ w)) / p_vol
+                return np.sum((rc - p_vol/n)**2)
+
+            res = minimize(objective, np.ones(n)/n, bounds=[(0,1)]*n, constraints={'type':'eq','fun':lambda x: np.sum(x)-1})
+            return res.x
+
+    # =============================================================================
+    # 6. OMNI-TERMINAL APPLICATION INTERFACE
+    # =============================================================================
+
+    class SovereignTerminal:
+        def __init__(self):
+            # Keep the original intent but prevent Streamlit crash if already configured elsewhere
+            try:
+                st.set_page_config(page_title="Quantum Sovereign v14", layout="wide", initial_sidebar_state="expanded")
+            except Exception:
+                pass
+            self.dm = InstitutionalDataManager()
+            self.ai = QuantumAIEngine()
+            self.quant = QuantLibrary()
+
+        def apply_custom_css(self):
+            st.markdown("""
+            <style>
+                .stApp { background-color: #0b0d11; }
+                .metric-container { background: #151921; padding: 20px; border-radius: 12px; border: 1px solid #2d343f; }
+                .header-text { color: #00d4ff; font-family: 'Inter', sans-serif; font-weight: 800; }
+            </style>
+            """, unsafe_allow_html=True)
+
+        def _dep_warnings(self):
+            missing = []
+            if not _XGB_OK:
+                missing.append("xgboost")
+            if not _TF_OK:
+                missing.append("tensorflow")
+            if not _SKL_OK:
+                missing.append("scikit-learn")
+            if missing:
+                st.warning("Quantum AI modules require extra packages not found in this environment: " + ", ".join(missing))
+                st.code(
+                    "requirements.txt suggestions:\n"
+                    "xgboost\n"
+                    "scikit-learn\n"
+                    "tensorflow\n"
+                )
+
+        def run(self):
+            self.apply_custom_css()
+            st.sidebar.markdown("<h1 class='header-text'>🏛️ Quantum Sovereign</h1>", unsafe_allow_html=True)
+
+            self._dep_warnings()
+
+            # Sidebar Universe Selection
+            category = st.sidebar.selectbox("Market Segment", list(ASSET_UNIVERSE.keys()), key="qs_category")
+            selected_tickers = st.sidebar.multiselect(
+                "Active Assets",
+                list(ASSET_UNIVERSE[category].keys()),
+                default=list(ASSET_UNIVERSE[category].keys())[:2],
+                key="qs_assets"
+            )
+
+            period = st.sidebar.selectbox("History window", ["1y", "2y", "5y", "10y", "max"], index=2, key="qs_period")
+
+            if st.sidebar.button("INITIALIZE TERMINAL EXECUTION", key="qs_init"):
+                with st.spinner("Processing Quantum Models..."):
+                    # Data Ingestion
+                    price_data = self.dm.get_data(selected_tickers, period=period)
+                    if price_data is None or price_data.empty:
+                        st.error("No price data returned.")
+                        return
+
+                    returns = price_data.pct_change().dropna()
+                    macro_data = self.dm.get_macro_data()
+
+                    # Main Dashboard Layout
+                    t1, t2, t3, t4, t5 = st.tabs(["📡 Signals", "🧠 AI Forecast", "🌍 Macro & Correlation", "🧮 Portfolio Lab", "🎫 Options"])
+
+                    # Cache forecasts per ticker to avoid undefined variables between tabs
+                    if "qs_forecasts" not in st.session_state:
+                        st.session_state["qs_forecasts"] = {}
+
+                    with t1:
+                        st.markdown("### 📡 Automated Trade Signals (Ensemble Intelligence)")
+                        for ticker in selected_tickers:
+                            if ticker not in price_data.columns:
+                                continue
+                            curr_p = float(price_data[ticker].iloc[-1])
+                            vol = float(returns[ticker].std(ddof=1) * np.sqrt(252)) if ticker in returns.columns else np.nan
+
+                            forecast_dict = None
+                            f_df = None
+                            if _XGB_OK and _TF_OK and _SKL_OK:
+                                try:
+                                    forecast_dict = self.ai.run_prediction(price_data[ticker])
+                                    f_df = pd.DataFrame(forecast_dict)
+                                    st.session_state["qs_forecasts"][ticker] = f_df
+                                except Exception as e:
+                                    st.warning(f"AI forecast failed for {ticker}: {e}")
+                                    f_df = None
+                            else:
+                                f_df = None
+
+                            signal = {"Action": "HOLD / NEUTRAL", "Color": "#888888", "SL": None, "TP": None}
+                            if f_df is not None and not f_df.empty and np.isfinite(vol):
+                                signal = SignalIntelligence.generate_trade_parameters(curr_p, f_df, vol)
+
+                            # UI Card
+                            col_sig, col_chart = st.columns([1, 2])
+                            with col_sig:
+                                st.markdown(f"""
+                                <div class='metric-container'>
+                                    <h3 style='color:#8892b0'>{ticker}</h3>
+                                    <h2 style='color:{signal['Color']}'>{signal['Action']}</h2>
+                                    <p>Entry: ${curr_p:.2f}</p>
+                                    {f"<p style='color:#00ff88'>TP: ${signal['TP']:.2f}</p><p style='color:#ff3b3b'>SL: ${signal['SL']:.2f}</p>" if signal['SL'] else ""}
+                                </div>
+                                """, unsafe_allow_html=True)
+
+                            with col_chart:
+                                fig = go.Figure()
+                                fig.add_trace(go.Scatter(y=price_data[ticker].values[-40:], name="Historical", line=dict(color="#5161f1")))
+                                if f_df is not None and not f_df.empty:
+                                    fig.add_trace(go.Scatter(
+                                        x=np.arange(40, 40 + len(f_df)),
+                                        y=f_df.mean(axis=1).values,
+                                        name="AI Ensemble",
+                                        line=dict(dash='dash', color=signal['Color'])
+                                    ))
+                                fig.update_layout(template="plotly_dark", height=250, margin=dict(l=0, r=0, t=20, b=0))
+                                st.plotly_chart(fig, use_container_width=True, key=f"qs_sig_chart_{ticker}")
+
+                    with t2:
+                        st.markdown("### 🧠 Quantum AI Decomposition")
+                        st.write("Comparison of LSTM (Deep Learning) vs XGBoost (Gradient Boosting) Paths")
+
+                        if not (_XGB_OK and _TF_OK and _SKL_OK):
+                            st.info("Install xgboost + tensorflow + scikit-learn to enable AI forecast comparison charts.")
+                        else:
+                            pick = st.selectbox("Select asset", selected_tickers, index=0, key="qs_ai_pick")
+                            f_df = st.session_state.get("qs_forecasts", {}).get(pick, None)
+                            if f_df is None:
+                                try:
+                                    forecast_dict = self.ai.run_prediction(price_data[pick])
+                                    f_df = pd.DataFrame(forecast_dict)
+                                    st.session_state["qs_forecasts"][pick] = f_df
+                                except Exception as e:
+                                    st.error(f"Forecast failed: {e}")
+                                    f_df = None
+                            if f_df is not None:
+                                st.line_chart(f_df)
+
+                    with t3:
+                        st.markdown("### 🌍 Macro Sensitivity & Cross-Asset Beta")
+                        combined = pd.concat([returns, macro_data], axis=1).dropna()
+                        if combined.empty:
+                            st.info("Not enough overlapping macro + asset returns.")
+                        else:
+                            corr_matrix = combined.corr()
+                            try:
+                                st.plotly_chart(px.imshow(corr_matrix, text_auto=".2f", color_continuous_scale="RdBu_r", template="plotly_dark"),
+                                                use_container_width=True, key="qs_macro_corr")
+                            except Exception:
+                                st.plotly_chart(px.imshow(corr_matrix, color_continuous_scale="RdBu_r", template="plotly_dark"),
+                                                use_container_width=True, key="qs_macro_corr2")
+
+                    with t4:
+                        st.markdown("### 🧮 Institutional Portfolio Allocation")
+                        if returns.shape[1] < 2:
+                            st.info("Need at least 2 assets to compute ERC weights.")
+                        else:
+                            weights = self.quant.calculate_erc_weights(returns)
+                            weight_df = pd.DataFrame({"Asset": list(returns.columns), "Weight": weights})
+                            st.plotly_chart(px.pie(weight_df, values='Weight', names='Asset', hole=0.5,
+                                                   title="Equal Risk Contribution (ERC) Allocation", template="plotly_dark"),
+                                            use_container_width=True, key="qs_erc_pie")
+                            st.dataframe(weight_df.set_index("Asset"), use_container_width=True)
+
+                    with t5:
+                        st.markdown("### 🎫 Options Hub (Derivatives Pricing)")
+                        selected_opt = st.selectbox("Select Asset for Pricing", selected_tickers, key="qs_opt_asset")
+                        S = float(price_data[selected_opt].iloc[-1])
+                        K = st.number_input("Strike Price", value=float(S), key="qs_opt_strike")
+                        vol_opt = float(returns[selected_opt].std(ddof=1) * np.sqrt(252)) if selected_opt in returns.columns else np.nan
+                        T = st.number_input("Time to maturity (years)", value=0.10, step=0.01, key="qs_opt_T")
+                        r = st.number_input("Risk-free rate", value=0.04, step=0.005, key="qs_opt_r")
+                        opt_type = st.selectbox("Option Type", ["call", "put"], index=0, key="qs_opt_type")
+
+                        if not np.isfinite(vol_opt) or vol_opt <= 0:
+                            st.info("Volatility cannot be computed for options pricing (insufficient returns).")
+                        else:
+                            p, d, v = self.quant.black_scholes_greeks(S, K, float(T), float(r), vol_opt, option_type=opt_type)
+                            st.metric(f"Option Price ({opt_type.upper()})", f"${p:.2f}")
+                            st.write(f"Delta: {d:.3f} | Vega: {v:.2f}")
+
+            else:
+                st.info("Use the sidebar to select assets and click **INITIALIZE TERMINAL EXECUTION**.")
+
+    # Run terminal
+    SovereignTerminal().run()
+
+
+# =============================================================================
+# 🧭 APPLICATION ROUTER — Mode selector (Institutional v6.x + Quantum Sovereign v14)
+# =============================================================================
+
+def _run_app_router():
+    import streamlit as st
+
+    st.sidebar.markdown("### 🧭 Platform Mode")
+    mode = st.sidebar.radio(
+        "Select application layer",
+        options=[
+            "🏛️ Institutional Commodities Platform (v6.x)",
+            "🧠 Quantum Sovereign Terminal (v14.0)"
+        ],
+        index=0,
+        key="app_mode_selector"
+    )
+
+    if mode == "🧠 Quantum Sovereign Terminal (v14.0)":
+        run_quantum_sovereign_v14_terminal()
+    else:
+        # Ensure InstitutionalCommoditiesDashboard exists and is runnable
+        try:
+            dashboard = InstitutionalCommoditiesDashboard()
+            dashboard.run()
+        except Exception as e:
+            st.error(f"Institutional dashboard failed to start: {e}")
+            st.exception(e)
+
+# Execute router (Streamlit entrypoint)
+_run_app_router()
