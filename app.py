@@ -4249,7 +4249,7 @@ class ScientificCommoditiesPlatform:
         for title, description in steps:
             with st.expander(title, expanded=True):
                 st.write(description)
-    
+                
         def render_scientific_footer(self):
         """Render scientific footer"""
         st.markdown("---")
