@@ -3335,76 +3335,130 @@ class InstitutionalCommoditiesDashboard:
             """), unsafe_allow_html=True)
         
         with col3:
-            if len(returns_df.columns) > 1:
-                # Robust Avg Correlation (off-diagonal mean) with strong data hygiene.
-                # Guardrails:
-                # - remove inf/NaN columns
-                # - remove duplicate column names
-                # - remove near-constant columns (std≈0)
-                # - remove duplicate series by CONTENT (identical returns across different labels)
-                # - compute Pearson corr with min_periods to avoid small-sample ±1 artifacts
-                _corr_src = returns_df.replace([np.inf, -np.inf], np.nan).dropna(axis=1, how="all")
-                _corr_src = _corr_src.loc[:, ~_corr_src.columns.duplicated()]
-                if not _corr_src.empty:
-                    _std = _corr_src.std(skipna=True)
-                    _corr_src = _corr_src.loc[:, _std > 1e-12]
-                # Drop duplicate series by content (exactly identical return paths ⇒ corr=1.000)
-                _dup_map = {}
-                _seen = {}
-                _keep_cols = []
-                for _c in list(_corr_src.columns):
-                    _s = _corr_src[_c].dropna()
-                    if _s.empty:
-                        continue
-                    try:
-                        _vals = np.round(_s.values.astype(float), 12)
-                    except Exception:
-                        _vals = np.round(pd.to_numeric(_s.values, errors="coerce").astype(float), 12)
-                    # include index to avoid accidental collisions
-                    try:
-                        _idx_bytes = _s.index.view("i8").tobytes()
-                    except Exception:
-                        _idx_bytes = np.asarray([hash(x) for x in _s.index], dtype=np.int64).tobytes()
-                    _h = hashlib.sha1(_idx_bytes + _vals.tobytes()).hexdigest()
-                    if _h in _seen:
-                        _base = _seen[_h]
-                        _dup_map.setdefault(_base, []).append(_c)
-                    else:
-                        _seen[_h] = _c
-                        _keep_cols.append(_c)
-                _corr_src_u = _corr_src[_keep_cols] if (_keep_cols and isinstance(_corr_src, pd.DataFrame)) else _corr_src
-                if _dup_map:
-                    with st.expander("⚠️ Correlation Diagnostics: Duplicate Series Detected", expanded=False):
-                        st.warning("Some selected assets have IDENTICAL return series (corr≈1). "
-                                   "Avg Correlation is computed after removing duplicates by content.")
-                        st.json(_dup_map)
-                if isinstance(_corr_src_u, pd.DataFrame) and _corr_src_u.shape[1] >= 2:
-                    try:
-                        _corr = _corr_src_u.corr(method="pearson", min_periods=30)
-                    except TypeError:
-                        _corr = _corr_src_u.corr(method="pearson")
+            # ✅ Robust Avg Correlation (off-diagonal mean) with STRICT overlap controls + diagnostics.
+            # Why this exists:
+            # - Some environments ignore/minimize `min_periods` support inconsistently, leading to corr=±1 with tiny overlap.
+            # - Some assets may have duplicated / synthetic / mismapped series causing corr≈1 across pairs.
+            # This block enforces min-overlap at the pair level and reports diagnostics when corr≈±1.
+            def _pairwise_corr_min_periods(_df: pd.DataFrame, _minp: int = 30) -> Tuple[pd.DataFrame, pd.DataFrame]:
+                _cols = list(_df.columns)
+                _n = len(_cols)
+                _corr = pd.DataFrame(np.nan, index=_cols, columns=_cols, dtype=float)
+                _ov = pd.DataFrame(0, index=_cols, columns=_cols, dtype=int)
+
+                # Pre-cast once to numeric
+                _num = _df.apply(lambda c: pd.to_numeric(c, errors="coerce"))
+
+                for _i in range(_n):
+                    _ci = _cols[_i]
+                    _xi = _num[_ci]
+                    _corr.iat[_i, _i] = 1.0
+                    _ov.iat[_i, _i] = int(_xi.notna().sum())
+
+                    for _j in range(_i + 1, _n):
+                        _cj = _cols[_j]
+                        _yj = _num[_cj]
+                        _m = _xi.notna() & _yj.notna()
+                        _nij = int(_m.sum())
+                        _ov.iat[_i, _j] = _ov.iat[_j, _i] = _nij
+
+                        if _nij < int(_minp):
+                            continue
+
+                        _x = _xi[_m].values.astype(float)
+                        _y = _yj[_m].values.astype(float)
+
+                        # Guard constant vectors
+                        if _x.size < 2 or _y.size < 2:
+                            continue
+                        if float(np.nanstd(_x)) < 1e-12 or float(np.nanstd(_y)) < 1e-12:
+                            continue
+
+                        _c = float(np.corrcoef(_x, _y)[0, 1])
+                        if np.isfinite(_c):
+                            _corr.iat[_i, _j] = _corr.iat[_j, _i] = _c
+
+                return _corr, _ov
+
+            avg_corr = np.nan
+            avg_corr_disp = "N/A"
+            _diag_pairs_df = None
+
+            if isinstance(returns_df, pd.DataFrame) and returns_df.shape[1] > 1:
+                # Hygiene
+                _src = returns_df.replace([np.inf, -np.inf], np.nan).dropna(axis=1, how="all")
+                _src = _src.loc[:, ~_src.columns.duplicated()]
+
+                if not _src.empty:
+                    _std = _src.std(skipna=True)
+                    _src = _src.loc[:, _std > 1e-12]
+
+                # Prefer intersection alignment if it preserves enough rows (helps avoid overlap-driven artifacts)
+                _src_int = _src.dropna(how="any")
+                _use = _src_int if (_src_int.shape[0] >= 30) else _src
+
+                if isinstance(_use, pd.DataFrame) and _use.shape[1] >= 2:
+                    _corr, _ov = _pairwise_corr_min_periods(_use, _minp=30)
                     _mask = np.triu(np.ones(_corr.shape, dtype=bool), k=1)
-                    _vals = _corr.where(_mask).stack()
-                    # keep only finite correlations
-                    _vals = _vals[np.isfinite(_vals.values)]
-                    avg_corr = float(_vals.mean()) if len(_vals) > 0 else np.nan
-                else:
-                    avg_corr = np.nan
-                avg_corr_disp = f"{avg_corr:.3f}" if np.isfinite(avg_corr) else "N/A"
-                st.markdown(textwrap.dedent(f"""
-                <div class="metric-card">
-                    <div class="metric-label">🔗 Avg Correlation</div>
-                    <div class="metric-value">{avg_corr_disp}</div>
-                </div>
-                """), unsafe_allow_html=True)
-            else:
-                st.markdown(textwrap.dedent("""
-                <div class="metric-card">
-                    <div class="metric-label">🔗 Avg Correlation</div>
-                    <div class="metric-value">N/A</div>
-                </div>
-                """), unsafe_allow_html=True)
-        
+                    _stack = _corr.where(_mask).stack()
+                    _stack = _stack[np.isfinite(_stack.values)]
+
+                    _n_total_pairs = int(_corr.shape[0] * (_corr.shape[0] - 1) / 2)
+                    _n_valid_pairs = int(len(_stack))
+                    _coverage = (_n_valid_pairs / _n_total_pairs) if _n_total_pairs > 0 else 0.0
+
+                    # If correlation coverage is too low, the average is meaningless -> show N/A instead of misleading 1.000
+                    if _coverage >= 0.35 and _n_valid_pairs > 0:
+                        avg_corr = float(_stack.mean())
+                        avg_corr_disp = f"{avg_corr:.3f}"
+                    else:
+                        avg_corr = np.nan
+                        avg_corr_disp = "N/A"
+
+                    # Diagnostics: near-perfect pairs (abs(corr) >= 0.9999) with overlap
+                    _pairs = []
+                    _st = _corr.where(_mask).stack()
+                    for (_a, _b), _v in _st.items():
+                        if not np.isfinite(_v):
+                            continue
+                        if abs(float(_v)) >= 0.9999:
+                            try:
+                                _nij = int(_ov.loc[_a, _b])
+                            except Exception:
+                                _nij = None
+                            _pairs.append({"Asset_A": _a, "Asset_B": _b, "Corr": float(_v), "Overlap_N": _nij})
+
+                    if _pairs:
+                        _diag_pairs_df = pd.DataFrame(_pairs).sort_values(by="Corr", key=lambda x: x.abs(), ascending=False)
+
+                        with st.expander("⚠️ Avg Correlation Diagnostics (corr≈±1 pairs)", expanded=False):
+                            st.warning(
+                                "Pairs with corr≈±1 are detected. This is typically caused by:\n"
+                                "- identical/mismapped tickers (same data under different labels)\n"
+                                "- synthetic fallback series being reused\n"
+                                "- extremely low effective overlap (even if total history looks long)\n\n"
+                                "Check the table below to see *which tickers* are responsible."
+                            )
+                            st.dataframe(_diag_pairs_df, use_container_width=True)
+                            st.caption("Tip: If you see the same benchmark/asset repeated under different names, fix the universe mapping.")
+
+                    # Coverage display (transparent sanity check)
+                    with st.expander("ℹ️ Avg Correlation Coverage", expanded=False):
+                        st.write({
+                            "assets_used": int(_corr.shape[0]),
+                            "pairs_total": int(_n_total_pairs),
+                            "pairs_valid(min_overlap=30)": int(_n_valid_pairs),
+                            "coverage": float(round(_coverage, 4)),
+                            "alignment_used": "intersection" if (_use is _src_int) else "pairwise",
+                        })
+
+            st.markdown(textwrap.dedent(f"""
+            <div class="metric-card">
+                <div class="metric-label">🔗 Avg Correlation</div>
+                <div class="metric-value">{avg_corr_disp}</div>
+            </div>
+            """), unsafe_allow_html=True)
+
         with col4:
             total_days = len(returns_df) if not returns_df.empty else 0
             st.markdown(textwrap.dedent(f"""
@@ -7684,8 +7738,44 @@ def _icd_display_tracking_error_fallback(self, config: "AnalysisConfiguration"):
     st.markdown("### 📌 Tracking Error (Fallback)")
     st.info("Tracking Error tab is available via the integrated Tracking Error module. If you still see this fallback, your merge likely misplaced the original method.")
 
+
+def _icd_to_returns_df_fallback(self, obj: Any) -> pd.DataFrame:
+    """Convert various return containers into a clean returns DataFrame.
+
+    Supports:
+    - pd.DataFrame: returned as copy
+    - pd.Series: to_frame
+    - dict: values may be Series or DataFrame (uses 'Returns' column if present)
+    """
+    try:
+        if obj is None:
+            return pd.DataFrame()
+        if isinstance(obj, pd.DataFrame):
+            return obj.copy()
+        if isinstance(obj, pd.Series):
+            return obj.to_frame(name=getattr(obj, "name", None) or "Returns")
+        if isinstance(obj, dict):
+            out = {}
+            for k, v in obj.items():
+                if v is None:
+                    continue
+                if isinstance(v, pd.Series):
+                    out[str(k)] = v
+                elif isinstance(v, pd.DataFrame):
+                    if "Returns" in v.columns:
+                        out[str(k)] = v["Returns"]
+                    elif v.shape[1] == 1:
+                        out[str(k)] = v.iloc[:, 0]
+            return pd.DataFrame(out).dropna(how="all")
+        # last resort
+        return pd.DataFrame(obj).dropna(how="all")
+    except Exception:
+        return pd.DataFrame()
+
 # Bind fallbacks ONLY if missing
 try:
+    if not hasattr(InstitutionalCommoditiesDashboard, "_to_returns_df"):
+        InstitutionalCommoditiesDashboard._to_returns_df = _icd_to_returns_df_fallback
     if not hasattr(InstitutionalCommoditiesDashboard, "_display_rolling_beta"):
         InstitutionalCommoditiesDashboard._display_rolling_beta = _icd_display_rolling_beta_fallback
     if not hasattr(InstitutionalCommoditiesDashboard, "_display_tracking_error"):
