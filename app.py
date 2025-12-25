@@ -712,6 +712,31 @@ class ScientificDependencyManager:
         self._scientific_imports()
         self._validate_versions()
     
+    def _get_package_version(self, package, fallback='unknown'):
+        """Safely get package version with multiple fallbacks"""
+        try:
+            # Try direct attribute
+            if hasattr(package, '__version__'):
+                return package.__version__
+            
+            # Try to use importlib.metadata for Python 3.8+
+            try:
+                import importlib.metadata
+                return importlib.metadata.version(package.__name__)
+            except:
+                pass
+            
+            # Try pkg_resources
+            try:
+                import pkg_resources
+                return pkg_resources.get_distribution(package.__name__).version
+            except:
+                pass
+            
+            return fallback
+        except:
+            return fallback
+    
     def _scientific_imports(self):
         """Load scientific dependencies with validation"""
         # statsmodels for statistical analysis
@@ -724,7 +749,7 @@ class ScientificDependencyManager:
             self.dependencies['statsmodels'] = {
                 'available': True,
                 'module': sm,
-                'version': sm.__version__,
+                'version': self._get_package_version(sm),
                 'het_arch': het_arch,
                 'acorr_ljungbox': acorr_ljungbox,
                 'het_breuschpagan': het_breuschpagan,
@@ -745,7 +770,7 @@ class ScientificDependencyManager:
             import arch
             self.dependencies['arch'] = {
                 'available': True,
-                'version': arch.__version__,
+                'version': self._get_package_version(arch),
                 'arch_model': arch_model,
                 'GARCH': GARCH,
                 'EWMAVariance': EWMAVariance,
@@ -766,7 +791,7 @@ class ScientificDependencyManager:
             import sklearn
             self.dependencies['hmmlearn'] = {
                 'available': True,
-                'version': sklearn.__version__,
+                'version': self._get_package_version(sklearn),
                 'GaussianHMM': GaussianHMM,
                 'StandardScaler': StandardScaler,
                 'RobustScaler': RobustScaler,
@@ -785,7 +810,7 @@ class ScientificDependencyManager:
             self.dependencies['quantstats'] = {
                 'available': True,
                 'module': qs,
-                'version': qs.__version__
+                'version': self._get_package_version(qs)
             }
         except ImportError as e:
             self.dependencies['quantstats'] = {'available': False, 'error': str(e)}
@@ -796,7 +821,7 @@ class ScientificDependencyManager:
             self.dependencies['ta'] = {
                 'available': True,
                 'module': ta,
-                'version': ta.__version__
+                'version': self._get_package_version(ta)
             }
         except ImportError as e:
             self.dependencies['ta'] = {'available': False, 'error': str(e)}
@@ -815,9 +840,8 @@ class ScientificDependencyManager:
             if info.get('available') and 'version' in info:
                 required = version_requirements.get(dep)
                 if required:
-                    # Basic version check (simplified)
                     current = info['version']
-                    if dep == 'statsmodels' and current < '0.14':
+                    if current != 'unknown' and dep == 'statsmodels' and current < '0.14':
                         st.warning(f"⚠️ {dep} version {current} may have stability issues. Recommended: {required}")
     
     def is_available(self, dependency: str) -> bool:
@@ -2985,7 +3009,7 @@ class ScientificCommoditiesPlatform:
             st.session_state.correlation_methods = ['pearson', 'ewma']
         if 'validation_warnings' not in st.session_state:
             st.session_state.validation_warnings = []
-        
+    
     def render_scientific_header(self):
         """Render institutional scientific header"""
         st.markdown("""
@@ -3122,19 +3146,10 @@ class ScientificCommoditiesPlatform:
                 ewma_lambda = 0.94
             
             # Statistical significance level
-            significance_level = st.select_slider(
+            significance_level = st.selectbox(
                 "Statistical Significance Level",
                 options=[0.01, 0.025, 0.05, 0.10],
-                value=0.05,
-                format_func=lambda x: f"{x*100:.1f}%",
-                help="Threshold for statistical significance (p-value)"
-            )
-            ####################################################################################################################################################
-                           # Statistical significance level
-            significance_level = st.select_slider(
-                "Statistical Significance Level",
-                options=[0.01, 0.025, 0.05, 0.10],
-                value=0.05,
+                index=2,  # 0.05 is at index 2
                 format_func=lambda x: f"{x*100:.1f}%",
                 help="Threshold for statistical significance (p-value)"
             )
@@ -3153,7 +3168,7 @@ class ScientificCommoditiesPlatform:
                 options=[20, 60, 120, 250],
                 index=1,  # 60 is at index 1
                 help="Window size for rolling statistics"
-            )      
+            )
             
             # Initialize scientific configuration
             self.config = ScientificAnalysisConfiguration(
@@ -4182,8 +4197,6 @@ class ScientificCommoditiesPlatform:
                     use_container_width=True
                 )
         
-               # ... previous code in render_data_validation method ...
-
         # Data download option
         st.markdown("---")
         st.markdown("#### 💾 Data Export")
@@ -4226,6 +4239,54 @@ class ScientificCommoditiesPlatform:
                 </p>
             </div>
             """, unsafe_allow_html=True)
+
+    def render_welcome_screen(self):
+        """Render welcome screen with instructions"""
+        st.markdown("""
+        <div style="text-align: center; padding: 3rem 2rem; background: linear-gradient(135deg, #e8eaf6 0%, #ffffff 100%); border-radius: 12px; margin: 2rem 0;">
+            <h2 style="color: #1a237e; margin-bottom: 1rem;">🔬 Welcome to Scientific Commodities Analytics</h2>
+            <p style="color: #415a77; font-size: 1.1rem; max-width: 800px; margin: 0 auto 2rem;">
+                Institutional-grade scientific analysis platform for commodities trading.
+                Get started by configuring your analysis in the sidebar and click "Run Scientific Analysis".
+            </p>
+            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 1.5rem; margin-top: 3rem;">
+                <div class="institutional-card">
+                    <div style="font-size: 2rem; margin-bottom: 0.5rem;">📊</div>
+                    <div style="font-weight: 600; color: #1a237e; margin-bottom: 0.5rem;">Scientific Correlation</div>
+                    <div style="font-size: 0.9rem; color: #415a77;">Multiple correlation methods with statistical validation</div>
+                </div>
+                <div class="institutional-card">
+                    <div style="font-size: 2rem; margin-bottom: 0.5rem;">📈</div>
+                    <div style="font-weight: 600; color: #1a237e; margin-bottom: 0.5rem;">Risk Analytics</div>
+                    <div style="font-size: 0.9rem; color: #415a77;">Comprehensive risk metrics with confidence intervals</div>
+                </div>
+                <div class="institutional-card">
+                    <div style="font-size: 2rem; margin-bottom: 0.5rem;">⚙️</div>
+                    <div style="font-weight: 600; color: #1a237e; margin-bottom: 0.5rem;">Portfolio Science</div>
+                    <div style="font-size: 0.9rem; color: #415a77;">Mean-variance optimization and efficient frontier</div>
+                </div>
+                <div class="institutional-card">
+                    <div style="font-size: 2rem; margin-bottom: 0.5rem;">📋</div>
+                    <div style="font-weight: 600; color: #1a237e; margin-bottom: 0.5rem;">Data Validation</div>
+                    <div style="font-size: 0.9rem; color: #415a77;">Comprehensive data quality and validation checks</div>
+                </div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        # Quick start guide
+        st.markdown("### 🚀 Quick Start Guide")
+        
+        steps = [
+            ("1. Select Assets", "Choose commodities and benchmarks from the sidebar"),
+            ("2. Configure Parameters", "Set scientific analysis parameters and correlation methods"),
+            ("3. Run Analysis", "Click 'Run Scientific Analysis' to generate insights"),
+            ("4. Explore Results", "Navigate through tabs to view different aspects of the analysis")
+        ]
+        
+        for title, description in steps:
+            with st.expander(title, expanded=True):
+                st.write(description)
 
     def run(self):
         """Run the scientific Streamlit application"""
