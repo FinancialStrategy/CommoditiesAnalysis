@@ -3336,11 +3336,17 @@ class InstitutionalCommoditiesDashboard:
         
         with col3:
             if len(returns_df.columns) > 1:
-                avg_corr = returns_df.corr().values[np.triu_indices(len(returns_df.columns), 1)].mean()
+                _corr_src = returns_df.replace([np.inf, -np.inf], np.nan).dropna(axis=1, how="all")
+                _corr_src = _corr_src.loc[:, ~_corr_src.columns.duplicated()]
+                _corr = _corr_src.corr(method="pearson", min_periods=30)
+                _mask = np.triu(np.ones(_corr.shape, dtype=bool), k=1)
+                _vals = _corr.where(_mask).stack()
+                avg_corr = float(_vals.mean()) if not _vals.empty else np.nan
+                avg_corr_disp = f"{avg_corr:.3f}" if np.isfinite(avg_corr) else "N/A"
                 st.markdown(textwrap.dedent(f"""
                 <div class="metric-card">
                     <div class="metric-label">🔗 Avg Correlation</div>
-                    <div class="metric-value">{avg_corr:.3f}</div>
+                    <div class="metric-value">{avg_corr_disp}</div>
                 </div>
                 """), unsafe_allow_html=True)
             else:
@@ -7525,6 +7531,119 @@ def render_portfolio_lab_suite(
 # =============================================================================
 # END PORTFOLIO LAB PATCH (Merged)
 # =============================================================================
+
+
+
+# =============================================================================
+# ✅ SAFETY PATCH: Ensure required dashboard methods exist (prevents AttributeError)
+# - Some merge/paste workflows can accidentally place methods outside the class scope.
+# - These fallbacks bind methods onto the class ONLY if missing.
+# =============================================================================
+
+def _icd__rolling_beta_compute(_target: pd.Series, _bench: pd.Series, window: int) -> pd.Series:
+    _df = pd.concat([_target, _bench], axis=1).dropna()
+    if _df.shape[0] < max(30, int(window) + 5):
+        return pd.Series(index=_df.index, dtype=float)
+    t = _df.iloc[:, 0]
+    b = _df.iloc[:, 1]
+    # rolling beta = cov(t,b) / var(b)
+    cov_tb = t.rolling(int(window)).cov(b)
+    var_b = b.rolling(int(window)).var()
+    beta = cov_tb / var_b.replace(0, np.nan)
+    beta.name = "RollingBeta"
+    return beta
+
+def _icd_display_rolling_beta_fallback(self, config: "AnalysisConfiguration"):
+    """Fallback rolling beta tab: asset/portfolio rolling beta vs selected benchmark."""
+    st.markdown("### β Rolling Beta vs Benchmark")
+
+    returns_df = self._to_returns_df(st.session_state.get("returns_data", None))
+    bench_returns_df = self._to_returns_df(st.session_state.get("benchmark_returns_data", None))
+
+    if returns_df is None or returns_df.empty:
+        st.info("Load data first to compute rolling beta.")
+        return
+
+    # Clean returns (avoid duplicated columns)
+    returns_df = returns_df.replace([np.inf, -np.inf], np.nan).dropna(axis=1, how="all")
+    returns_df = returns_df.loc[:, ~returns_df.columns.duplicated()]
+
+    # Benchmark options
+    bench_options = []
+    if bench_returns_df is not None and not bench_returns_df.empty:
+        bench_returns_df = bench_returns_df.replace([np.inf, -np.inf], np.nan).dropna(axis=1, how="all")
+        bench_returns_df = bench_returns_df.loc[:, ~bench_returns_df.columns.duplicated()]
+        bench_options += list(bench_returns_df.columns)
+
+    # Also allow any asset as benchmark
+    bench_options += [c for c in returns_df.columns if c not in bench_options]
+    bench_options = list(dict.fromkeys(bench_options))
+
+    if not bench_options:
+        st.warning("No benchmark series available.")
+        return
+
+    c1, c2, c3 = st.columns([1, 1, 1])
+    with c1:
+        mode = st.radio("Target", options=["Asset", "Portfolio (Equal Weight)"], horizontal=True, key="rb_mode")
+    with c2:
+        benchmark_col = st.selectbox("Benchmark", options=bench_options, index=0, key="rb_bench")
+    with c3:
+        window = st.selectbox("Rolling window (days)", options=[21, 42, 63, 126, 252], index=4, key="rb_window")
+
+    if benchmark_col in (bench_returns_df.columns if bench_returns_df is not None and not bench_returns_df.empty else []):
+        bench = bench_returns_df[benchmark_col]
+    else:
+        bench = returns_df[benchmark_col]
+
+    if mode == "Asset":
+        target_col = st.selectbox("Target asset", options=list(returns_df.columns), index=0, key="rb_asset")
+        target = returns_df[target_col]
+        title = f"Rolling Beta: {target_col} vs {benchmark_col}"
+    else:
+        # Equal-weight portfolio across current return universe
+        port = returns_df.mean(axis=1)
+        port.name = "EW_Portfolio"
+        target = port
+        title = f"Rolling Beta: EW Portfolio vs {benchmark_col}"
+
+    beta = _icd__rolling_beta_compute(target, bench, window=int(window))
+
+    if beta.empty:
+        st.info("Not enough overlapping data to compute rolling beta for the selected window.")
+        return
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=beta.index, y=beta.values, name="Rolling Beta", mode="lines"))
+    fig.add_hline(y=1.0, line_dash="dash", annotation_text="β=1", annotation_position="top left")
+    fig.add_hline(y=0.0, line_dash="dot", annotation_text="β=0", annotation_position="bottom left")
+    fig.update_layout(
+        title=title,
+        height=460,
+        xaxis_title="Date",
+        yaxis_title="Beta",
+        margin=dict(l=10, r=10, t=60, b=10),
+        legend_title=""
+    )
+    st.plotly_chart(fig, use_container_width=True, key="rb_chart")
+
+    # Summary
+    last_beta = float(beta.dropna().iloc[-1]) if not beta.dropna().empty else np.nan
+    st.caption(f"Latest rolling beta: **{last_beta:.3f}**" if np.isfinite(last_beta) else "Latest rolling beta: N/A")
+
+def _icd_display_tracking_error_fallback(self, config: "AnalysisConfiguration"):
+    """Fallback tracking error tab (kept minimal)."""
+    st.markdown("### 📌 Tracking Error (Fallback)")
+    st.info("Tracking Error tab is available via the integrated Tracking Error module. If you still see this fallback, your merge likely misplaced the original method.")
+
+# Bind fallbacks ONLY if missing
+try:
+    if not hasattr(InstitutionalCommoditiesDashboard, "_display_rolling_beta"):
+        InstitutionalCommoditiesDashboard._display_rolling_beta = _icd_display_rolling_beta_fallback
+    if not hasattr(InstitutionalCommoditiesDashboard, "_display_tracking_error"):
+        InstitutionalCommoditiesDashboard._display_tracking_error = _icd_display_tracking_error_fallback
+except Exception:
+    pass
 
 
 if __name__ == "__main__":
