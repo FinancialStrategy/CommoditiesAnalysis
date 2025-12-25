@@ -3060,6 +3060,7 @@ class InstitutionalCommoditiesDashboard:
                 "🧪 Stress Testing",
                 "📑 Reporting",
                 "⚙️ Settings",
+                "🧰 Portfolio Lab (PyPortfolioOpt)",
             ]
             tabs = st.tabs(tab_labels)
 
@@ -3085,6 +3086,9 @@ class InstitutionalCommoditiesDashboard:
                 self._display_reporting(cfg)
             with tabs[10]:
                 self._display_settings(cfg)
+
+            with tabs[11]:
+                self._display_portfolio_lab(cfg)
 
         except Exception as e:
             self._log_error(e, context="run")
@@ -5343,6 +5347,67 @@ making investment decisions. Data source: Yahoo Finance.
         
         return markdown
     
+def _display_portfolio_lab(self, config: AnalysisConfiguration):
+    """Portfolio Lab (PyPortfolioOpt + manual portfolio builder + risk decomposition).
+
+    This tab is **additive** (does not replace existing Portfolio tab). It provides:
+    - PyPortfolioOpt strategies (EF: max Sharpe, min vol, efficient return/risk, L2 reg, etc.)
+    - Manual portfolio builder via sliders (user-defined weights)
+    - Comparative portfolio analysis (saved portfolios)
+    - Risk contribution decomposition (covariance + PCA factors)
+    - VaR / CVaR(ES) + Relative VaR vs benchmark (Historical, Parametric, Monte Carlo)
+    - PCA drivers for EWMA & GARCH volatility proxies
+    """
+    st.markdown('<div class="section-header"><h2>🧰 Portfolio Lab (PyPortfolioOpt)</h2></div>', unsafe_allow_html=True)
+
+    # Pull aligned returns from session
+    returns_df = st.session_state.get("returns_data", pd.DataFrame())
+    if returns_df is None or not isinstance(returns_df, pd.DataFrame) or returns_df.empty:
+        st.info("No returns matrix found. Please load data from the sidebar.")
+        return
+
+    # Build prices DataFrame from asset_data (Adj_Close preferred)
+    asset_data = st.session_state.get("asset_data", {})
+    prices_df = pd.DataFrame()
+    if isinstance(asset_data, dict) and asset_data:
+        series_map = {}
+        for sym, df in asset_data.items():
+            try:
+                if isinstance(df, pd.DataFrame) and not df.empty:
+                    col = "Adj_Close" if "Adj_Close" in df.columns else ("Close" if "Close" in df.columns else None)
+                    if col:
+                        s = pd.to_numeric(df[col], errors="coerce")
+                        s.name = sym
+                        series_map[sym] = s
+            except Exception:
+                continue
+        if series_map:
+            prices_df = pd.concat(series_map.values(), axis=1).sort_index()
+
+    # Benchmarks (optional)
+    bench_df = st.session_state.get("benchmark_returns_data", pd.DataFrame())
+    bench_dict = {}
+    if isinstance(bench_df, pd.DataFrame) and not bench_df.empty:
+        for c in bench_df.columns:
+            s = pd.to_numeric(bench_df[c], errors="coerce").dropna()
+            if not s.empty:
+                s.name = c
+                bench_dict[c] = s
+
+    # Delegate the whole suite to the patch module (merged below)
+    try:
+        render_portfolio_lab_suite(
+            prices_df=prices_df,
+            returns_df=returns_df,
+            benchmark_returns=bench_dict,
+            key_ns="portfolio_lab",
+        )
+    except NameError:
+        st.error("Portfolio Lab patch is not available (render_portfolio_lab_suite missing). Please ensure the merged file is used.")
+    except Exception as e:
+        st.error(f"Portfolio Lab failed: {e}")
+        st.code(traceback.format_exc())
+
     def _display_settings(self, config: AnalysisConfiguration):
         """Display settings and system information"""
         st.markdown('<div class="section-header"><h2>⚙️ Settings & System Info</h2></div>', unsafe_allow_html=True)
@@ -6041,8 +6106,11 @@ def main():
         
         st.code(json.dumps(error_log, indent=2), language='json')
 
-if __name__ == "__main__":
-    main()
+
+# =============================================================================
+# BEGIN PORTFOLIO LAB PATCH (Merged)
+# =============================================================================
+
 # =============================================================================
 # 🧩 PATCH PACK v1.0 — Portfolio Lab + Risk Decomposition + VaR (3 Methods) + PCA Vol Drivers
 # Target: "🏛️ Institutional Commodities Analytics Platform v7.0" (Streamlit)
@@ -6063,9 +6131,6 @@ if __name__ == "__main__":
 # - PyPortfolioOpt requires: PyPortfolioOpt + cvxpy + scikit-learn
 # - This patch handles missing packages gracefully and shows install hints inside the app.
 # =============================================================================
-
-from __future__ import annotations
-
 import warnings
 from dataclasses import dataclass
 from typing import Dict, Any, Optional, Tuple, List
@@ -7261,3 +7326,11 @@ def render_portfolio_lab_suite(
 #
 #    Note: benchmark_returns is optional. If you already compute benchmarks, pass them.
 # =============================================================================
+
+# =============================================================================
+# END PORTFOLIO LAB PATCH (Merged)
+# =============================================================================
+
+
+if __name__ == "__main__":
+    main()
