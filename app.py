@@ -3130,11 +3130,11 @@ class ScientificCommoditiesPlatform:
                 help="Threshold for statistical significance (p-value)"
             )
             ####################################################################################################################################################
-                      # Statistical significance level
-            significance_level = st.selectbox(
+                           # Statistical significance level
+            significance_level = st.select_slider(
                 "Statistical Significance Level",
                 options=[0.01, 0.025, 0.05, 0.10],
-                index=2,  # 0.05 is at index 2
+                value=0.05,
                 format_func=lambda x: f"{x*100:.1f}%",
                 help="Threshold for statistical significance (p-value)"
             )
@@ -3153,7 +3153,7 @@ class ScientificCommoditiesPlatform:
                 options=[20, 60, 120, 250],
                 index=1,  # 60 is at index 1
                 help="Window size for rolling statistics"
-            )
+            )      
             
             # Initialize scientific configuration
             self.config = ScientificAnalysisConfiguration(
