@@ -1,6 +1,7 @@
 ipython
 numpy
 ta
+pyportfolioopt
 scipy
 numba
 psutil
