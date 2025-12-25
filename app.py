@@ -4288,8 +4288,7 @@ class ScientificCommoditiesPlatform:
             # Render scientific footer
             self.render_scientific_footer()
         ###################################################################################################################################
-    
-    def run(self):
+        def run(self):
         """Run the scientific Streamlit application"""
         try:
             # Render scientific header
