@@ -4277,15 +4277,17 @@ class ScientificCommoditiesPlatform:
             
             # Render scientific footer
             self.render_scientific_footer()
-            
-        except Exception as e:
-            st.error(f"""
-            <div class="error-message">
-                <strong>🚨 Scientific Application Error</strong><br>
-                {str(e)}
-            </div>
-            """, unsafe_allow_html=True)
-            
+        ###################################################################################################################################
+
+            except Exception as e:
+    error_html = f"""
+    <div class="error-message">
+        <strong>🚨 Scientific Application Error</strong><br>
+        {str(e)}
+    </div>
+    """
+    st.markdown(error_html, unsafe_allow_html=True)
+                    
             # Display detailed error information
             with st.expander("🔍 Error Details", expanded=False):
                 st.code(traceback.format_exc())
