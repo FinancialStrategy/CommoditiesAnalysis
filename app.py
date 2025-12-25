@@ -4288,16 +4288,31 @@ class ScientificCommoditiesPlatform:
             # Render scientific footer
             self.render_scientific_footer()
         ###################################################################################################################################
-
-            except Exception as e:
-    error_html = f"""
-    <div class="error-message">
-        <strong>🚨 Scientific Application Error</strong><br>
-        {str(e)}
-    </div>
-    """
-    st.markdown(error_html, unsafe_allow_html=True)
-                    
+    def run(self):
+        """Run the scientific Streamlit application"""
+        try:
+            # Render scientific header
+            self.render_scientific_header()
+            
+            # Render scientific sidebar
+            self.render_scientific_sidebar()
+            
+            # Render main dashboard
+            self.render_scientific_dashboard()
+            
+            # Render scientific footer
+            self.render_scientific_footer()
+            
+        except Exception as e:
+            # FIXED: Using markdown instead of error() with unsafe_allow_html
+            error_html = f"""
+            <div class="error-message">
+                <strong>🚨 Scientific Application Error</strong><br>
+                {str(e)}
+            </div>
+            """
+            st.markdown(error_html, unsafe_allow_html=True)
+            
             # Display detailed error information
             with st.expander("🔍 Error Details", expanded=False):
                 st.code(traceback.format_exc())
