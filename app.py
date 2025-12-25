@@ -4182,6 +4182,8 @@ class ScientificCommoditiesPlatform:
                     use_container_width=True
                 )
         
+               # ... previous code in render_data_validation method ...
+
         # Data download option
         st.markdown("---")
         st.markdown("#### 💾 Data Export")
@@ -4201,57 +4203,9 @@ class ScientificCommoditiesPlatform:
             
             href = f'<a href="data:application/json;base64,{b64}" download="scientific_analysis_report.json">Download JSON Report</a>'
             st.markdown(href, unsafe_allow_html=True)
-    
-    def render_welcome_screen(self):
-        """Render welcome screen with instructions"""
-        st.markdown("""
-        <div style="text-align: center; padding: 3rem 2rem; background: linear-gradient(135deg, #e8eaf6 0%, #ffffff 100%); border-radius: 12px; margin: 2rem 0;">
-            <h2 style="color: #1a237e; margin-bottom: 1rem;">🔬 Welcome to Scientific Commodities Analytics</h2>
-            <p style="color: #415a77; font-size: 1.1rem; max-width: 800px; margin: 0 auto 2rem;">
-                Institutional-grade scientific analysis platform for commodities trading.
-                Get started by configuring your analysis in the sidebar and click "Run Scientific Analysis".
-            </p>
-            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 1.5rem; margin-top: 3rem;">
-                <div class="institutional-card">
-                    <div style="font-size: 2rem; margin-bottom: 0.5rem;">📊</div>
-                    <div style="font-weight: 600; color: #1a237e; margin-bottom: 0.5rem;">Scientific Correlation</div>
-                    <div style="font-size: 0.9rem; color: #415a77;">Multiple correlation methods with statistical validation</div>
-                </div>
-                <div class="institutional-card">
-                    <div style="font-size: 2rem; margin-bottom: 0.5rem;">📈</div>
-                    <div style="font-weight: 600; color: #1a237e; margin-bottom: 0.5rem;">Risk Analytics</div>
-                    <div style="font-size: 0.9rem; color: #415a77;">Comprehensive risk metrics with confidence intervals</div>
-                </div>
-                <div class="institutional-card">
-                    <div style="font-size: 2rem; margin-bottom: 0.5rem;">⚙️</div>
-                    <div style="font-weight: 600; color: #1a237e; margin-bottom: 0.5rem;">Portfolio Science</div>
-                    <div style="font-size: 0.9rem; color: #415a77;">Mean-variance optimization and efficient frontier</div>
-                </div>
-                <div class="institutional-card">
-                    <div style="font-size: 2rem; margin-bottom: 0.5rem;">📋</div>
-                    <div style="font-weight: 600; color: #1a237e; margin-bottom: 0.5rem;">Data Validation</div>
-                    <div style="font-size: 0.9rem; color: #415a77;">Comprehensive data quality and validation checks</div>
-                </div>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        # Quick start guide
-        st.markdown("### 🚀 Quick Start Guide")
-        
-        steps = [
-            ("1. Select Assets", "Choose commodities and benchmarks from the sidebar"),
-            ("2. Configure Parameters", "Set scientific analysis parameters and correlation methods"),
-            ("3. Run Analysis", "Click 'Run Scientific Analysis' to generate insights"),
-            ("4. Explore Results", "Navigate through tabs to view different aspects of the analysis")
-        ]
-        
-        for title, description in steps:
-            with st.expander(title, expanded=True):
-                st.write(description)
-                
-        def render_scientific_footer(self):
-            """Render scientific footer"""
+
+    def render_scientific_footer(self):
+        """Render scientific footer"""
         st.markdown("---")
         
         col1, col2, col3 = st.columns([1, 2, 1])
