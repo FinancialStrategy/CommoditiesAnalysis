@@ -5530,7 +5530,7 @@ making investment decisions. Data source: Yahoo Finance.
             asset = cols[0]
         return returns_df[asset].dropna(), str(asset)
 
-    def _select_benchmark_series(self, bench_returns_df: pd.DataFrame) -> Tuple[pd.Series, str]:
+    def _select_benchmark_series(self, bench_returns_df: pd.DataFrame, key_ns: str = "") -> Tuple[pd.Series, str]:
         """Select benchmark series from loaded benchmark returns."""
         if bench_returns_df is None or bench_returns_df.empty:
             return pd.Series(dtype=float), "N/A"
@@ -5541,7 +5541,7 @@ making investment decisions. Data source: Yahoo Finance.
             "Benchmark",
             bcols,
             index=default_idx,
-            key="rel_benchmark_selectbox",
+            key=f"{key_ns}rel_benchmark_selectbox",
             help="Benchmark used for relative metrics (Tracking Error / Beta / Relative VaR).",
         )
         return bench_returns_df[selected].dropna(), str(selected)
@@ -5615,7 +5615,7 @@ making investment decisions. Data source: Yahoo Finance.
 
         # Select returns
         scope_returns, scope_label = self._get_scope_returns(returns_df, scope=scope, asset=selected_asset)
-        bench_series, bench_label = self._select_benchmark_series(bench_returns_df)
+        bench_series, bench_label = self._select_benchmark_series(bench_returns_df, key_ns="te_")
 
         a, b = self._safe_align_pair(scope_returns, bench_series)
         if a.empty or b.empty:
@@ -5749,7 +5749,7 @@ making investment decisions. Data source: Yahoo Finance.
             window = st.number_input("Rolling window (days)", min_value=20, max_value=252, value=int(getattr(config, "rolling_window", 60)), step=5, key="beta_window")
 
         scope_returns, scope_label = self._get_scope_returns(returns_df, scope=scope, asset=selected_asset)
-        bench_series, bench_label = self._select_benchmark_series(bench_returns_df)
+        bench_series, bench_label = self._select_benchmark_series(bench_returns_df, key_ns="beta_")
 
         a, b = self._safe_align_pair(scope_returns, bench_series)
         if a.empty or b.empty or len(a) < int(window):
@@ -5861,7 +5861,7 @@ making investment decisions. Data source: Yahoo Finance.
             alpha = st.selectbox("Confidence level", [0.90, 0.95, 0.99], index=1, key="relrisk_alpha")
 
         scope_returns, scope_label = self._get_scope_returns(returns_df, scope=scope, asset=selected_asset)
-        bench_series, bench_label = self._select_benchmark_series(bench_returns_df)
+        bench_series, bench_label = self._select_benchmark_series(bench_returns_df, key_ns="relrisk_")
 
         a, b = self._safe_align_pair(scope_returns, bench_series)
         if a.empty or b.empty or len(a) < int(window):
