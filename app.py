@@ -3130,10 +3130,20 @@ class ScientificCommoditiesPlatform:
                 help="Threshold for statistical significance (p-value)"
             )
             ####################################################################################################################################################
-           monte_carlo_sims = st.selectbox(
+                      # Statistical significance level
+            significance_level = st.selectbox(
+                "Statistical Significance Level",
+                options=[0.01, 0.025, 0.05, 0.10],
+                index=2,  # 0.05 is at index 2
+                format_func=lambda x: f"{x*100:.1f}%",
+                help="Threshold for statistical significance (p-value)"
+            )
+            
+            # Monte Carlo simulations
+            monte_carlo_sims = st.selectbox(
                 "Monte Carlo Simulations",
                 options=[1000, 5000, 10000, 25000, 50000],
-                index=2,  # <--- NEW PARAMETER: 2 is the index of 10000 in the options list
+                index=2,  # 10000 is at index 2
                 help="Number of simulations for risk analysis"
             )
             
@@ -3141,7 +3151,7 @@ class ScientificCommoditiesPlatform:
             rolling_window = st.selectbox(
                 "Rolling Analysis Window (days)",
                 options=[20, 60, 120, 250],
-                value=60,
+                index=1,  # 60 is at index 1
                 help="Window size for rolling statistics"
             )
             
