@@ -3129,12 +3129,11 @@ class ScientificCommoditiesPlatform:
                 format_func=lambda x: f"{x*100:.1f}%",
                 help="Threshold for statistical significance (p-value)"
             )
-            
-            # Monte Carlo simulations
-            monte_carlo_sims = st.selectbox(
+            ####################################################################################################################################################
+           monte_carlo_sims = st.selectbox(
                 "Monte Carlo Simulations",
                 options=[1000, 5000, 10000, 25000, 50000],
-                value=10000,
+                index=2,  # <--- NEW PARAMETER: 2 is the index of 10000 in the options list
                 help="Number of simulations for risk analysis"
             )
             
