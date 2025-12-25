@@ -3014,6 +3014,201 @@ class InstitutionalCommoditiesDashboard:
                 st.session_state.data_loaded = False
                 st.error(f"Data load failed: {e}")
 
+    def _display_tracking_error(self, config: 'AnalysisConfiguration'):
+        """Interactive Tracking Error analytics with institutional band zones.
+        Robust implementation: always available even if earlier patch blocks were misplaced.
+        """
+        st.markdown("### 🎯 Tracking Error (Institutional Band Monitoring)")
+        # --- Load returns
+        to_df = getattr(self, "_to_returns_df", None)
+        if callable(to_df):
+            returns_df = to_df(st.session_state.get("returns_data", None))
+            bench_df = to_df(st.session_state.get("benchmark_returns_data", None))
+        else:
+            returns_df = st.session_state.get("returns_data", None)
+            bench_df = st.session_state.get("benchmark_returns_data", None)
+            returns_df = returns_df.copy() if isinstance(returns_df, pd.DataFrame) else pd.DataFrame(returns_df) if isinstance(returns_df, dict) else pd.DataFrame()
+            bench_df = bench_df.copy() if isinstance(bench_df, pd.DataFrame) else pd.DataFrame(bench_df) if isinstance(bench_df, dict) else pd.DataFrame()
+
+        returns_df = returns_df.replace([np.inf, -np.inf], np.nan).dropna(axis=1, how="all")
+        bench_df = bench_df.replace([np.inf, -np.inf], np.nan).dropna(axis=1, how="all")
+
+        if returns_df.empty:
+            st.info("Load data first to compute Tracking Error.")
+            return
+        if bench_df.empty:
+            st.warning("No benchmark returns available. Please select at least one benchmark in the sidebar and reload data.")
+            return
+
+        key_ns = "te_tab__"
+
+        # --- Controls
+        c1, c2, c3, c4 = st.columns([1.2, 1.0, 1.0, 1.0])
+        with c1:
+            scope = st.selectbox(
+                "Scope",
+                ["Portfolio (Equal Weight)", "Single Asset"],
+                index=0,
+                key=f"{key_ns}scope",
+                help="Compute tracking error for an equal-weight portfolio of selected assets or a single asset.",
+            )
+        with c2:
+            window = st.selectbox(
+                "Rolling window (days)",
+                [20, 60, 126, 252],
+                index=3,
+                key=f"{key_ns}window",
+            )
+        with c3:
+            green_thr = st.number_input(
+                "Green threshold (TE)",
+                min_value=0.0,
+                max_value=1.0,
+                value=float(st.session_state.get("te_green_thr", 0.04)),
+                step=0.005,
+                format="%.3f",
+                key=f"{key_ns}green",
+                help="Default institutional policy: TE < 4% = Green",
+            )
+        with c4:
+            orange_thr = st.number_input(
+                "Orange threshold (TE)",
+                min_value=0.0,
+                max_value=1.0,
+                value=float(st.session_state.get("te_orange_thr", 0.08)),
+                step=0.005,
+                format="%.3f",
+                key=f"{key_ns}orange",
+                help="Default institutional policy: 4–8% = Orange, >8% = Red",
+            )
+
+        st.session_state["te_green_thr"] = float(green_thr)
+        st.session_state["te_orange_thr"] = float(orange_thr)
+
+        bcols = list(bench_df.columns)
+        bench_col = st.selectbox(
+            "Benchmark",
+            bcols,
+            index=0,
+            key=f"{key_ns}bench",
+            help="Benchmark series used for Tracking Error.",
+        )
+
+        # --- Build portfolio/asset series
+        if scope.startswith("Portfolio"):
+            assets = list(returns_df.columns)
+            default_assets = assets[: min(6, len(assets))]
+            sel_assets = st.multiselect(
+                "Select assets for equal-weight portfolio",
+                assets,
+                default=default_assets,
+                key=f"{key_ns}assets",
+            )
+            if not sel_assets:
+                st.warning("Select at least 1 asset.")
+                return
+            port = returns_df[sel_assets].mean(axis=1)
+            series_name = "EQW_Portfolio"
+        else:
+            assets = list(returns_df.columns)
+            asset = st.selectbox(
+                "Asset",
+                assets,
+                index=0,
+                key=f"{key_ns}asset",
+            )
+            port = returns_df[asset]
+            series_name = str(asset)
+
+        bench = bench_df[bench_col]
+
+        # --- Align / active
+        idx = port.dropna().index.intersection(bench.dropna().index)
+        if len(idx) < max(60, int(window)):
+            st.warning("Not enough overlapping data points to compute robust Tracking Error.")
+            return
+
+        port = port.loc[idx].astype(float)
+        bench = bench.loc[idx].astype(float)
+        active = (port - bench).dropna()
+
+        if active.empty:
+            st.warning("Active return series is empty after alignment.")
+            return
+
+        # --- Tracking error series (rolling)
+        te_roll = active.rolling(int(window)).std(ddof=1) * np.sqrt(252.0)
+        te_roll.name = "TrackingError"
+        te_last = float(te_roll.dropna().iloc[-1]) if te_roll.dropna().shape[0] else np.nan
+
+        # --- KPI row
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Current TE (ann.)", f"{te_last:.2%}" if np.isfinite(te_last) else "N/A")
+        k2.metric("Avg TE (ann.)", f"{float(te_roll.mean()):.2%}" if te_roll.dropna().shape[0] else "N/A")
+        k3.metric("Max TE (ann.)", f"{float(te_roll.max()):.2%}" if te_roll.dropna().shape[0] else "N/A")
+        k4.metric("Window", f"{int(window)}d")
+
+        # --- Determine band range
+        y_max = float(np.nanmax([te_roll.max(), orange_thr * 1.35, 0.12])) if te_roll.dropna().shape[0] else float(orange_thr * 1.35)
+        y_max = max(y_max, orange_thr * 1.35, green_thr * 1.35, 0.05)
+
+        # --- Plot with bands
+        fig = go.Figure()
+
+        # Bands (green/orange/red)
+        x0 = te_roll.index.min()
+        x1 = te_roll.index.max()
+        fig.add_shape(type="rect", xref="x", yref="y", x0=x0, x1=x1, y0=0, y1=green_thr,
+                      fillcolor="rgba(0,200,0,0.18)", line_width=0, layer="below")
+        fig.add_shape(type="rect", xref="x", yref="y", x0=x0, x1=x1, y0=green_thr, y1=orange_thr,
+                      fillcolor="rgba(255,165,0,0.18)", line_width=0, layer="below")
+        fig.add_shape(type="rect", xref="x", yref="y", x0=x0, x1=x1, y0=orange_thr, y1=y_max,
+                      fillcolor="rgba(255,0,0,0.16)", line_width=0, layer="below")
+
+        fig.add_trace(go.Scatter(x=te_roll.index, y=te_roll.values, mode="lines", name="Rolling TE (ann.)"))
+        if np.isfinite(te_last):
+            fig.add_trace(go.Scatter(x=[te_roll.index[-1]], y=[te_last], mode="markers", name="Current", marker=dict(size=10)))
+
+        fig.update_layout(
+            title=f"Tracking Error — {series_name} vs {bench_col} (rolling {int(window)}d)",
+            height=460,
+            xaxis_title="Date",
+            yaxis_title="Tracking Error (annualized)",
+            margin=dict(l=10, r=10, t=60, b=10),
+            legend_title="Series",
+        )
+        st.plotly_chart(fig, use_container_width=True, key=f"{key_ns}chart")
+
+        # --- Weekly table (last TE per week)
+        st.markdown("#### Weekly Tracking Error Snapshot")
+        te_week = te_roll.resample("W-FRI").last().dropna()
+        if te_week.empty:
+            st.info("Weekly snapshot not available yet.")
+        else:
+            table = pd.DataFrame({
+                "Week": te_week.index.strftime("%Y-%m-%d"),
+                "TE": te_week.values,
+            })
+            def _band(v: float) -> str:
+                if not np.isfinite(v):
+                    return "N/A"
+                if v < green_thr:
+                    return "GREEN"
+                if v < orange_thr:
+                    return "ORANGE"
+                return "RED"
+            table["Band"] = [_band(v) for v in table["TE"]]
+            table["TE"] = table["TE"].map(lambda x: f"{x:.2%}" if np.isfinite(x) else "N/A")
+            st.dataframe(table.tail(30), use_container_width=True)
+
+        with st.expander("Method Notes (Institutional)", expanded=False):
+            st.markdown(
+                """**Tracking Error (TE)** is the annualized standard deviation of **active returns** (Portfolio − Benchmark).\n\n"
+                "- Rolling TE uses the selected window and annualizes by √252.\n"
+                "- Band thresholds are configurable; typical policy: **<4% green**, **4–8% orange**, **>8% red**.\n"
+                "- Portfolio scope here uses **equal weights** for the selected assets (manual optimizer weights are in Portfolio Lab tab)."""
+            )
+
     def run(self):
         """Main app runner (Streamlit entry)."""
         try:
