@@ -3346,3 +3346,170 @@ class InstitutionalCommoditiesDashboard:
             """), unsafe_allow_html=True)
 
         with col4:
+
+
+
+# =============================================================================
+# 🔧 SAFETY BINDERS — Ensure required dashboard methods exist (no AttributeErrors)
+# =============================================================================
+
+def _icd__to_returns_df_fallback(self, returns_data):
+    """Robustly coerce session_state returns_data into a wide DataFrame."""
+    import numpy as np
+    import pandas as pd
+    if returns_data is None:
+        return pd.DataFrame()
+    if isinstance(returns_data, pd.DataFrame):
+        return returns_data.copy()
+    if isinstance(returns_data, pd.Series):
+        return returns_data.to_frame()
+    if isinstance(returns_data, dict):
+        cols = {}
+        for k, v in returns_data.items():
+            if v is None:
+                continue
+            if isinstance(v, pd.Series):
+                cols[str(k)] = v
+            elif isinstance(v, pd.DataFrame):
+                if v.shape[1] >= 1:
+                    cols[str(k)] = v.iloc[:, 0]
+        if not cols:
+            return pd.DataFrame()
+        df = pd.concat(cols, axis=1)
+        return df
+    try:
+        return pd.DataFrame(returns_data)
+    except Exception:
+        return pd.DataFrame()
+
+def _icd_display_relative_risk_fallback(self, cfg):
+    """
+    Relative Risk Dashboard:
+    - Relative VaR / CVaR(ES) (Historical) on active returns (Portfolio - Benchmark)
+    - Tracking Error (annualized)
+    - Interactive bands (green/orange/red) via thresholds
+    This is a safe fallback to avoid AttributeError if the method was not merged into the class.
+    """
+    import numpy as np
+    import pandas as pd
+    import streamlit as st
+    import plotly.graph_objects as go
+
+    st.subheader("📊 Relative Risk (vs Benchmark) — Relative VaR / ES + Bands")
+
+    # Returns universe
+    if hasattr(self, "_to_returns_df"):
+        returns_df = self._to_returns_df(st.session_state.get("returns_data", None))
+    else:
+        returns_df = _icd__to_returns_df_fallback(self, st.session_state.get("returns_data", None))
+
+    returns_df = returns_df.replace([np.inf, -np.inf], np.nan).dropna(axis=1, how="all")
+
+    if returns_df.empty:
+        st.info("Relative risk cannot be computed: returns data is empty.")
+        return
+
+    # Benchmarks
+    bench_dict = st.session_state.get("benchmark_returns", None)
+    if not isinstance(bench_dict, dict):
+        bench_dict = {}
+
+    bench_options = ["(None)"] + list(bench_dict.keys())
+    bmk_key = st.selectbox("Benchmark", options=bench_options, index=0, key="relrisk_bmk")
+    bench = bench_dict.get(bmk_key) if bmk_key != "(None)" else None
+
+    # Portfolio series
+    port_series = st.session_state.get("portfolio_returns", None)
+    if isinstance(port_series, pd.Series) and not port_series.dropna().empty:
+        portfolio = port_series.dropna()
+        st.caption("Using portfolio_returns from session_state.")
+    else:
+        asset = st.selectbox("Target (proxy portfolio): choose asset", options=list(returns_df.columns), index=0, key="relrisk_asset")
+        portfolio = returns_df[asset].dropna()
+
+    if bench is None or not isinstance(bench, pd.Series) or bench.dropna().empty:
+        st.info("Select a benchmark to compute relative risk (active series).")
+        return
+
+    idx = portfolio.index.intersection(bench.dropna().index)
+    if len(idx) < 60:
+        st.warning("Insufficient overlap with benchmark (need ~60+ observations).")
+        return
+
+    active = (portfolio.loc[idx] - bench.loc[idx]).dropna()
+    if active.empty:
+        st.warning("Active series is empty after alignment.")
+        return
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        alpha = st.select_slider("α (tail)", options=[0.10, 0.05, 0.025, 0.01], value=0.05, key="relrisk_alpha")
+    with c2:
+        horizon = st.selectbox("Horizon (days)", options=[1, 5, 10, 21], index=0, key="relrisk_h")
+    with c3:
+        window = st.selectbox("Rolling window", options=[63, 126, 252, 504], index=2, key="relrisk_win")
+    with c4:
+        green = st.number_input("Green ≤", value=0.02, step=0.005, format="%.4f", key="relrisk_green")
+        orange = st.number_input("Orange ≤", value=0.04, step=0.005, format="%.4f", key="relrisk_orange")
+
+    def _hist_var_es(series, a):
+        losses = -series
+        var_loss = float(np.quantile(losses, a))
+        tail = losses[losses >= var_loss]
+        es_loss = float(np.mean(tail)) if len(tail) else float(np.max(losses))
+        # Convert back to return-space thresholds (negative for losses)
+        return -var_loss, -es_loss
+
+    roll_var = active.rolling(int(window)).apply(lambda s: _hist_var_es(pd.Series(s).dropna(), float(alpha))[0] if len(pd.Series(s).dropna()) else np.nan, raw=False)
+    roll_es  = active.rolling(int(window)).apply(lambda s: _hist_var_es(pd.Series(s).dropna(), float(alpha))[1] if len(pd.Series(s).dropna()) else np.nan, raw=False)
+
+    if int(horizon) > 1:
+        scale = float(np.sqrt(int(horizon)))
+        roll_var = roll_var * scale
+        roll_es = roll_es * scale
+
+    latest_var = float(roll_var.dropna().iloc[-1]) if not roll_var.dropna().empty else np.nan
+    latest_es  = float(roll_es.dropna().iloc[-1]) if not roll_es.dropna().empty else np.nan
+    te = float(active.std(ddof=1) * np.sqrt(252)) if active.dropna().shape[0] > 1 else np.nan
+
+    k1, k2, k3 = st.columns(3)
+    k1.metric("Tracking Error (ann.)", f"{te:.2%}" if np.isfinite(te) else "N/A")
+    k2.metric(f"Active VaR (Hist, α={alpha}, h={horizon})", f"{latest_var:.2%}" if np.isfinite(latest_var) else "N/A")
+    k3.metric(f"Active ES (Hist, α={alpha}, h={horizon})", f"{latest_es:.2%}" if np.isfinite(latest_es) else "N/A")
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=active.index, y=active.values, name="Active Return", mode="lines"))
+    fig.add_trace(go.Scatter(x=roll_var.index, y=roll_var.values, name="Rolling Active VaR", mode="lines"))
+    fig.add_trace(go.Scatter(x=roll_es.index, y=roll_es.values, name="Rolling Active ES", mode="lines"))
+
+    g = float(green)
+    o = float(orange)
+
+    # Green band [-g, g]
+    fig.add_shape(type="rect", xref="paper", yref="y", x0=0, x1=1, y0=-g, y1=g, opacity=0.15, line_width=0)
+    # Orange band [-o, -g] and [g, o]
+    fig.add_shape(type="rect", xref="paper", yref="y", x0=0, x1=1, y0=-o, y1=-g, opacity=0.12, line_width=0)
+    fig.add_shape(type="rect", xref="paper", yref="y", x0=0, x1=1, y0=g, y1=o, opacity=0.12, line_width=0)
+    # Reference lines
+    fig.add_hline(y=o, line_width=1)
+    fig.add_hline(y=-o, line_width=1)
+
+    fig.update_layout(
+        title="Active Return vs Rolling Relative VaR/ES (Bands via thresholds)",
+        height=520,
+        xaxis_title="Date",
+        yaxis_title="Active Return / Risk",
+        margin=dict(l=10, r=10, t=50, b=10)
+    )
+    st.plotly_chart(fig, use_container_width=True, key="relrisk_chart")
+
+
+# Bind missing methods safely (no crashes)
+try:
+    InstitutionalCommoditiesDashboard  # noqa: F401
+    if not hasattr(InstitutionalCommoditiesDashboard, "_to_returns_df"):
+        InstitutionalCommoditiesDashboard._to_returns_df = _icd__to_returns_df_fallback
+    if not hasattr(InstitutionalCommoditiesDashboard, "_display_relative_risk"):
+        InstitutionalCommoditiesDashboard._display_relative_risk = _icd_display_relative_risk_fallback
+except Exception:
+    pass
