@@ -2127,12 +2127,45 @@ class InstitutionalVisualizer:
     
     def create_performance_chart(
         self,
-        returns: pd.Series,
+        returns: Union[pd.Series, pd.DataFrame],
         benchmark_returns: Optional[pd.Series] = None,
         title: str = "Performance Analysis"
     ) -> go.Figure:
-        """Create performance visualization with multiple metrics"""
-        
+        """Create performance visualization with multiple metrics.
+
+        Robustly supports both pd.Series (single strategy/portfolio) and pd.DataFrame
+        (multi-asset or multi-strategy) inputs.
+        """
+
+        # -----------------------------
+        # Normalize input -> DataFrame
+        # -----------------------------
+        if returns is None:
+            returns_df = pd.DataFrame()
+        elif isinstance(returns, pd.DataFrame):
+            returns_df = returns.copy()
+        else:
+            name = getattr(returns, "name", None) or "Portfolio"
+            returns_df = pd.DataFrame({name: returns})
+
+        # Coerce to numeric and drop empty rows/cols safely
+        if not returns_df.empty:
+            returns_df = returns_df.apply(pd.to_numeric, errors="coerce")
+            returns_df = returns_df.dropna(how="all")
+            returns_df = returns_df.dropna(axis=1, how="all")
+
+        # Align benchmark to returns index (if present)
+        bmk = None
+        if benchmark_returns is not None:
+            try:
+                bmk = pd.to_numeric(benchmark_returns, errors="coerce").dropna()
+                if (bmk is not None) and (not returns_df.empty):
+                    common_idx = returns_df.index.intersection(bmk.index)
+                    returns_df = returns_df.loc[common_idx]
+                    bmk = bmk.loc[common_idx]
+            except Exception:
+                bmk = None
+
         fig = make_subplots(
             rows=3, cols=2,
             subplot_titles=(
@@ -2143,125 +2176,210 @@ class InstitutionalVisualizer:
                 "Returns Distribution",
                 "QQ Plot"
             ),
-            vertical_spacing=0.1,
-            horizontal_spacing=0.1,
             specs=[
-                [{"colspan": 2}, None],
+                [{"type": "scatter"}, {"type": "scatter"}],
                 [{"type": "scatter"}, {"type": "scatter"}],
                 [{"type": "histogram"}, {"type": "scatter"}]
             ]
         )
-        
-        # Cumulative returns
-        cumulative = (1 + returns).cumprod()
-        fig.add_trace(
-            go.Scatter(
-                x=cumulative.index,
-                y=cumulative.values,
-                name="Portfolio",
-                line=dict(color=self.colors['primary'], width=3),
-                fill='tozeroy',
-                fillcolor=f"rgba({int(self.colors['primary'][1:3], 16)}, "
-                         f"{int(self.colors['primary'][3:5], 16)}, "
-                         f"{int(self.colors['primary'][5:7], 16)}, 0.2)"
-            ),
-            row=1, col=1
-        )
-        
-        if benchmark_returns is not None:
-            benchmark_cumulative = (1 + benchmark_returns).cumprod()
+
+        cols = list(returns_df.columns) if not returns_df.empty else []
+        palette = [
+            self.colors.get("primary", "#1f77b4"),
+            self.colors.get("secondary", "#ff7f0e"),
+            self.colors.get("success", "#2ca02c"),
+            self.colors.get("warning", "#d62728"),
+            self.colors.get("danger", "#9467bd"),
+            self.colors.get("gray", "#7f7f7f"),
+        ]
+
+        # -----------------------------
+        # Cumulative returns (row 1, col 1)
+        # -----------------------------
+        for i, col in enumerate(cols):
+            s = returns_df[col].dropna()
+            if s.empty:
+                continue
+            cumulative = (1 + s).cumprod()
+            fig.add_trace(
+                go.Scatter(
+                    x=cumulative.index,
+                    y=cumulative.values,
+                    name=str(col),
+                    line=dict(color=palette[i % len(palette)], width=3 if len(cols) == 1 else 2),
+                    fill='tozeroy' if len(cols) == 1 else None,
+                ),
+                row=1, col=1
+            )
+
+        if bmk is not None and len(bmk) > 0:
+            benchmark_cumulative = (1 + bmk).cumprod()
             fig.add_trace(
                 go.Scatter(
                     x=benchmark_cumulative.index,
                     y=benchmark_cumulative.values,
                     name="Benchmark",
-                    line=dict(color=self.colors['gray'], width=2, dash='dash')
+                    line=dict(color=self.colors.get("gray", "#888888"), width=2, dash='dash')
                 ),
                 row=1, col=1
             )
-        
-        # Drawdown
-        running_max = cumulative.cummax()
-        drawdown = (cumulative - running_max) / running_max * 100
-        
-        fig.add_trace(
-            go.Scatter(
-                x=drawdown.index,
-                y=drawdown.values,
-                name="Drawdown",
-                line=dict(color=self.colors['danger'], width=2),
-                fill='tozeroy',
-                fillcolor=f"rgba({int(self.colors['danger'][1:3], 16)}, "
-                         f"{int(self.colors['danger'][3:5], 16)}, "
-                         f"{int(self.colors['danger'][5:7], 16)}, 0.3)"
-            ),
-            row=2, col=1
-        )
-        
-        # Rolling returns (12 months)
-        rolling_returns = returns.rolling(window=252).mean() * 252 * 100
-        fig.add_trace(
-            go.Scatter(
-                x=rolling_returns.index,
-                y=rolling_returns.values,
-                name="Rolling Return",
-                line=dict(color=self.colors['success'], width=2)
-            ),
-            row=2, col=2
-        )
-        
-        # Rolling volatility (12 months)
-        rolling_vol = returns.rolling(window=252).std() * np.sqrt(252) * 100
-        fig.add_trace(
-            go.Scatter(
-                x=rolling_vol.index,
-                y=rolling_vol.values,
-                name="Rolling Volatility",
-                line=dict(color=self.colors['warning'], width=2)
-            ),
-            row=3, col=1
-        )
-        
-        # Returns distribution
-        fig.add_trace(
-            go.Histogram(
-                x=returns * 100,
-                nbinsx=50,
-                name="Returns",
-                marker_color=self.colors['primary'],
-                opacity=0.7
-            ),
-            row=3, col=1
-        )
-        
-        # QQ Plot
-        if len(returns) > 10:
-            qq_data = stats.probplot(returns.dropna(), dist="norm")
+
+        # -----------------------------
+        # Drawdown (row 1, col 2)
+        # -----------------------------
+        for i, col in enumerate(cols):
+            s = returns_df[col].dropna()
+            if s.empty:
+                continue
+            cumulative = (1 + s).cumprod()
+            running_max = cumulative.cummax()
+            drawdown = (cumulative - running_max) / running_max * 100
             fig.add_trace(
                 go.Scatter(
-                    x=qq_data[0][0],
-                    y=qq_data[0][1],
-                    mode='markers',
-                    name="Data",
-                    marker=dict(color=self.colors['secondary'], size=6)
+                    x=drawdown.index,
+                    y=drawdown.values,
+                    name=f"{col} Drawdown" if len(cols) > 1 else "Drawdown",
+                    line=dict(color=palette[i % len(palette)], width=2),
+                    fill='tozeroy' if len(cols) == 1 else None,
+                    opacity=0.85 if len(cols) > 1 else 0.95
                 ),
-                row=3, col=2
+                row=1, col=2
             )
-            
-            # Add theoretical line
-            x_line = np.array([qq_data[0][0][0], qq_data[0][0][-1]])
-            y_line = qq_data[1][0] + qq_data[1][1] * x_line
+
+        if bmk is not None and len(bmk) > 0:
+            bc = (1 + bmk).cumprod()
+            rm = bc.cummax()
+            bdd = (bc - rm) / rm * 100
             fig.add_trace(
                 go.Scatter(
-                    x=x_line,
-                    y=y_line,
-                    mode='lines',
-                    name="Normal",
-                    line=dict(color=self.colors['danger'], width=2, dash='dash')
+                    x=bdd.index,
+                    y=bdd.values,
+                    name="Benchmark Drawdown",
+                    line=dict(color=self.colors.get("gray", "#888888"), width=2, dash='dot'),
+                    opacity=0.9
                 ),
-                row=3, col=2
+                row=1, col=2
             )
-        
+
+        # -----------------------------
+        # Rolling returns (row 2, col 1)
+        # -----------------------------
+        for i, col in enumerate(cols):
+            s = returns_df[col]
+            rolling_returns = s.rolling(window=252, min_periods=60).mean() * 252 * 100
+            fig.add_trace(
+                go.Scatter(
+                    x=rolling_returns.index,
+                    y=rolling_returns.values,
+                    name=f"{col} Rolling Return" if len(cols) > 1 else "Rolling Return",
+                    line=dict(color=palette[i % len(palette)], width=2),
+                    opacity=0.75 if len(cols) > 1 else 0.95
+                ),
+                row=2, col=1
+            )
+
+        if bmk is not None and len(bmk) > 0:
+            brr = bmk.rolling(window=252, min_periods=60).mean() * 252 * 100
+            fig.add_trace(
+                go.Scatter(
+                    x=brr.index,
+                    y=brr.values,
+                    name="Benchmark Rolling Return",
+                    line=dict(color=self.colors.get("gray", "#888888"), width=2, dash='dash')
+                ),
+                row=2, col=1
+            )
+
+        # -----------------------------
+        # Rolling volatility (row 2, col 2)
+        # -----------------------------
+        for i, col in enumerate(cols):
+            s = returns_df[col]
+            rolling_vol = s.rolling(window=252, min_periods=60).std() * np.sqrt(252) * 100
+            fig.add_trace(
+                go.Scatter(
+                    x=rolling_vol.index,
+                    y=rolling_vol.values,
+                    name=f"{col} Rolling Vol" if len(cols) > 1 else "Rolling Volatility",
+                    line=dict(color=palette[i % len(palette)], width=2),
+                    opacity=0.75 if len(cols) > 1 else 0.95
+                ),
+                row=2, col=2
+            )
+
+        if bmk is not None and len(bmk) > 0:
+            brv = bmk.rolling(window=252, min_periods=60).std() * np.sqrt(252) * 100
+            fig.add_trace(
+                go.Scatter(
+                    x=brv.index,
+                    y=brv.values,
+                    name="Benchmark Rolling Vol",
+                    line=dict(color=self.colors.get("gray", "#888888"), width=2, dash='dash')
+                ),
+                row=2, col=2
+            )
+
+        # -----------------------------
+        # Returns distribution (row 3, col 1)
+        # -----------------------------
+        for i, col in enumerate(cols):
+            s = (returns_df[col] * 100).dropna()
+            if s.empty:
+                continue
+            fig.add_trace(
+                go.Histogram(
+                    x=s,
+                    nbinsx=50,
+                    name=str(col),
+                    marker_color=palette[i % len(palette)],
+                    opacity=0.45 if len(cols) > 1 else 0.7
+                ),
+                row=3, col=1
+            )
+
+        # -----------------------------
+        # QQ Plot (row 3, col 2) - per series + pooled theoretical line
+        # -----------------------------
+        for i, col in enumerate(cols):
+            vals = returns_df[col].dropna().values
+            if vals is None or len(vals) <= 10:
+                continue
+            try:
+                qq_data = stats.probplot(vals, dist="norm")
+                fig.add_trace(
+                    go.Scatter(
+                        x=qq_data[0][0],
+                        y=qq_data[0][1],
+                        mode='markers',
+                        name=str(col),
+                        marker=dict(size=6),
+                        opacity=0.7 if len(cols) > 1 else 1.0
+                    ),
+                    row=3, col=2
+                )
+            except Exception:
+                continue
+
+        # Add pooled theoretical line (prevents DataFrame probplot shape issues)
+        try:
+            pooled = returns_df.stack().dropna().values if not returns_df.empty else np.array([])
+            if pooled is not None and len(pooled) > 10:
+                qq_all = stats.probplot(pooled, dist="norm")
+                x_line = np.array([qq_all[0][0][0], qq_all[0][0][-1]])
+                y_line = qq_all[1][0] + qq_all[1][1] * x_line
+                fig.add_trace(
+                    go.Scatter(
+                        x=x_line,
+                        y=y_line,
+                        mode='lines',
+                        name="Normal",
+                        line=dict(color=self.colors.get("danger", "#d62728"), width=2, dash='dash')
+                    ),
+                    row=3, col=2
+                )
+        except Exception:
+            pass
+
         # Update layout
         fig.update_layout(
             title=dict(text=title, x=0.5, font=dict(size=24)),
@@ -2270,21 +2388,23 @@ class InstitutionalVisualizer:
             showlegend=True,
             hovermode='x unified'
         )
-        
-        # Update axes titles
+
+        # Update axes titles (consistent with subplot placement)
         fig.update_yaxes(title_text="Cumulative Return", row=1, col=1)
-        fig.update_yaxes(title_text="Drawdown (%)", row=2, col=1)
-        fig.update_yaxes(title_text="Annual Return (%)", row=2, col=2)
-        fig.update_yaxes(title_text="Annual Volatility (%)", row=3, col=1)
+        fig.update_yaxes(title_text="Drawdown (%)", row=1, col=2)
+        fig.update_yaxes(title_text="Annual Return (%)", row=2, col=1)
+        fig.update_yaxes(title_text="Annual Volatility (%)", row=2, col=2)
+        fig.update_yaxes(title_text="Count", row=3, col=1)
         fig.update_yaxes(title_text="Sample Quantiles", row=3, col=2)
+
         fig.update_xaxes(title_text="Date", row=1, col=1)
+        fig.update_xaxes(title_text="Date", row=1, col=2)
         fig.update_xaxes(title_text="Date", row=2, col=1)
         fig.update_xaxes(title_text="Date", row=2, col=2)
         fig.update_xaxes(title_text="Return (%)", row=3, col=1)
         fig.update_xaxes(title_text="Theoretical Quantiles", row=3, col=2)
-        
+
         return fig
-    
     def create_correlation_matrix(
         self,
         corr_matrix: pd.DataFrame,
