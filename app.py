@@ -2127,50 +2127,44 @@ class InstitutionalVisualizer:
     
     def create_performance_chart(
         self,
-        returns: pd.Series,
+        returns: Union[pd.Series, pd.DataFrame],
         benchmark_returns: Optional[pd.Series] = None,
         title: str = "Performance Analysis"
     ) -> go.Figure:
-        """Create performance visualization with multiple metrics"""
-        
+        """Create performance visualization with multiple metrics.
 
-        # Robust handling: sometimes callers pass a DataFrame (multi-asset)
-        # into this function. Distribution/QQ plots require 1D data, so in that
-        # case we return a dedicated cumulative performance figure.
-        if isinstance(returns, pd.DataFrame):
-            df = returns.copy()
-            df = df.replace([np.inf, -np.inf], np.nan)
-            df = df.dropna(axis=0, how="all")
-            if df.empty:
-                fig_empty = go.Figure()
-                fig_empty.update_layout(title=title, template=self.template, height=420)
-                return fig_empty
+        Robustly supports both pd.Series (single strategy/portfolio) and pd.DataFrame
+        (multi-asset or multi-strategy) inputs.
+        """
 
-            fig_multi = go.Figure()
-            for c in df.columns:
-                s = pd.Series(df[c]).dropna()
-                if s.empty:
-                    continue
-                cum = (1.0 + s).cumprod()
-                fig_multi.add_trace(
-                    go.Scatter(
-                        x=cum.index,
-                        y=cum.values,
-                        name=str(c),
-                        line=dict(width=2),
-                    )
-                )
-            fig_multi.update_layout(
-                title=title,
-                height=520,
-                xaxis_title="Date",
-                yaxis_title="Cumulative Growth of $1",
-                template=self.template,
-                hovermode="x unified",
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                margin=dict(l=40, r=40, t=70, b=40),
-            )
-            return fig_multi
+        # -----------------------------
+        # Normalize input -> DataFrame
+        # -----------------------------
+        if returns is None:
+            returns_df = pd.DataFrame()
+        elif isinstance(returns, pd.DataFrame):
+            returns_df = returns.copy()
+        else:
+            name = getattr(returns, "name", None) or "Portfolio"
+            returns_df = pd.DataFrame({name: returns})
+
+        # Coerce to numeric and drop empty rows/cols safely
+        if not returns_df.empty:
+            returns_df = returns_df.apply(pd.to_numeric, errors="coerce")
+            returns_df = returns_df.dropna(how="all")
+            returns_df = returns_df.dropna(axis=1, how="all")
+
+        # Align benchmark to returns index (if present)
+        bmk = None
+        if benchmark_returns is not None:
+            try:
+                bmk = pd.to_numeric(benchmark_returns, errors="coerce").dropna()
+                if (bmk is not None) and (not returns_df.empty):
+                    common_idx = returns_df.index.intersection(bmk.index)
+                    returns_df = returns_df.loc[common_idx]
+                    bmk = bmk.loc[common_idx]
+            except Exception:
+                bmk = None
 
         fig = make_subplots(
             rows=3, cols=2,
@@ -2182,125 +2176,210 @@ class InstitutionalVisualizer:
                 "Returns Distribution",
                 "QQ Plot"
             ),
-            vertical_spacing=0.1,
-            horizontal_spacing=0.1,
             specs=[
-                [{"colspan": 2}, None],
+                [{"type": "scatter"}, {"type": "scatter"}],
                 [{"type": "scatter"}, {"type": "scatter"}],
                 [{"type": "histogram"}, {"type": "scatter"}]
             ]
         )
-        
-        # Cumulative returns
-        cumulative = (1 + returns).cumprod()
-        fig.add_trace(
-            go.Scatter(
-                x=cumulative.index,
-                y=cumulative.values,
-                name="Portfolio",
-                line=dict(color=self.colors['primary'], width=3),
-                fill='tozeroy',
-                fillcolor=f"rgba({int(self.colors['primary'][1:3], 16)}, "
-                         f"{int(self.colors['primary'][3:5], 16)}, "
-                         f"{int(self.colors['primary'][5:7], 16)}, 0.2)"
-            ),
-            row=1, col=1
-        )
-        
-        if benchmark_returns is not None:
-            benchmark_cumulative = (1 + benchmark_returns).cumprod()
+
+        cols = list(returns_df.columns) if not returns_df.empty else []
+        palette = [
+            self.colors.get("primary", "#1f77b4"),
+            self.colors.get("secondary", "#ff7f0e"),
+            self.colors.get("success", "#2ca02c"),
+            self.colors.get("warning", "#d62728"),
+            self.colors.get("danger", "#9467bd"),
+            self.colors.get("gray", "#7f7f7f"),
+        ]
+
+        # -----------------------------
+        # Cumulative returns (row 1, col 1)
+        # -----------------------------
+        for i, col in enumerate(cols):
+            s = returns_df[col].dropna()
+            if s.empty:
+                continue
+            cumulative = (1 + s).cumprod()
+            fig.add_trace(
+                go.Scatter(
+                    x=cumulative.index,
+                    y=cumulative.values,
+                    name=str(col),
+                    line=dict(color=palette[i % len(palette)], width=3 if len(cols) == 1 else 2),
+                    fill='tozeroy' if len(cols) == 1 else None,
+                ),
+                row=1, col=1
+            )
+
+        if bmk is not None and len(bmk) > 0:
+            benchmark_cumulative = (1 + bmk).cumprod()
             fig.add_trace(
                 go.Scatter(
                     x=benchmark_cumulative.index,
                     y=benchmark_cumulative.values,
                     name="Benchmark",
-                    line=dict(color=self.colors['gray'], width=2, dash='dash')
+                    line=dict(color=self.colors.get("gray", "#888888"), width=2, dash='dash')
                 ),
                 row=1, col=1
             )
-        
-        # Drawdown
-        running_max = cumulative.cummax()
-        drawdown = (cumulative - running_max) / running_max * 100
-        
-        fig.add_trace(
-            go.Scatter(
-                x=drawdown.index,
-                y=drawdown.values,
-                name="Drawdown",
-                line=dict(color=self.colors['danger'], width=2),
-                fill='tozeroy',
-                fillcolor=f"rgba({int(self.colors['danger'][1:3], 16)}, "
-                         f"{int(self.colors['danger'][3:5], 16)}, "
-                         f"{int(self.colors['danger'][5:7], 16)}, 0.3)"
-            ),
-            row=2, col=1
-        )
-        
-        # Rolling returns (12 months)
-        rolling_returns = returns.rolling(window=252).mean() * 252 * 100
-        fig.add_trace(
-            go.Scatter(
-                x=rolling_returns.index,
-                y=rolling_returns.values,
-                name="Rolling Return",
-                line=dict(color=self.colors['success'], width=2)
-            ),
-            row=2, col=2
-        )
-        
-        # Rolling volatility (12 months)
-        rolling_vol = returns.rolling(window=252).std() * np.sqrt(252) * 100
-        fig.add_trace(
-            go.Scatter(
-                x=rolling_vol.index,
-                y=rolling_vol.values,
-                name="Rolling Volatility",
-                line=dict(color=self.colors['warning'], width=2)
-            ),
-            row=3, col=1
-        )
-        
-        # Returns distribution
-        fig.add_trace(
-            go.Histogram(
-                x=returns * 100,
-                nbinsx=50,
-                name="Returns",
-                marker_color=self.colors['primary'],
-                opacity=0.7
-            ),
-            row=3, col=1
-        )
-        
-        # QQ Plot
-        if len(returns) > 10:
-            qq_data = stats.probplot(returns.dropna(), dist="norm")
+
+        # -----------------------------
+        # Drawdown (row 1, col 2)
+        # -----------------------------
+        for i, col in enumerate(cols):
+            s = returns_df[col].dropna()
+            if s.empty:
+                continue
+            cumulative = (1 + s).cumprod()
+            running_max = cumulative.cummax()
+            drawdown = (cumulative - running_max) / running_max * 100
             fig.add_trace(
                 go.Scatter(
-                    x=qq_data[0][0],
-                    y=qq_data[0][1],
-                    mode='markers',
-                    name="Data",
-                    marker=dict(color=self.colors['secondary'], size=6)
+                    x=drawdown.index,
+                    y=drawdown.values,
+                    name=f"{col} Drawdown" if len(cols) > 1 else "Drawdown",
+                    line=dict(color=palette[i % len(palette)], width=2),
+                    fill='tozeroy' if len(cols) == 1 else None,
+                    opacity=0.85 if len(cols) > 1 else 0.95
                 ),
-                row=3, col=2
+                row=1, col=2
             )
-            
-            # Add theoretical line
-            x_line = np.array([qq_data[0][0][0], qq_data[0][0][-1]])
-            y_line = qq_data[1][0] + qq_data[1][1] * x_line
+
+        if bmk is not None and len(bmk) > 0:
+            bc = (1 + bmk).cumprod()
+            rm = bc.cummax()
+            bdd = (bc - rm) / rm * 100
             fig.add_trace(
                 go.Scatter(
-                    x=x_line,
-                    y=y_line,
-                    mode='lines',
-                    name="Normal",
-                    line=dict(color=self.colors['danger'], width=2, dash='dash')
+                    x=bdd.index,
+                    y=bdd.values,
+                    name="Benchmark Drawdown",
+                    line=dict(color=self.colors.get("gray", "#888888"), width=2, dash='dot'),
+                    opacity=0.9
                 ),
-                row=3, col=2
+                row=1, col=2
             )
-        
+
+        # -----------------------------
+        # Rolling returns (row 2, col 1)
+        # -----------------------------
+        for i, col in enumerate(cols):
+            s = returns_df[col]
+            rolling_returns = s.rolling(window=252, min_periods=60).mean() * 252 * 100
+            fig.add_trace(
+                go.Scatter(
+                    x=rolling_returns.index,
+                    y=rolling_returns.values,
+                    name=f"{col} Rolling Return" if len(cols) > 1 else "Rolling Return",
+                    line=dict(color=palette[i % len(palette)], width=2),
+                    opacity=0.75 if len(cols) > 1 else 0.95
+                ),
+                row=2, col=1
+            )
+
+        if bmk is not None and len(bmk) > 0:
+            brr = bmk.rolling(window=252, min_periods=60).mean() * 252 * 100
+            fig.add_trace(
+                go.Scatter(
+                    x=brr.index,
+                    y=brr.values,
+                    name="Benchmark Rolling Return",
+                    line=dict(color=self.colors.get("gray", "#888888"), width=2, dash='dash')
+                ),
+                row=2, col=1
+            )
+
+        # -----------------------------
+        # Rolling volatility (row 2, col 2)
+        # -----------------------------
+        for i, col in enumerate(cols):
+            s = returns_df[col]
+            rolling_vol = s.rolling(window=252, min_periods=60).std() * np.sqrt(252) * 100
+            fig.add_trace(
+                go.Scatter(
+                    x=rolling_vol.index,
+                    y=rolling_vol.values,
+                    name=f"{col} Rolling Vol" if len(cols) > 1 else "Rolling Volatility",
+                    line=dict(color=palette[i % len(palette)], width=2),
+                    opacity=0.75 if len(cols) > 1 else 0.95
+                ),
+                row=2, col=2
+            )
+
+        if bmk is not None and len(bmk) > 0:
+            brv = bmk.rolling(window=252, min_periods=60).std() * np.sqrt(252) * 100
+            fig.add_trace(
+                go.Scatter(
+                    x=brv.index,
+                    y=brv.values,
+                    name="Benchmark Rolling Vol",
+                    line=dict(color=self.colors.get("gray", "#888888"), width=2, dash='dash')
+                ),
+                row=2, col=2
+            )
+
+        # -----------------------------
+        # Returns distribution (row 3, col 1)
+        # -----------------------------
+        for i, col in enumerate(cols):
+            s = (returns_df[col] * 100).dropna()
+            if s.empty:
+                continue
+            fig.add_trace(
+                go.Histogram(
+                    x=s,
+                    nbinsx=50,
+                    name=str(col),
+                    marker_color=palette[i % len(palette)],
+                    opacity=0.45 if len(cols) > 1 else 0.7
+                ),
+                row=3, col=1
+            )
+
+        # -----------------------------
+        # QQ Plot (row 3, col 2) - per series + pooled theoretical line
+        # -----------------------------
+        for i, col in enumerate(cols):
+            vals = returns_df[col].dropna().values
+            if vals is None or len(vals) <= 10:
+                continue
+            try:
+                qq_data = stats.probplot(vals, dist="norm")
+                fig.add_trace(
+                    go.Scatter(
+                        x=qq_data[0][0],
+                        y=qq_data[0][1],
+                        mode='markers',
+                        name=str(col),
+                        marker=dict(size=6),
+                        opacity=0.7 if len(cols) > 1 else 1.0
+                    ),
+                    row=3, col=2
+                )
+            except Exception:
+                continue
+
+        # Add pooled theoretical line (prevents DataFrame probplot shape issues)
+        try:
+            pooled = returns_df.stack().dropna().values if not returns_df.empty else np.array([])
+            if pooled is not None and len(pooled) > 10:
+                qq_all = stats.probplot(pooled, dist="norm")
+                x_line = np.array([qq_all[0][0][0], qq_all[0][0][-1]])
+                y_line = qq_all[1][0] + qq_all[1][1] * x_line
+                fig.add_trace(
+                    go.Scatter(
+                        x=x_line,
+                        y=y_line,
+                        mode='lines',
+                        name="Normal",
+                        line=dict(color=self.colors.get("danger", "#d62728"), width=2, dash='dash')
+                    ),
+                    row=3, col=2
+                )
+        except Exception:
+            pass
+
         # Update layout
         fig.update_layout(
             title=dict(text=title, x=0.5, font=dict(size=24)),
@@ -2309,21 +2388,23 @@ class InstitutionalVisualizer:
             showlegend=True,
             hovermode='x unified'
         )
-        
-        # Update axes titles
+
+        # Update axes titles (consistent with subplot placement)
         fig.update_yaxes(title_text="Cumulative Return", row=1, col=1)
-        fig.update_yaxes(title_text="Drawdown (%)", row=2, col=1)
-        fig.update_yaxes(title_text="Annual Return (%)", row=2, col=2)
-        fig.update_yaxes(title_text="Annual Volatility (%)", row=3, col=1)
+        fig.update_yaxes(title_text="Drawdown (%)", row=1, col=2)
+        fig.update_yaxes(title_text="Annual Return (%)", row=2, col=1)
+        fig.update_yaxes(title_text="Annual Volatility (%)", row=2, col=2)
+        fig.update_yaxes(title_text="Count", row=3, col=1)
         fig.update_yaxes(title_text="Sample Quantiles", row=3, col=2)
+
         fig.update_xaxes(title_text="Date", row=1, col=1)
+        fig.update_xaxes(title_text="Date", row=1, col=2)
         fig.update_xaxes(title_text="Date", row=2, col=1)
         fig.update_xaxes(title_text="Date", row=2, col=2)
         fig.update_xaxes(title_text="Return (%)", row=3, col=1)
         fig.update_xaxes(title_text="Theoretical Quantiles", row=3, col=2)
-        
+
         return fig
-    
     def create_correlation_matrix(
         self,
         corr_matrix: pd.DataFrame,
@@ -2703,7 +2784,7 @@ class InstitutionalVisualizer:
 # =============================================================================
 
 class InstitutionalCommoditiesDashboard:
-    """Institutional commodities dashboard (Streamlit)."""
+    """Main dashboard class with superior architecture"""
     
     def __init__(self):
         # Initialize components
@@ -2812,7 +2893,7 @@ class InstitutionalCommoditiesDashboard:
     
 
     def display_header(self):
-        """Display the app header."""
+        """Display professional institutional header (clean)."""
 
         st.components.v1.html(f"""
         <div style="
@@ -3249,7 +3330,7 @@ class InstitutionalCommoditiesDashboard:
             )
 
     def run(self):
-        """Run the Streamlit app."""
+        """Main app runner (Streamlit entry)."""
         try:
             self.display_header()
 
@@ -3553,6 +3634,7 @@ def _icd_display_relative_risk_fallback(self, cfg):
 
 # Bind missing methods safely (no crashes)
 try:
+    _ = InstitutionalCommoditiesDashboard  # noqa: F401
     if not hasattr(InstitutionalCommoditiesDashboard, "_to_returns_df"):
         InstitutionalCommoditiesDashboard._to_returns_df = _icd__to_returns_df_fallback
     if not hasattr(InstitutionalCommoditiesDashboard, "_display_relative_risk"):
@@ -4009,6 +4091,2337 @@ def run_quantum_sovereign_v14_terminal():
 # 🧭 APPLICATION ROUTER — Mode selector (Institutional v6.x + Quantum Sovereign v14)
 # =============================================================================
 
+
+
+# =============================================================================
+# 🧬 MERGED MODULE: Scientific Commodities Platform v7.2 ULTRA (fixed)
+# =============================================================================
+
+
+# =============================================================================
+# IMPORTS (DO NOT MOVE st.set_page_config BELOW IMPORTS THAT REQUIRE st)
+# =============================================================================
+import os
+import math
+import json
+import time
+import warnings
+import traceback
+import hashlib
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from typing import Dict, Any, Optional, Tuple, List, Union
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+import yfinance as yf
+
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
+
+# Scientific stack
+import scipy  # ✅ REQUIRED because we reference scipy.__version__
+from scipy import stats
+
+# Optional visualization extras
+try:
+    import seaborn as sns  # not required, but kept for compatibility in user environments
+except Exception:
+    sns = None
+
+# =============================================================================
+# STREAMLIT PAGE CONFIG (MUST BE FIRST STREAMLIT COMMAND)
+# =============================================================================
+try:
+    st.set_page_config(
+        page_title="Institutional Commodities Analytics Platform v7.2",
+        page_icon="🏛️",
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
+except Exception:
+    # set_page_config can only be called once; ignore if already set
+    pass
+
+# =============================================================================
+# GLOBAL SETTINGS
+# =============================================================================
+warnings.filterwarnings("ignore")
+os.environ["NUMEXPR_MAX_THREADS"] = os.environ.get("NUMEXPR_MAX_THREADS", "8")
+os.environ["OMP_NUM_THREADS"] = os.environ.get("OMP_NUM_THREADS", "4")
+os.environ["MKL_NUM_THREADS"] = os.environ.get("MKL_NUM_THREADS", "4")
+
+# =============================================================================
+# STYLE (INSTITUTIONAL UI)
+# =============================================================================
+def _inject_css() -> None:
+    css = """
+    <style>
+    :root{
+        --bg:#0b1220;
+        --card:#111a2e;
+        --card2:#0f172a;
+        --stroke:rgba(255,255,255,0.08);
+        --text:#e5e7eb;
+        --muted:#9ca3af;
+        --accent:#60a5fa;
+        --green:#22c55e;
+        --orange:#f59e0b;
+        --red:#ef4444;
+        --purple:#a78bfa;
+        --cyan:#22d3ee;
+    }
+    .block-container{padding-top:1.2rem;}
+    .institutional-hero{
+        border:1px solid var(--stroke);
+        background: linear-gradient(135deg, rgba(96,165,250,0.18), rgba(167,139,250,0.12));
+        padding: 1.2rem 1.2rem;
+        border-radius: 16px;
+        margin-bottom: 1rem;
+    }
+    .institutional-hero h1{
+        margin:0;
+        color: var(--text);
+        font-size: 1.8rem;
+        letter-spacing: 0.2px;
+    }
+    .institutional-hero p{
+        margin:.3rem 0 0 0;
+        color: var(--muted);
+        font-size: .95rem;
+    }
+    .section-header{
+        display:flex;
+        align-items:flex-end;
+        justify-content:space-between;
+        gap:1rem;
+        border:1px solid var(--stroke);
+        background: rgba(255,255,255,0.02);
+        padding: .8rem 1rem;
+        border-radius: 14px;
+        margin: 0.3rem 0 0.9rem 0;
+    }
+    .section-header h2{
+        margin:0;
+        color: var(--text);
+        font-size:1.2rem;
+    }
+    .section-actions{display:flex; gap:.4rem; flex-wrap:wrap; justify-content:flex-end;}
+    .scientific-badge{
+        display:inline-flex;
+        align-items:center;
+        padding:.25rem .55rem;
+        border-radius:999px;
+        border:1px solid var(--stroke);
+        font-size:.78rem;
+        color: var(--text);
+        background: rgba(255,255,255,0.03);
+        white-space:nowrap;
+    }
+    .scientific-badge.info{border-color:rgba(96,165,250,0.35); background:rgba(96,165,250,0.12);}
+    .scientific-badge.low-risk{border-color:rgba(34,197,94,0.35); background:rgba(34,197,94,0.12);}
+    .scientific-badge.medium-risk{border-color:rgba(245,158,11,0.35); background:rgba(245,158,11,0.12);}
+    .scientific-badge.high-risk{border-color:rgba(239,68,68,0.35); background:rgba(239,68,68,0.12);}
+    .institutional-card{
+        border:1px solid var(--stroke);
+        background: rgba(17,26,46,0.55);
+        padding: 1rem;
+        border-radius: 16px;
+        margin-bottom: 0.8rem;
+    }
+    .metric-title{color:var(--muted); font-size:.85rem; margin-bottom:.2rem;}
+    .metric-value{color:var(--text); font-size:1.6rem; font-weight:700;}
+    .subtle{color:var(--muted);}
+    hr{border-color: rgba(255,255,255,0.08)!important;}
+    </style>
+    """
+    st.markdown(css, unsafe_allow_html=True)
+
+_inject_css()
+
+# =============================================================================
+# DEPENDENCY MANAGER (OPTIONAL MODULES)
+# =============================================================================
+class ScientificDependencyManager:
+    def __init__(self):
+        self._cache: Dict[str, bool] = {}
+
+    def is_available(self, name: str) -> bool:
+        if name in self._cache:
+            return self._cache[name]
+        try:
+            __import__(name)
+            self._cache[name] = True
+        except Exception:
+            self._cache[name] = False
+        return self._cache[name]
+
+sci_dep_manager = ScientificDependencyManager()
+
+# =============================================================================
+# HELPERS
+# =============================================================================
+def _safe_float(x: Any, default: float = 0.0) -> float:
+    try:
+        if x is None:
+            return default
+        if isinstance(x, (float, int, np.floating, np.integer)):
+            if np.isnan(x):
+                return default
+            return float(x)
+        val = float(x)
+        if np.isnan(val):
+            return default
+        return val
+    except Exception:
+        return default
+
+def _annualize_mean(daily_mean: float, trading_days: int = 252) -> float:
+    return daily_mean * trading_days
+
+def _annualize_vol(daily_std: float, trading_days: int = 252) -> float:
+    return daily_std * math.sqrt(trading_days)
+
+def _max_drawdown_from_returns(returns: pd.Series) -> float:
+    if returns is None or returns.dropna().empty:
+        return 0.0
+    eq = (1.0 + returns.fillna(0.0)).cumprod()
+    peak = eq.cummax()
+    dd = (eq / peak) - 1.0
+    return float(dd.min())
+
+def _ewma_vol_annualized(returns: pd.Series, span: int, trading_days: int = 252) -> pd.Series:
+    r = returns.astype(float)
+    ewm_var = (r ** 2).ewm(span=span, adjust=False, min_periods=max(10, int(span * 0.7))).mean()
+    return np.sqrt(ewm_var) * np.sqrt(trading_days)
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+@dataclass
+class ScientificAnalysisConfiguration:
+    lookback_years: int = 5
+    interval: str = "1d"
+    annual_trading_days: int = 252
+    risk_free_rate: float = 0.03  # annual
+
+    correlation_method: str = field(default="pearson")
+    ewma_lambda: float = 0.94
+    ensure_psd_corr: bool = True
+
+    var_confidence: float = 0.95
+    var_horizon_days: int = 1
+    use_student_t_parametric: bool = True
+
+    rolling_beta_window: int = 63
+    tracking_error_window: int = 63
+
+    vol_ratio_green_max: float = 0.35
+    vol_ratio_orange_max: float = 0.55
+
+    te_green_max: float = 0.04
+    te_orange_max: float = 0.08
+
+    relvar_green_max: float = 1.0
+    relvar_orange_max: float = 2.0
+
+# =============================================================================
+# DATA MANAGER
+# =============================================================================
+class ScientificDataManager:
+    def __init__(self, cfg: ScientificAnalysisConfiguration):
+        self.cfg = cfg
+
+    @st.cache_data(show_spinner=False)
+    def fetch_prices(_self, tickers: Tuple[str, ...], start: str, end: str, interval: str) -> pd.DataFrame:
+        try:
+            df = yf.download(
+                list(tickers),
+                start=start,
+                end=end,
+                interval=interval,
+                auto_adjust=True,
+                progress=False,
+                threads=True
+            )
+            if df is None or df.empty:
+                return pd.DataFrame()
+            if isinstance(df.columns, pd.MultiIndex):
+                if "Close" in df.columns.get_level_values(0):
+                    close = df["Close"].copy()
+                else:
+                    close = df.xs("Close", axis=1, level=0, drop_level=False)
+                    if isinstance(close, pd.DataFrame) and close.shape[1] > 0:
+                        close.columns = close.columns.get_level_values(-1)
+                close = close.sort_index()
+                return close
+            if "Close" in df.columns:
+                out = df[["Close"]].copy()
+                out.columns = [tickers[0]]
+                return out
+            return df
+        except Exception:
+            return pd.DataFrame()
+
+    def compute_returns(self, prices: pd.DataFrame) -> pd.DataFrame:
+        if prices is None or prices.empty:
+            return pd.DataFrame()
+        rets = prices.pct_change().replace([np.inf, -np.inf], np.nan)
+        return rets
+
+    def calculate_scientific_features(self, prices: pd.Series) -> pd.DataFrame:
+        if prices is None or prices.dropna().empty:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(index=prices.index)
+        df["Price"] = prices.astype(float)
+        df["Returns"] = df["Price"].pct_change()
+
+        try:
+            if df["Returns"].notna().sum() >= 120:
+                r = df["Returns"].copy()
+
+                df["EWMA_Vol_22"] = _ewma_vol_annualized(r, 22, self.cfg.annual_trading_days) * 100.0
+                df["EWMA_Vol_33"] = _ewma_vol_annualized(r, 33, self.cfg.annual_trading_days) * 100.0
+                df["EWMA_Vol_99"] = _ewma_vol_annualized(r, 99, self.cfg.annual_trading_days) * 100.0
+
+                denom = (df["EWMA_Vol_33"] + df["EWMA_Vol_99"]) + 1e-12
+                df["EWMA_Vol_Ratio_22_over_33_99"] = df["EWMA_Vol_22"] / denom
+
+                ratio = df["EWMA_Vol_Ratio_22_over_33_99"]
+                bb_n = 20
+                if ratio.notna().sum() >= bb_n:
+                    mid = ratio.rolling(bb_n, min_periods=int(bb_n * 0.8)).mean()
+                    sd = ratio.rolling(bb_n, min_periods=int(bb_n * 0.8)).std()
+                    df["EWMA_Ratio_BB_Mid"] = mid
+                    df["EWMA_Ratio_BB_Upper"] = mid + 2.0 * sd
+                    df["EWMA_Ratio_BB_Lower"] = mid - 2.0 * sd
+        except Exception:
+            pass
+
+        return df
+
+# =============================================================================
+# CORRELATION ENGINE
+# =============================================================================
+class ScientificCorrelationEngine:
+    def __init__(self, cfg: ScientificAnalysisConfiguration):
+        self.cfg = cfg
+
+    def _calculate_ewma_cov(self, data: pd.DataFrame, lam: float) -> np.ndarray:
+        X = data.dropna().values
+        if X.shape[0] < 5:
+            return np.cov(data.dropna().values, rowvar=False)
+        n = X.shape[0]
+        w = np.array([(1 - lam) * (lam ** (n - 1 - i)) for i in range(n)], dtype=float)
+        w = w / (w.sum() + 1e-12)
+        mean = np.average(X, axis=0, weights=w)
+        Xc = X - mean
+        cov = (Xc.T * w) @ Xc
+        return cov
+
+    def _cov_to_corr(self, cov: np.ndarray, cols: List[str]) -> pd.DataFrame:
+        d = np.sqrt(np.diag(cov))
+        denom = np.outer(d, d) + 1e-12
+        corr = cov / denom
+        corr = np.clip(corr, -0.9999, 0.9999)
+        np.fill_diagonal(corr, 1.0)
+        return pd.DataFrame(corr, index=cols, columns=cols)
+
+    def _calculate_ledoit_wolf_correlation(self, data: pd.DataFrame) -> pd.DataFrame:
+        if not sci_dep_manager.is_available("sklearn"):
+            st.warning("Ledoit-Wolf requires scikit-learn. Falling back to Pearson correlation.")
+            return data.corr(method="pearson")
+        try:
+            from sklearn.covariance import LedoitWolf
+            X = data.dropna().values
+            if X.shape[0] < 30:
+                return data.corr(method="pearson")
+            lw = LedoitWolf().fit(X)
+            cov = lw.covariance_
+            return self._cov_to_corr(cov, list(data.columns))
+        except Exception as e:
+            st.warning(f"Ledoit-Wolf correlation failed: {e}. Falling back to Pearson.")
+            return data.corr(method="pearson")
+
+    def _calculate_correlation_method(self, data: pd.DataFrame, method: str) -> pd.DataFrame:
+        m = (method or "pearson").lower().strip()
+        if m in ("pearson", "spearman", "kendall"):
+            return data.corr(method=m)
+        if m == "ewma":
+            cov = self._calculate_ewma_cov(data, self.cfg.ewma_lambda)
+            return self._cov_to_corr(cov, list(data.columns))
+        if m == "ledoit_wolf":
+            return self._calculate_ledoit_wolf_correlation(data)
+        return data.corr(method="pearson")
+
+    def _higham_nearest_correlation(self, A: Union[np.ndarray, pd.DataFrame], max_iter: int = 100) -> pd.DataFrame:
+        if isinstance(A, pd.DataFrame):
+            idx = A.index
+            cols = A.columns
+            X = A.values.copy()
+        else:
+            X = np.array(A, dtype=float, copy=True)
+            idx = list(range(X.shape[0]))
+            cols = list(range(X.shape[1]))
+
+        X = (X + X.T) / 2.0
+        for _ in range(max_iter):
+            Y = X.copy()
+            np.fill_diagonal(Y, 1.0)
+            try:
+                eigvals, eigvecs = np.linalg.eigh(Y)
+                eigvals = np.maximum(eigvals, 0.0)
+                X_new = eigvecs @ np.diag(eigvals) @ eigvecs.T
+            except Exception:
+                break
+            if np.linalg.norm(X_new - X, "fro") < 1e-10:
+                X = X_new
+                break
+            X = X_new
+
+        np.fill_diagonal(X, 1.0)
+        X = np.clip(X, -0.9999, 0.9999)
+        np.fill_diagonal(X, 1.0)
+        return pd.DataFrame(X, index=idx, columns=cols)
+
+    def ensure_psd(self, corr: pd.DataFrame) -> pd.DataFrame:
+        if corr is None or corr.empty:
+            return pd.DataFrame()
+        corr = corr.copy()
+        corr = (corr + corr.T) / 2.0
+        np.fill_diagonal(corr.values, 1.0)
+        try:
+            eig = np.linalg.eigvalsh(corr.values)
+            if np.min(eig) < -1e-10:
+                corr = self._higham_nearest_correlation(corr)
+        except Exception:
+            corr = self._higham_nearest_correlation(corr)
+        corr = corr.clip(-0.9999, 0.9999)
+        np.fill_diagonal(corr.values, 1.0)
+        return corr
+
+    def compute_correlation(self, returns: pd.DataFrame, method: str) -> pd.DataFrame:
+        if returns is None or returns.empty:
+            return pd.DataFrame()
+        data = returns.dropna(how="all").dropna(axis=1, how="all")
+        if data.shape[1] < 2:
+            return pd.DataFrame()
+        corr = self._calculate_correlation_method(data, method)
+        corr = corr.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        np.fill_diagonal(corr.values, 1.0)
+        if self.cfg.ensure_psd_corr:
+            corr = self.ensure_psd(corr)
+        return corr
+
+# =============================================================================
+# ANALYTICS ENGINE
+# =============================================================================
+class ScientificAnalyticsEngine:
+    def __init__(self, cfg: ScientificAnalysisConfiguration):
+        self.cfg = cfg
+
+    def calculate_scientific_risk_metrics(self, returns: pd.Series, benchmark_returns: Optional[pd.Series] = None) -> Dict[str, Any]:
+        if returns is None or returns.dropna().empty:
+            return {}
+        r = returns.dropna().astype(float).replace([np.inf, -np.inf], np.nan).dropna()
+        if r.empty:
+            return {}
+
+        ann_ret = _annualize_mean(r.mean(), self.cfg.annual_trading_days)
+        ann_vol = _annualize_vol(r.std(ddof=1), self.cfg.annual_trading_days)
+        sharpe = (ann_ret - self.cfg.risk_free_rate) / (ann_vol + 1e-12)
+
+        downside = r[r < 0.0]
+        downside_vol = _annualize_vol(downside.std(ddof=1), self.cfg.annual_trading_days) if len(downside) > 5 else 0.0
+        sortino = (ann_ret - self.cfg.risk_free_rate) / (downside_vol + 1e-12) if downside_vol > 0 else 0.0
+
+        mdd = _max_drawdown_from_returns(r)
+
+        var_h, cvar_h = self._historical_var_cvar(r, self.cfg.var_confidence, self.cfg.var_horizon_days)
+        var_p, cvar_p = self._parametric_var_cvar(r, self.cfg.var_confidence, self.cfg.var_horizon_days, use_t=self.cfg.use_student_t_parametric)
+
+        beta, alpha = self._capm_beta_alpha(r, benchmark_returns)
+        treynor = self._calculate_treynor_ratio(r, benchmark_returns)
+        info_ratio = self._calculate_information_ratio(r, benchmark_returns)
+        tracking_error = self._tracking_error(r, benchmark_returns)
+
+        return {
+            "Ann_Return": float(ann_ret),
+            "Ann_Vol": float(ann_vol),
+            "Sharpe": float(sharpe),
+            "Sortino": float(sortino),
+            "Max_Drawdown": float(mdd),
+            "Hist_VaR": float(var_h),
+            "Hist_CVaR_ES": float(cvar_h),
+            "Param_VaR": float(var_p),
+            "Param_CVaR": float(cvar_p),
+            "Beta": float(beta),
+            "Alpha": float(alpha),
+            "Treynor_Ratio": float(treynor),
+            "Information_Ratio": float(info_ratio),
+            "Tracking_Error": float(tracking_error),
+        }
+
+    def _historical_var_cvar(self, r: pd.Series, confidence: float, horizon: int) -> Tuple[float, float]:
+        rr = r.dropna()
+        if rr.empty:
+            return 0.0, 0.0
+        scaled = rr * math.sqrt(max(1, int(horizon)))
+        q = np.quantile(scaled, 1 - confidence)
+        var = -float(q)
+        tail = scaled[scaled <= q]
+        cvar = -float(tail.mean()) if len(tail) > 0 else var
+        return var, cvar
+
+    def _parametric_var_cvar(self, r: pd.Series, confidence: float, horizon: int, use_t: bool = True) -> Tuple[float, float]:
+        rr = r.dropna()
+        if rr.empty:
+            return 0.0, 0.0
+        mu = rr.mean()
+        sigma = rr.std(ddof=1)
+        if sigma < 1e-12:
+            return 0.0, 0.0
+        h = math.sqrt(max(1, int(horizon)))
+        mu_h = mu * max(1, int(horizon))
+        sigma_h = sigma * h
+
+        if use_t and len(rr) >= 80:
+            try:
+                df, loc, scale = stats.t.fit(rr.values)
+                q = stats.t.ppf(1 - confidence, df, loc=loc, scale=scale)
+                var = -(q * h)
+                tail = rr[rr <= q]
+                if len(tail) > 10:
+                    cvar = -float(tail.mean()) * h
+                else:
+                    cvar = float(var)
+                return float(var), float(cvar)
+            except Exception:
+                pass
+
+        z = stats.norm.ppf(1 - confidence)
+        var = -(mu_h + z * sigma_h)
+        pdf = stats.norm.pdf(z)
+        cvar = -(mu_h - sigma_h * pdf / (1 - confidence))
+        return float(var), float(cvar)
+
+    def _capm_beta_alpha(self, r: pd.Series, bench: Optional[pd.Series]) -> Tuple[float, float]:
+        if bench is None or bench.dropna().empty:
+            return 0.0, 0.0
+        aligned = pd.DataFrame({"a": r, "m": bench}).dropna()
+        if len(aligned) < 30:
+            return 0.0, 0.0
+        cov = aligned["a"].cov(aligned["m"])
+        var_m = aligned["m"].var()
+        beta = cov / var_m if var_m > 1e-12 else 0.0
+        ann_a = _annualize_mean(aligned["a"].mean(), self.cfg.annual_trading_days)
+        ann_m = _annualize_mean(aligned["m"].mean(), self.cfg.annual_trading_days)
+        alpha = (ann_a - self.cfg.risk_free_rate) - beta * (ann_m - self.cfg.risk_free_rate)
+        return float(beta), float(alpha)
+
+    def _calculate_treynor_ratio(self, returns: pd.Series, benchmark_returns: Optional[pd.Series] = None) -> float:
+        if benchmark_returns is None or benchmark_returns.dropna().empty:
+            return 0.0
+        aligned = pd.DataFrame({"a": returns, "m": benchmark_returns}).dropna()
+        if len(aligned) < 30:
+            return 0.0
+        cov = aligned["a"].cov(aligned["m"])
+        var_m = aligned["m"].var()
+        beta = cov / var_m if var_m > 1e-12 else 0.0
+        if abs(beta) < 1e-12:
+            return 0.0
+        ann_ret = _annualize_mean(aligned["a"].mean(), self.cfg.annual_trading_days)
+        return float((ann_ret - self.cfg.risk_free_rate) / beta)
+
+    def _calculate_information_ratio(self, returns: pd.Series, benchmark_returns: Optional[pd.Series] = None) -> float:
+        if benchmark_returns is None or benchmark_returns.dropna().empty:
+            return 0.0
+        aligned = pd.DataFrame({"a": returns, "b": benchmark_returns}).dropna()
+        if len(aligned) < 30:
+            return 0.0
+        active = aligned["a"] - aligned["b"]
+        te = active.std(ddof=1) * math.sqrt(self.cfg.annual_trading_days)
+        if te < 1e-12:
+            return 0.0
+        ann_active = _annualize_mean(active.mean(), self.cfg.annual_trading_days)
+        return float(ann_active / te)
+
+    def _tracking_error(self, returns: pd.Series, benchmark_returns: Optional[pd.Series]) -> float:
+        if benchmark_returns is None or benchmark_returns.dropna().empty:
+            return 0.0
+        aligned = pd.DataFrame({"a": returns, "b": benchmark_returns}).dropna()
+        if len(aligned) < 30:
+            return 0.0
+        active = aligned["a"] - aligned["b"]
+        te = active.std(ddof=1) * math.sqrt(self.cfg.annual_trading_days)
+        return float(te)
+
+    def rolling_beta(self, returns: pd.Series, benchmark_returns: pd.Series, window: int) -> pd.Series:
+        df = pd.DataFrame({"a": returns, "m": benchmark_returns}).dropna()
+        if df.shape[0] < window + 5:
+            return pd.Series(index=returns.index, dtype=float)
+        cov = df["a"].rolling(window).cov(df["m"])
+        var = df["m"].rolling(window).var()
+        beta = cov / (var + 1e-12)
+        return beta.reindex(returns.index)
+
+    def rolling_tracking_error(self, returns: pd.Series, benchmark_returns: pd.Series, window: int) -> pd.Series:
+        df = pd.DataFrame({"a": returns, "b": benchmark_returns}).dropna()
+        if df.shape[0] < window + 5:
+            return pd.Series(index=returns.index, dtype=float)
+        active = df["a"] - df["b"]
+        te = active.rolling(window).std(ddof=1) * math.sqrt(self.cfg.annual_trading_days)
+        return te.reindex(returns.index)
+
+    def relative_var_cvar_es(self, returns: pd.Series, benchmark_returns: pd.Series, confidence: float, horizon: int) -> Dict[str, float]:
+        df = pd.DataFrame({"a": returns, "b": benchmark_returns}).dropna()
+        if df.shape[0] < 60:
+            return {"Rel_Hist_VaR": 0.0, "Rel_Hist_CVaR_ES": 0.0, "Rel_Param_VaR": 0.0, "Rel_Param_CVaR": 0.0}
+        active = df["a"] - df["b"]
+        var_h, cvar_h = self._historical_var_cvar(active, confidence, horizon)
+        var_p, cvar_p = self._parametric_var_cvar(active, confidence, horizon, use_t=self.cfg.use_student_t_parametric)
+        scale = math.sqrt(self.cfg.annual_trading_days)
+        return {
+            "Rel_Hist_VaR": float(var_h * scale * 100.0),
+            "Rel_Hist_CVaR_ES": float(cvar_h * scale * 100.0),
+            "Rel_Param_VaR": float(var_p * scale * 100.0),
+            "Rel_Param_CVaR": float(cvar_p * scale * 100.0),
+        }
+
+# =============================================================================
+# VISUALIZATION ENGINE
+# =============================================================================
+class ScientificVisualizationEngine:
+    def __init__(self, cfg: ScientificAnalysisConfiguration):
+        self.cfg = cfg
+
+    def _create_empty_plot(self, message: str) -> go.Figure:
+        fig = go.Figure()
+        fig.add_annotation(text=message, x=0.5, y=0.5, showarrow=False, font=dict(size=16))
+        fig.update_layout(height=420, template="plotly_white")
+        return fig
+
+    def create_correlation_heatmap(self, corr: pd.DataFrame, title: str) -> go.Figure:
+        if corr is None or corr.empty:
+            return self._create_empty_plot("No correlation data.")
+        fig = px.imshow(
+            corr,
+            text_auto=False,
+            aspect="auto",
+            origin="lower",
+            color_continuous_scale="RdBu",
+            zmin=-1, zmax=1
+        )
+        fig.update_layout(title=dict(text=title, x=0.5), height=720, template="plotly_white")
+        return fig
+
+    def create_volatility_ratio_signal_chart(self, features_df: pd.DataFrame, symbol: str, green_max: float, orange_max: float, title: str) -> go.Figure:
+        if features_df is None or features_df.empty:
+            return self._create_empty_plot("No features data.")
+        if "EWMA_Vol_Ratio_22_over_33_99" not in features_df.columns:
+            return self._create_empty_plot("EWMA ratio missing. Run analysis.")
+        df = features_df.dropna(subset=["EWMA_Vol_Ratio_22_over_33_99"]).copy()
+        if df.empty:
+            return self._create_empty_plot("No valid EWMA ratio data.")
+        ratio = df["EWMA_Vol_Ratio_22_over_33_99"]
+        if "EWMA_Ratio_BB_Upper" not in df.columns or "EWMA_Ratio_BB_Lower" not in df.columns:
+            bb_n = 20
+            mid = ratio.rolling(bb_n, min_periods=int(bb_n * 0.8)).mean()
+            sd = ratio.rolling(bb_n, min_periods=int(bb_n * 0.8)).std()
+            df["EWMA_Ratio_BB_Mid"] = mid
+            df["EWMA_Ratio_BB_Upper"] = mid + 2.0 * sd
+            df["EWMA_Ratio_BB_Lower"] = mid - 2.0 * sd
+
+        fig = go.Figure()
+        ymax = max(1.5, float(ratio.max()) * 1.15) if ratio.notna().any() else 1.5
+
+        fig.add_hrect(y0=0.0, y1=green_max, fillcolor="rgba(34,197,94,0.12)", line_width=0,
+                      annotation_text="GREEN", annotation_position="top left")
+        fig.add_hrect(y0=green_max, y1=orange_max, fillcolor="rgba(245,158,11,0.12)", line_width=0,
+                      annotation_text="ORANGE", annotation_position="top left")
+        fig.add_hrect(y0=orange_max, y1=ymax, fillcolor="rgba(239,68,68,0.12)", line_width=0,
+                      annotation_text="RED", annotation_position="top left")
+
+        fig.add_trace(go.Scatter(x=df.index, y=ratio, name="EWMA Vol Ratio (22 / (33+99))", mode="lines", line=dict(width=2)))
+        fig.add_trace(go.Scatter(x=df.index, y=df["EWMA_Ratio_BB_Upper"], name="BB Upper", mode="lines", line=dict(width=1.5, dash="dash")))
+        fig.add_trace(go.Scatter(x=df.index, y=df["EWMA_Ratio_BB_Lower"], name="BB Lower", mode="lines", line=dict(width=1.5, dash="dash")))
+        fig.add_hline(y=green_max, line_dash="dot", opacity=0.6, annotation_text=f"Green max = {green_max:.2f}")
+        fig.add_hline(y=orange_max, line_dash="dot", opacity=0.6, annotation_text=f"Orange max = {orange_max:.2f}")
+
+        last_x = df.index[-1]
+        last_y = float(ratio.iloc[-1])
+        fig.add_trace(go.Scatter(x=[last_x], y=[last_y], mode="markers", name="Latest", marker=dict(size=10)))
+
+        fig.update_layout(
+            title=dict(text=f"{title} — {symbol}", x=0.5),
+            template="plotly_white",
+            height=650,
+            hovermode="x unified",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.0)
+        )
+        fig.update_yaxes(title_text="Ratio (unitless)", range=[0, ymax])
+        fig.update_xaxes(title_text="Date")
+        return fig
+
+    def create_tracking_error_chart(self, te_series: pd.Series, symbol: str, green_max: float, orange_max: float, title: str = "Tracking Error (Annualized)") -> go.Figure:
+        if te_series is None or te_series.dropna().empty:
+            return self._create_empty_plot("No tracking error series available.")
+        s = te_series.dropna().astype(float)
+        ymax = max(float(s.max()) * 1.25, orange_max * 1.4, 0.10)
+
+        fig = go.Figure()
+        fig.add_hrect(y0=0.0, y1=green_max, fillcolor="rgba(34,197,94,0.12)", line_width=0,
+                      annotation_text="GREEN", annotation_position="top left")
+        fig.add_hrect(y0=green_max, y1=orange_max, fillcolor="rgba(245,158,11,0.12)", line_width=0,
+                      annotation_text="ORANGE", annotation_position="top left")
+        fig.add_hrect(y0=orange_max, y1=ymax, fillcolor="rgba(239,68,68,0.12)", line_width=0,
+                      annotation_text="RED", annotation_position="top left")
+
+        fig.add_trace(go.Scatter(x=s.index, y=s.values, mode="lines", name="Tracking Error", line=dict(width=2)))
+        fig.add_hline(y=green_max, line_dash="dot", opacity=0.6, annotation_text=f"Green max = {green_max:.2%}")
+        fig.add_hline(y=orange_max, line_dash="dot", opacity=0.6, annotation_text=f"Orange max = {orange_max:.2%}")
+        fig.add_trace(go.Scatter(x=[s.index[-1]], y=[float(s.iloc[-1])], mode="markers", name="Latest", marker=dict(size=10)))
+
+        fig.update_layout(
+            title=dict(text=f"{title} — {symbol}", x=0.5),
+            template="plotly_white",
+            height=650,
+            hovermode="x unified",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.0)
+        )
+        fig.update_yaxes(title_text="Tracking Error (decimal)", range=[0, ymax])
+        fig.update_xaxes(title_text="Date")
+        return fig
+
+    def create_rolling_beta_chart(self, beta: pd.Series, symbol: str, title: str = "Rolling Beta") -> go.Figure:
+        if beta is None or beta.dropna().empty:
+            return self._create_empty_plot("No rolling beta available.")
+        s = beta.dropna().astype(float)
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=s.index, y=s.values, mode="lines", name="Rolling Beta", line=dict(width=2)))
+        fig.add_trace(go.Scatter(x=[s.index[-1]], y=[float(s.iloc[-1])], mode="markers", name="Latest", marker=dict(size=10)))
+        fig.add_hline(y=1.0, line_dash="dot", opacity=0.6, annotation_text="Beta = 1.0")
+        fig.update_layout(
+            title=dict(text=f"{title} — {symbol}", x=0.5),
+            template="plotly_white",
+            height=650,
+            hovermode="x unified",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.0)
+        )
+        fig.update_yaxes(title_text="Beta")
+        fig.update_xaxes(title_text="Date")
+        return fig
+
+    def create_relative_risk_chart(self, rel_risk_df: pd.DataFrame, symbol: str, green_max: float, orange_max: float, title: str = "Relative Risk vs Benchmark") -> go.Figure:
+        if rel_risk_df is None or rel_risk_df.empty:
+            return self._create_empty_plot("No relative risk history available.")
+        df = rel_risk_df.dropna(how="all").copy()
+        if df.empty:
+            return self._create_empty_plot("No valid relative risk values.")
+        series_candidates = [c for c in ["Rel_Hist_VaR", "Rel_Hist_CVaR_ES", "Rel_Param_VaR", "Rel_Param_CVaR"] if c in df.columns]
+        if not series_candidates:
+            return self._create_empty_plot("Relative risk columns missing.")
+        primary = series_candidates[0]
+        s = df[primary].dropna()
+        ymax = max(float(s.max()) * 1.25, orange_max * 1.4, 3.0)
+
+        fig = go.Figure()
+        fig.add_hrect(y0=0.0, y1=green_max, fillcolor="rgba(34,197,94,0.12)", line_width=0,
+                      annotation_text="GREEN", annotation_position="top left")
+        fig.add_hrect(y0=green_max, y1=orange_max, fillcolor="rgba(245,158,11,0.12)", line_width=0,
+                      annotation_text="ORANGE", annotation_position="top left")
+        fig.add_hrect(y0=orange_max, y1=ymax, fillcolor="rgba(239,68,68,0.12)", line_width=0,
+                      annotation_text="RED", annotation_position="top left")
+
+        for c in series_candidates:
+            fig.add_trace(go.Scatter(
+                x=df.index, y=df[c], mode="lines",
+                name=c.replace("_", " "),
+                line=dict(width=2 if c == primary else 1.5, dash="solid" if c == primary else "dash")
+            ))
+        fig.add_hline(y=green_max, line_dash="dot", opacity=0.6, annotation_text=f"Green max = {green_max:.2f}%")
+        fig.add_hline(y=orange_max, line_dash="dot", opacity=0.6, annotation_text=f"Orange max = {orange_max:.2f}%")
+        last = df[primary].dropna()
+        if not last.empty:
+            fig.add_trace(go.Scatter(x=[last.index[-1]], y=[float(last.iloc[-1])], mode="markers", name="Latest (primary)", marker=dict(size=10)))
+
+        fig.update_layout(
+            title=dict(text=f"{title} — {symbol}", x=0.5),
+            template="plotly_white",
+            height=650,
+            hovermode="x unified",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.0)
+        )
+        fig.update_yaxes(title_text="Relative Risk (annualized %, proxy)", range=[0, ymax])
+        fig.update_xaxes(title_text="Date")
+        return fig
+
+# =============================================================================
+# MAIN PLATFORM
+# =============================================================================
+class ScientificCommoditiesPlatform:
+    def __init__(self):
+        self.cfg = ScientificAnalysisConfiguration()
+        self.data_manager = ScientificDataManager(self.cfg)
+        self.corr_engine = ScientificCorrelationEngine(self.cfg)
+        self.analytics = ScientificAnalyticsEngine(self.cfg)
+        self.viz = ScientificVisualizationEngine(self.cfg)
+
+        if "selected_assets" not in st.session_state:
+            st.session_state.selected_assets = ["GC=F", "SI=F", "CL=F", "HG=F"]
+        if "selected_benchmarks" not in st.session_state:
+            st.session_state.selected_benchmarks = ["^GSPC"]
+        if "sc_results" not in st.session_state:
+            st.session_state.sc_results = {}
+
+        if "vol_ratio_thresholds" not in st.session_state:
+            st.session_state.vol_ratio_thresholds = {"green_max": self.cfg.vol_ratio_green_max, "orange_max": self.cfg.vol_ratio_orange_max}
+        if "te_thresholds" not in st.session_state:
+            st.session_state.te_thresholds = {"green_max": self.cfg.te_green_max, "orange_max": self.cfg.te_orange_max}
+        if "relrisk_thresholds" not in st.session_state:
+            st.session_state.relrisk_thresholds = {"green_max": self.cfg.relvar_green_max, "orange_max": self.cfg.relvar_orange_max}
+
+    def render_sidebar(self):
+        st.sidebar.markdown("## ⚙️ Configuration")
+
+        st.sidebar.markdown("### 📌 Asset Universe")
+        default_assets = st.session_state.selected_assets
+        assets = st.sidebar.multiselect(
+            "Assets (tickers)",
+            options=[
+                "GC=F", "SI=F", "CL=F", "NG=F", "HG=F", "PL=F", "PA=F",
+                "ZW=F", "ZC=F", "ZS=F", "KC=F", "CC=F",
+                "^BCOM", "DX-Y.NYB"
+            ],
+            default=default_assets,
+            help="Commodities futures (Yahoo tickers). Add/remove as needed.",
+            key="assets_multiselect"
+        )
+        if len(assets) == 0:
+            assets = default_assets
+        st.session_state.selected_assets = assets
+
+        st.sidebar.markdown("### 🧭 Benchmark")
+        bench = st.sidebar.selectbox(
+            "Benchmark (market proxy for Beta/Treynor/IR/TE/Relative Risk)",
+            options=["^GSPC", "^NDX", "DXY", "XU100.IS", "^BSESN", "^N225"],
+            index=0,
+            key="benchmark_select"
+        )
+        st.session_state.selected_benchmarks = [bench]
+
+        st.sidebar.markdown("### 🗓️ Time Range")
+        lookback_years = st.sidebar.slider("Lookback Years", 1, 15, int(self.cfg.lookback_years), 1, key="lookback_years")
+        self.cfg.lookback_years = lookback_years
+
+        st.sidebar.markdown("### 🔗 Correlation Controls")
+        corr_method = st.sidebar.selectbox(
+            "Correlation Method",
+            options=["pearson", "spearman", "kendall", "ewma", "ledoit_wolf"],
+            index=0,
+            help="ledoit_wolf requires scikit-learn. ewma uses decay lambda.",
+            key="corr_method"
+        )
+        self.cfg.correlation_method = corr_method
+        self.cfg.ensure_psd_corr = st.sidebar.checkbox("Force PSD correlation", value=True, key="psd_corr")
+        if corr_method == "ewma":
+            self.cfg.ewma_lambda = st.sidebar.slider("EWMA Lambda (decay)", 0.80, 0.99, float(self.cfg.ewma_lambda), 0.01, key="ewma_lambda")
+
+        st.sidebar.markdown("### 📉 VaR / CVaR / ES")
+        self.cfg.var_confidence = st.sidebar.slider("Confidence Level", 0.90, 0.99, float(self.cfg.var_confidence), 0.01, key="var_conf")
+        self.cfg.var_horizon_days = st.sidebar.slider("Horizon (days)", 1, 20, int(self.cfg.var_horizon_days), 1, key="var_hor")
+        self.cfg.use_student_t_parametric = st.sidebar.checkbox("Student-t Parametric VaR", value=True, key="use_t")
+
+        st.sidebar.markdown("### 🧮 Rolling Windows")
+        self.cfg.rolling_beta_window = st.sidebar.slider("Rolling Beta Window (days)", 20, 252, int(self.cfg.rolling_beta_window), 1, key="beta_win")
+        self.cfg.tracking_error_window = st.sidebar.slider("Tracking Error Window (days)", 20, 252, int(self.cfg.tracking_error_window), 1, key="te_win")
+
+        st.sidebar.markdown("---")
+        st.sidebar.markdown("### 🟢🟠🔴 Vol Ratio Risk Bands")
+        gmax = st.sidebar.slider("Green max threshold (Ratio)", 0.10, 1.00, float(st.session_state.vol_ratio_thresholds.get("green_max", 0.35)), 0.01, key="vr_green")
+        omax = st.sidebar.slider("Orange max threshold (Ratio)", min(1.50, gmax + 0.01), 1.50, max(float(st.session_state.vol_ratio_thresholds.get("orange_max", 0.55)), gmax + 0.01), 0.01, key="vr_orange")
+        st.session_state.vol_ratio_thresholds = {"green_max": gmax, "orange_max": omax}
+
+        st.sidebar.markdown("### 🟢🟠🔴 Tracking Error Bands (Annualized)")
+        tg = st.sidebar.slider("Green max (TE)", 0.01, 0.20, float(st.session_state.te_thresholds.get("green_max", 0.04)), 0.005, key="te_green")
+        to = st.sidebar.slider("Orange max (TE)", min(0.30, tg + 0.005), 0.30, max(float(st.session_state.te_thresholds.get("orange_max", 0.08)), tg + 0.005), 0.005, key="te_orange")
+        st.session_state.te_thresholds = {"green_max": tg, "orange_max": to}
+
+        st.sidebar.markdown("### 🟢🟠🔴 Relative Risk Bands (Annualized %)")
+        rg = st.sidebar.slider("Green max (Relative risk %)", 0.25, 5.0, float(st.session_state.relrisk_thresholds.get("green_max", 1.0)), 0.05, key="rr_green")
+        ro = st.sidebar.slider("Orange max (Relative risk %)", min(10.0, rg + 0.05), 10.0, max(float(st.session_state.relrisk_thresholds.get("orange_max", 2.0)), rg + 0.05), 0.05, key="rr_orange")
+        st.session_state.relrisk_thresholds = {"green_max": rg, "orange_max": ro}
+
+        st.sidebar.markdown("---")
+        st.sidebar.markdown("### ▶️ Execute")
+        run = st.sidebar.button("Run Scientific Analysis", key="run_analysis_btn")
+        return run
+
+    def run_scientific_analysis(self):
+        assets = st.session_state.selected_assets
+        bench = st.session_state.selected_benchmarks[0] if st.session_state.selected_benchmarks else "^GSPC"
+        tickers = list(dict.fromkeys(list(assets) + [bench]))
+
+        end = datetime.utcnow().date()
+        start = end - timedelta(days=int(self.cfg.lookback_years * 365.25))
+
+        prices = self.data_manager.fetch_prices(tuple(tickers), start=str(start), end=str(end), interval=self.cfg.interval)
+        if prices is None or prices.empty:
+            st.error("❌ No data downloaded. Please check tickers / internet / Yahoo availability.")
+            return
+
+        returns = self.data_manager.compute_returns(prices)
+
+        bench_ret = None
+        if bench in returns.columns:
+            bench_ret = returns[bench].dropna()
+
+        features: Dict[str, pd.DataFrame] = {}
+        metrics: Dict[str, Dict[str, Any]] = {}
+        rolling_beta: Dict[str, pd.Series] = {}
+        rolling_te: Dict[str, pd.Series] = {}
+        relrisk_hist: Dict[str, pd.DataFrame] = {}
+
+        for a in assets:
+            if a not in prices.columns:
+                continue
+            ser = prices[a].dropna()
+            feat = self.data_manager.calculate_scientific_features(ser)
+            features[a] = feat
+
+            r = returns[a].dropna() if a in returns.columns else pd.Series(dtype=float)
+            metrics[a] = self.analytics.calculate_scientific_risk_metrics(r, benchmark_returns=bench_ret)
+
+            if bench_ret is not None and not bench_ret.empty and not r.empty:
+                rolling_beta[a] = self.analytics.rolling_beta(r, bench_ret, window=self.cfg.rolling_beta_window)
+                rolling_te[a] = self.analytics.rolling_tracking_error(r, bench_ret, window=self.cfg.tracking_error_window)
+
+                win = max(120, int(self.cfg.tracking_error_window))
+                df_ab = pd.DataFrame({"a": r, "b": bench_ret}).dropna()
+                if df_ab.shape[0] >= win + 10:
+                    rr_rows, idx = [], []
+                    for i in range(win, df_ab.shape[0]):
+                        sub = df_ab.iloc[i - win:i]
+                        rr_rows.append(self.analytics.relative_var_cvar_es(sub["a"], sub["b"], self.cfg.var_confidence, self.cfg.var_horizon_days))
+                        idx.append(sub.index[-1])
+                    relrisk_hist[a] = pd.DataFrame(rr_rows, index=pd.Index(idx, name="Date"))
+                else:
+                    relrisk_hist[a] = pd.DataFrame()
+
+        corr_in = returns[assets].dropna(how="all")
+        corr = self.corr_engine.compute_correlation(corr_in, method=self.cfg.correlation_method)
+
+        st.session_state.sc_results = {
+            "prices": prices,
+            "returns": returns,
+            "benchmark": bench,
+            "benchmark_returns": bench_ret,
+            "features": features,
+            "metrics": metrics,
+            "corr": corr,
+            "rolling_beta": rolling_beta,
+            "rolling_te": rolling_te,
+            "relrisk_hist": relrisk_hist,
+            "config_snapshot": dict(self.cfg.__dict__),
+            "timestamp": datetime.utcnow().isoformat()
+        }
+
+    def render(self):
+        st.markdown(
+            """
+            <div class="institutional-hero">
+              <h1>🏛️ Institutional Commodities Analytics Platform <span class="subtle">v7.2</span></h1>
+              <p>Robust correlations • Institutional risk metrics • EWMA volatility risk signal • Tracking Error • Rolling Beta • Relative VaR/CVaR/ES</p>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+        run_clicked = self.render_sidebar()
+        if run_clicked:
+            with st.spinner("Running scientific analysis..."):
+                try:
+                    self.run_scientific_analysis()
+                    st.success("✅ Analysis complete.")
+                except Exception as e:
+                    st.error(f"Analysis failed: {e}")
+                    st.code(traceback.format_exc())
+
+        tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+            "📊 Overview",
+            "📈 Risk Analytics",
+            "🧭 EWMA Vol Ratio Signal",
+            "🔗 Correlation Analysis",
+            "🎯 Tracking Error",
+            "🧷 Rolling Beta",
+            "⚖️ Relative VaR/CVaR/ES"
+        ])
+
+        with tab1:
+            self.render_overview()
+        with tab2:
+            self.render_risk_analytics()
+        with tab3:
+            self.render_vol_ratio_signal()
+        with tab4:
+            self.render_correlation_analysis()
+        with tab5:
+            self.render_tracking_error()
+        with tab6:
+            self.render_rolling_beta()
+        with tab7:
+            self.render_relative_risk()
+
+        st.markdown("---")
+        self.render_data_validation()
+
+    def render_overview(self):
+        st.markdown(
+            """
+            <div class="section-header">
+                <h2>📊 Overview</h2>
+                <div class="section-actions">
+                    <span class="scientific-badge info">v7.2 Ultra</span>
+                    <span class="scientific-badge">SciPy: {}</span>
+                    <span class="scientific-badge">Plotly</span>
+                </div>
+            </div>
+            """.format(scipy.__version__),
+            unsafe_allow_html=True
+        )
+
+        res = st.session_state.get("sc_results", {})
+        if not res:
+            st.info("Run analysis from the sidebar to populate metrics, correlation, and signal tabs.")
+            return
+
+        prices: pd.DataFrame = res.get("prices", pd.DataFrame())
+        returns: pd.DataFrame = res.get("returns", pd.DataFrame())
+        bench = res.get("benchmark", "")
+
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.markdown(f"""
+            <div class="institutional-card">
+                <div class="metric-title">Assets Selected</div>
+                <div class="metric-value">{len(st.session_state.selected_assets)}</div>
+                <div class="subtle">{", ".join(st.session_state.selected_assets[:4])}{("..." if len(st.session_state.selected_assets)>4 else "")}</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        with c2:
+            st.markdown(f"""
+            <div class="institutional-card">
+                <div class="metric-title">Benchmark</div>
+                <div class="metric-value">{bench}</div>
+                <div class="subtle">Used for Beta/Treynor/IR/TE/Relative Risk</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        with c3:
+            nobs = int(prices.shape[0]) if prices is not None else 0
+            st.markdown(f"""
+            <div class="institutional-card">
+                <div class="metric-title">Data Points</div>
+                <div class="metric-value">{nobs}</div>
+                <div class="subtle">{res.get("timestamp","")[:19]} UTC</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        with c4:
+            st.markdown(f"""
+            <div class="institutional-card">
+                <div class="metric-title">Correlation Method</div>
+                <div class="metric-value">{self.cfg.correlation_method}</div>
+                <div class="subtle">PSD enforced: {self.cfg.ensure_psd_corr}</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        st.markdown("### Price Snapshot")
+        if prices is not None and not prices.empty:
+            st.line_chart(prices[st.session_state.selected_assets].dropna(how="all"))
+        else:
+            st.warning("No prices to display.")
+
+        st.markdown("### Returns Snapshot (last 250)")
+        if returns is not None and not returns.empty:
+            st.dataframe(returns[st.session_state.selected_assets].tail(250), use_container_width=True)
+        else:
+            st.warning("No returns to display.")
+
+    def render_risk_analytics(self):
+        st.markdown(
+            """
+            <div class="section-header">
+                <h2>📈 Risk Analytics</h2>
+                <div class="section-actions">
+                    <span class="scientific-badge info">Sharpe • Sortino</span>
+                    <span class="scientific-badge medium-risk">VaR/CVaR/ES</span>
+                    <span class="scientific-badge">Treynor • IR (real benchmark)</span>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+        res = st.session_state.get("sc_results", {})
+        if not res:
+            st.info("Run analysis first.")
+            return
+
+        metrics: Dict[str, Dict[str, Any]] = res.get("metrics", {})
+        if not metrics:
+            st.warning("No metrics computed.")
+            return
+
+        df = pd.DataFrame(metrics).T
+        for c in ["Ann_Return", "Ann_Vol", "Hist_VaR", "Hist_CVaR_ES", "Param_VaR", "Param_CVaR", "Tracking_Error"]:
+            if c in df.columns:
+                df[c] = df[c] * 100.0 if c in ["Ann_Return", "Ann_Vol"] else df[c] * 100.0
+
+        st.dataframe(df.sort_index(), use_container_width=True)
+
+        if "Sharpe" in df.columns:
+            st.markdown("### Sharpe Comparison")
+            fig = px.bar(df.reset_index().rename(columns={"index": "Asset"}), x="Asset", y="Sharpe")
+            fig.update_layout(height=420, template="plotly_white")
+            st.plotly_chart(fig, use_container_width=True)
+
+    def render_vol_ratio_signal(self):
+        res = st.session_state.get("sc_results", {})
+        if not res:
+            st.info("Run analysis first.")
+            return
+
+        st.markdown(
+            """
+            <div class="section-header">
+                <h2>🧭 EWMA Volatility Ratio Signal</h2>
+                <div class="section-actions">
+                    <span class="scientific-badge info">(EWMA22)/(EWMA33+EWMA99)</span>
+                    <span class="scientific-badge medium-risk">Bollinger Bands</span>
+                    <span class="scientific-badge high-risk">Risk Zones</span>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+        features: Dict[str, pd.DataFrame] = res.get("features", {})
+        symbols = list(features.keys())
+        if not symbols:
+            st.warning("No features available.")
+            return
+
+        symbol = st.selectbox("Select Asset for Signal", options=symbols, index=0, key="vol_ratio_symbol")
+        df = features.get(symbol, pd.DataFrame())
+        if df is None or df.empty:
+            st.warning("No data for selected asset.")
+            return
+
+        thr = st.session_state.get("vol_ratio_thresholds", {"green_max": 0.35, "orange_max": 0.55})
+        green_max = float(thr.get("green_max", 0.35))
+        orange_max = float(thr.get("orange_max", 0.55))
+
+        if "EWMA_Vol_Ratio_22_over_33_99" in df.columns and df["EWMA_Vol_Ratio_22_over_33_99"].dropna().shape[0] > 0:
+            last_val = float(df["EWMA_Vol_Ratio_22_over_33_99"].dropna().iloc[-1])
+            if last_val <= green_max:
+                zone, badge = "GREEN", "low-risk"
+            elif last_val <= orange_max:
+                zone, badge = "ORANGE", "medium-risk"
+            else:
+                zone, badge = "RED", "high-risk"
+
+            st.markdown(f"""
+            <div class="institutional-card">
+                <div class="metric-title">Latest Risk Signal</div>
+                <div style="display:flex; justify-content:space-between; align-items:center; gap:1rem;">
+                    <div>
+                        <div class="metric-value">{last_val:.3f}</div>
+                        <div class="subtle">EWMA Vol Ratio (unitless)</div>
+                    </div>
+                    <div><span class="scientific-badge {badge}">{zone} ZONE</span></div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        fig = self.viz.create_volatility_ratio_signal_chart(df, symbol, green_max, orange_max, "Institutional Risk Signal: EWMA Vol Ratio")
+        st.plotly_chart(fig, use_container_width=True)
+
+        with st.expander("📋 Signal Data (Last 80 rows)", expanded=False):
+            cols = [c for c in ["EWMA_Vol_22", "EWMA_Vol_33", "EWMA_Vol_99",
+                                "EWMA_Vol_Ratio_22_over_33_99",
+                                "EWMA_Ratio_BB_Mid", "EWMA_Ratio_BB_Upper", "EWMA_Ratio_BB_Lower"] if c in df.columns]
+            st.dataframe(df[cols].tail(80), use_container_width=True)
+
+    def render_correlation_analysis(self):
+        res = st.session_state.get("sc_results", {})
+        if not res:
+            st.info("Run analysis first.")
+            return
+        st.markdown(
+            """
+            <div class="section-header">
+                <h2>🔗 Correlation Analysis</h2>
+                <div class="section-actions">
+                    <span class="scientific-badge info">Correct alignment</span>
+                    <span class="scientific-badge">PSD safe</span>
+                    <span class="scientific-badge">Ledoit-Wolf optional</span>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+        corr = res.get("corr", pd.DataFrame())
+        if corr is None or corr.empty:
+            st.warning("No correlation matrix computed.")
+            return
+        fig = self.viz.create_correlation_heatmap(corr, f"Asset Correlations — method: {self.cfg.correlation_method}")
+        st.plotly_chart(fig, use_container_width=True)
+        with st.expander("📋 Correlation Table", expanded=False):
+            st.dataframe(corr.round(4), use_container_width=True)
+
+    def render_tracking_error(self):
+        res = st.session_state.get("sc_results", {})
+        if not res:
+            st.info("Run analysis first.")
+            return
+        st.markdown(
+            """
+            <div class="section-header">
+                <h2>🎯 Tracking Error</h2>
+                <div class="section-actions">
+                    <span class="scientific-badge info">Active risk vs benchmark</span>
+                    <span class="scientific-badge medium-risk">Green/Orange/Red Zones</span>
+                    <span class="scientific-badge">Rolling window</span>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+        te_map: Dict[str, pd.Series] = res.get("rolling_te", {})
+        if not te_map:
+            st.warning("Tracking error series not available (need benchmark + enough data).")
+            return
+        symbols = list(te_map.keys())
+        symbol = st.selectbox("Select Asset", options=symbols, index=0, key="te_symbol")
+        te_series = te_map.get(symbol, pd.Series(dtype=float))
+        thr = st.session_state.get("te_thresholds", {"green_max": 0.04, "orange_max": 0.08})
+        green_max, orange_max = float(thr.get("green_max", 0.04)), float(thr.get("orange_max", 0.08))
+
+        if te_series is not None and te_series.dropna().shape[0] > 0:
+            last = float(te_series.dropna().iloc[-1])
+            if last <= green_max:
+                zone, badge = "GREEN", "low-risk"
+            elif last <= orange_max:
+                zone, badge = "ORANGE", "medium-risk"
+            else:
+                zone, badge = "RED", "high-risk"
+            st.markdown(f"""
+            <div class="institutional-card">
+                <div class="metric-title">Latest Tracking Error (annualized)</div>
+                <div style="display:flex; justify-content:space-between; align-items:center; gap:1rem;">
+                    <div>
+                        <div class="metric-value">{last:.2%}</div>
+                        <div class="subtle">Rolling window: {self.cfg.tracking_error_window} days</div>
+                    </div>
+                    <div><span class="scientific-badge {badge}">{zone} ZONE</span></div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        fig = self.viz.create_tracking_error_chart(te_series, symbol, green_max, orange_max, f"Tracking Error (Annualized) — Window {self.cfg.tracking_error_window}D")
+        st.plotly_chart(fig, use_container_width=True)
+        with st.expander("📋 Tracking Error Data (Last 120 rows)", expanded=False):
+            st.dataframe(te_series.dropna().to_frame("Tracking_Error").tail(120), use_container_width=True)
+
+    def render_rolling_beta(self):
+        res = st.session_state.get("sc_results", {})
+        if not res:
+            st.info("Run analysis first.")
+            return
+        st.markdown(
+            """
+            <div class="section-header">
+                <h2>🧷 Rolling Beta</h2>
+                <div class="section-actions">
+                    <span class="scientific-badge info">Rolling CAPM beta</span>
+                    <span class="scientific-badge">Benchmark-linked</span>
+                    <span class="scientific-badge">Window configurable</span>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+        beta_map: Dict[str, pd.Series] = res.get("rolling_beta", {})
+        if not beta_map:
+            st.warning("Rolling beta not available (need benchmark + enough data).")
+            return
+        symbols = list(beta_map.keys())
+        symbol = st.selectbox("Select Asset", options=symbols, index=0, key="beta_symbol")
+        beta = beta_map.get(symbol, pd.Series(dtype=float))
+        if beta is None or beta.dropna().empty:
+            st.warning("No rolling beta data for this asset.")
+            return
+        last = float(beta.dropna().iloc[-1])
+        st.markdown(f"""
+        <div class="institutional-card">
+            <div class="metric-title">Latest Rolling Beta</div>
+            <div style="display:flex; justify-content:space-between; align-items:center; gap:1rem;">
+                <div>
+                    <div class="metric-value">{last:.3f}</div>
+                    <div class="subtle">Window: {self.cfg.rolling_beta_window} days</div>
+                </div>
+                <div><span class="scientific-badge info">Beta vs {res.get("benchmark","")}</span></div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        fig = self.viz.create_rolling_beta_chart(beta, symbol, f"Rolling Beta — Window {self.cfg.rolling_beta_window}D")
+        st.plotly_chart(fig, use_container_width=True)
+        with st.expander("📋 Beta Data (Last 120 rows)", expanded=False):
+            st.dataframe(beta.dropna().to_frame("Rolling_Beta").tail(120), use_container_width=True)
+
+    def render_relative_risk(self):
+        res = st.session_state.get("sc_results", {})
+        if not res:
+            st.info("Run analysis first.")
+            return
+        st.markdown(
+            """
+            <div class="section-header">
+                <h2>⚖️ Relative VaR / CVaR / ES vs Benchmark</h2>
+                <div class="section-actions">
+                    <span class="scientific-badge info">Active returns risk</span>
+                    <span class="scientific-badge medium-risk">Band zones</span>
+                    <span class="scientific-badge">Rolling history</span>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+        rel_map: Dict[str, pd.DataFrame] = res.get("relrisk_hist", {})
+        if not rel_map:
+            st.warning("Relative risk history not available.")
+            return
+        symbols = [s for s, df in rel_map.items() if df is not None]
+        if not symbols:
+            st.warning("No relative risk frames computed.")
+            return
+        symbol = st.selectbox("Select Asset", options=symbols, index=0, key="rel_symbol")
+        df = rel_map.get(symbol, pd.DataFrame())
+        if df is None or df.empty:
+            st.warning("Not enough data for rolling relative risk. Increase lookback or reduce window.")
+            return
+        thr = st.session_state.get("relrisk_thresholds", {"green_max": 1.0, "orange_max": 2.0})
+        green_max, orange_max = float(thr.get("green_max", 1.0)), float(thr.get("orange_max", 2.0))
+
+        primary = "Rel_Hist_VaR" if "Rel_Hist_VaR" in df.columns else df.columns[0]
+        last = df[primary].dropna()
+        if not last.empty:
+            last_val = float(last.iloc[-1])
+            if last_val <= green_max:
+                zone, badge = "GREEN", "low-risk"
+            elif last_val <= orange_max:
+                zone, badge = "ORANGE", "medium-risk"
+            else:
+                zone, badge = "RED", "high-risk"
+            st.markdown(f"""
+            <div class="institutional-card">
+                <div class="metric-title">Latest Relative Risk (primary: {primary})</div>
+                <div style="display:flex; justify-content:space-between; align-items:center; gap:1rem;">
+                    <div>
+                        <div class="metric-value">{last_val:.2f}%</div>
+                        <div class="subtle">Annualized risk proxy from active returns</div>
+                    </div>
+                    <div><span class="scientific-badge {badge}">{zone} ZONE</span></div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        fig = self.viz.create_relative_risk_chart(df, symbol, green_max, orange_max, f"Relative VaR/CVaR/ES vs {res.get('benchmark','')}")
+        st.plotly_chart(fig, use_container_width=True)
+        with st.expander("📋 Relative Risk Data (Last 120 rows)", expanded=False):
+            st.dataframe(df.tail(120), use_container_width=True)
+
+    def render_data_validation(self):
+        res = st.session_state.get("sc_results", {})
+        st.markdown(
+            """
+            <div class="section-header">
+                <h2>📋 Data & Validation</h2>
+                <div class="section-actions">
+                    <span class="scientific-badge">Quality checks</span>
+                    <span class="scientific-badge">Overlap / NA</span>
+                    <span class="scientific-badge">Diagnostics</span>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+        if not res:
+            st.info("No results yet.")
+            return
+
+        prices: pd.DataFrame = res.get("prices", pd.DataFrame())
+        returns: pd.DataFrame = res.get("returns", pd.DataFrame())
+        assets = st.session_state.selected_assets
+        bench = res.get("benchmark", "")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("#### Missingness (Prices)")
+            if prices is not None and not prices.empty:
+                miss = (prices[assets + [bench]].isna().mean() * 100.0).sort_values(ascending=False)
+                st.dataframe(miss.to_frame("Missing %").round(2), use_container_width=True)
+            else:
+                st.warning("No price data.")
+        with c2:
+            st.markdown("#### Missingness (Returns)")
+            if returns is not None and not returns.empty:
+                miss = (returns[assets + [bench]].isna().mean() * 100.0).sort_values(ascending=False)
+                st.dataframe(miss.to_frame("Missing %").round(2), use_container_width=True)
+            else:
+                st.warning("No return data.")
+
+        st.markdown("#### Notes")
+        st.write(
+            "- Correlations computed after aligning returns and dropping all-NA columns.\n"
+            "- PSD enforcement ensures correlation matrix is numerically valid for risk engines.\n"
+            "- Treynor / Information Ratio / Tracking Error / Rolling Beta are computed vs selected benchmark.\n"
+            "- Relative VaR/CVaR/ES uses active returns (asset - benchmark) and is shown as an annualized % proxy."
+        )
+
+# =============================================================================
+# MAIN
+# =============================================================================
+def main():
+    try:
+        app = ScientificCommoditiesPlatform()
+        app.render()
+    except Exception as e:
+        st.error(f"Fatal error: {e}")
+        st.code(traceback.format_exc())
+
+if __name__ == "__main__":
+    main()
+
+
+# =============================================================================
+# 🔥 ULTRA MERGE PATCHES (v7.3) — Fill missing InstitutionalCommoditiesDashboard tabs
+# - Robust, correct correlation matrix (aligned, PSD enforced)
+# - Optional Ledoit–Wolf shrinkage correlation (scikit-learn; auto-fallback)
+# - EWMA Vol Ratio signal tab (22 / (33+99)) with Bollinger + green/orange/red zones
+# - Rolling Beta tab (vs benchmark)
+# - Risk/Performance tabs (Treynor, Information Ratio, VaR/CVaR/ES) using REAL benchmark
+# - Stress testing, Reporting, Settings, Portfolio Lab (PyPortfolioOpt optional)
+# =============================================================================
+
+def _icd__safe_df(x):
+    import pandas as pd
+    if x is None:
+        return pd.DataFrame()
+    if isinstance(x, pd.DataFrame):
+        return x.copy()
+    if isinstance(x, dict):
+        return pd.DataFrame(x).copy()
+    try:
+        return pd.DataFrame(x).copy()
+    except Exception:
+        return pd.DataFrame()
+
+def _icd__get_returns_df(self):
+    import pandas as pd
+    import streamlit as st
+    to_df = getattr(self, "_to_returns_df", None)
+    if callable(to_df):
+        df = to_df(st.session_state.get("returns_data", None))
+    else:
+        df = _icd__safe_df(st.session_state.get("returns_data", None))
+    if not isinstance(df, pd.DataFrame):
+        df = pd.DataFrame()
+    df = df.sort_index()
+    # Drop all-NA columns; keep numeric only
+    df = df.apply(pd.to_numeric, errors="coerce")
+    df = df.dropna(axis=1, how="all")
+    return df
+
+def _icd__get_benchmark_df(self):
+    import pandas as pd
+    import streamlit as st
+    to_df = getattr(self, "_to_returns_df", None)
+    if callable(to_df):
+        bdf = to_df(st.session_state.get("benchmark_returns_data", None))
+    else:
+        bdf = _icd__safe_df(st.session_state.get("benchmark_returns_data", None))
+    if not isinstance(bdf, pd.DataFrame):
+        bdf = pd.DataFrame()
+    bdf = bdf.sort_index()
+    bdf = bdf.apply(pd.to_numeric, errors="coerce")
+    bdf = bdf.dropna(axis=1, how="all")
+    return bdf
+
+def _icd__pick_benchmark_series(bdf, preferred_col=None):
+    import pandas as pd
+    if bdf is None or not isinstance(bdf, pd.DataFrame) or bdf.empty:
+        return pd.Series(dtype=float), None
+    cols = list(bdf.columns)
+    if preferred_col and preferred_col in cols:
+        c = preferred_col
+    else:
+        c = cols[0]
+    s = pd.to_numeric(bdf[c], errors="coerce").dropna()
+    return s, c
+
+def _icd__equal_weight_portfolio(returns_df, asset_cols):
+    import pandas as pd
+    if returns_df is None or returns_df.empty:
+        return pd.Series(dtype=float)
+    cols = [c for c in asset_cols if c in returns_df.columns]
+    if not cols:
+        return pd.Series(dtype=float)
+    port = returns_df[cols].mean(axis=1)
+    port = pd.to_numeric(port, errors="coerce").dropna()
+    return port
+
+def _icd__compute_correlation_matrix(self, returns_df, method="sample_aligned", ensure_psd=True):
+    """
+    method:
+      - sample_aligned: drop all-NA columns, then drop any row with NA (complete-case), then sample corr
+      - sample_pairwise: pandas pairwise correlation (can be non-PSD)
+      - ledoit_wolf: Ledoit–Wolf covariance -> correlation (requires sklearn); uses complete-case data
+    """
+    import numpy as np
+    import pandas as pd
+
+    df = returns_df.copy()
+    df = df.apply(pd.to_numeric, errors="coerce").dropna(axis=1, how="all")
+
+    if df.shape[1] < 2:
+        return pd.DataFrame()
+
+    if method in ("sample_aligned", "ledoit_wolf"):
+        # strict alignment for correct reporting
+        df_cc = df.dropna(how="any")
+        if df_cc.shape[0] >= 40:
+            df_use = df_cc
+        else:
+            df_use = df
+    else:
+        df_use = df
+
+    corr = None
+
+    if method == "ledoit_wolf":
+        try:
+            from sklearn.covariance import LedoitWolf
+            X = df_use.dropna(how="any").values
+            if X.shape[0] < 40:
+                raise ValueError("Insufficient aligned observations for Ledoit-Wolf.")
+            lw = LedoitWolf().fit(X)
+            cov = np.asarray(lw.covariance_, dtype=float)
+            d = np.sqrt(np.clip(np.diag(cov), 1e-18, None))
+            denom = np.outer(d, d)
+            corr = np.divide(cov, denom, out=np.zeros_like(cov), where=denom > 0)
+        except Exception:
+            # fallback to aligned sample correlation
+            method = "sample_aligned"
+
+    if corr is None:
+        if method == "sample_pairwise":
+            corr = df_use.corr().values
+        else:
+            corr = df_use.dropna(how="any").corr().values
+
+    # sanitize
+    corr = np.asarray(corr, dtype=float)
+    corr = 0.5 * (corr + corr.T)
+    np.fill_diagonal(corr, 1.0)
+    corr = np.clip(corr, -1.0, 1.0)
+
+    # PSD enforcement for downstream risk engines
+    if ensure_psd:
+        try:
+            if hasattr(self, "analytics") and hasattr(self.analytics, "_higham_nearest_correlation"):
+                corr = self.analytics._higham_nearest_correlation(corr, max_iter=100, tol=1e-7, epsilon=1e-12)
+        except Exception:
+            # eigen-clip fallback
+            try:
+                vals, vecs = np.linalg.eigh(corr)
+                vals = np.clip(vals, 1e-10, None)
+                corr = (vecs @ np.diag(vals) @ vecs.T)
+                corr = 0.5 * (corr + corr.T)
+                np.fill_diagonal(corr, 1.0)
+            except Exception:
+                pass
+
+    out = pd.DataFrame(corr, index=list(df_use.columns), columns=list(df_use.columns))
+    return out
+
+def _icd_display_advanced_analytics_fallback(self, cfg):
+    import numpy as np
+    import pandas as pd
+    import streamlit as st
+    import plotly.graph_objects as go
+
+    st.markdown("### 🧠 Advanced Analytics (Institutional)")
+
+    returns_df = _icd__get_returns_df(self)
+    bench_df = _icd__get_benchmark_df(self)
+
+    if returns_df.empty:
+        st.info("Load data from the sidebar to begin.")
+        return
+
+    bench_series, bench_col = _icd__pick_benchmark_series(bench_df)
+
+    # Asset selector (or portfolio)
+    scope = st.radio(
+        "Scope",
+        options=["Equal-Weight Portfolio", "Single Asset"],
+        index=0,
+        horizontal=True,
+        key="adv_scope"
+    )
+
+    if scope.startswith("Equal"):
+        assets = list(returns_df.columns)
+        default_assets = assets[: min(6, len(assets))]
+        sel = st.multiselect("Assets (equal weight)", assets, default=default_assets, key="adv_assets")
+        series = _icd__equal_weight_portfolio(returns_df, sel)
+        label = "EW Portfolio"
+    else:
+        sym = st.selectbox("Select Asset", options=list(returns_df.columns), index=0, key="adv_asset")
+        series = pd.to_numeric(returns_df[sym], errors="coerce").dropna()
+        label = sym
+
+    if series.empty or len(series) < 60:
+        st.warning("Insufficient data for analytics (need ~60+ observations).")
+        return
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("Observations", f"{len(series):,}")
+    with c2:
+        st.metric("Mean (daily)", f"{series.mean():.4%}")
+    with c3:
+        st.metric("Vol (daily)", f"{series.std():.4%}")
+    with c4:
+        st.metric("Skew / Kurt", f"{series.skew():.2f} / {series.kurtosis():.2f}")
+
+    # Performance metrics (incl. Treynor/IR if benchmark available)
+    bm = None
+    if bench_series is not None and not bench_series.empty:
+        idx = series.index.intersection(bench_series.index)
+        if len(idx) >= 60:
+            bm = bench_series.loc[idx]
+            s_aligned = series.loc[idx]
+        else:
+            bm = None
+            s_aligned = series
+    else:
+        s_aligned = series
+
+    try:
+        self.analytics.risk_free_rate = float(getattr(cfg, "risk_free_rate", 0.02))
+        perf = self.analytics.calculate_performance_metrics(s_aligned, benchmark_returns=bm)
+    except Exception:
+        perf = {}
+
+    if perf:
+        perf_tbl = pd.DataFrame([perf]).T
+        perf_tbl.columns = [label]
+        st.dataframe(perf_tbl, use_container_width=True)
+    else:
+        st.info("Performance metrics unavailable (data too short or invalid).")
+
+    # GARCH (optional)
+    st.markdown("#### 📉 Volatility Modeling (GARCH)")
+    garch_on = st.checkbox("Run GARCH(1,1) volatility estimate", value=False, key="adv_garch_on")
+    if garch_on:
+        try:
+            out = self.analytics.garch_analysis(s_aligned, p=1, q=1)
+            if out and out.get("success", False):
+                vol = out.get("conditional_volatility")
+                if isinstance(vol, pd.Series) and not vol.empty:
+                    fig = self.visualizer.create_garch_volatility(vol, title=f"GARCH Volatility — {label}")
+                    st.plotly_chart(fig, use_container_width=True)
+                st.json({k: v for k, v in out.items() if k not in ("conditional_volatility",)}, expanded=False)
+            else:
+                st.warning(out.get("message", "GARCH analysis returned no result."))
+        except Exception as e:
+            st.warning(f"GARCH failed: {e}")
+
+    # Regime detection (optional)
+    st.markdown("#### 🧩 Regime Detection (HMM optional)")
+    reg_on = st.checkbox("Run regime detection (HMM if available)", value=False, key="adv_regime_on")
+    if reg_on:
+        try:
+            reg = self.analytics.detect_regimes(s_aligned, n_states=int(getattr(cfg, "regime_states", 3)))
+            if reg and reg.get("success", False):
+                states = reg.get("states")
+                if isinstance(states, pd.Series) and not states.empty:
+                    fig = self.visualizer.create_regime_chart(states, title=f"Regimes — {label}")
+                    st.plotly_chart(fig, use_container_width=True)
+                st.json({k: v for k, v in reg.items() if k not in ("states",)}, expanded=False)
+            else:
+                st.warning(reg.get("message", "Regime detection returned no result."))
+        except Exception as e:
+            st.warning(f"Regime detection failed: {e}")
+
+def _icd_display_risk_analytics_fallback(self, cfg):
+    import numpy as np
+    import pandas as pd
+    import streamlit as st
+
+    st.markdown("### 🧮 Risk Analytics (Institutional)")
+
+    returns_df = _icd__get_returns_df(self)
+    bench_df = _icd__get_benchmark_df(self)
+    if returns_df.empty:
+        st.info("Load data from the sidebar to begin.")
+        return
+
+    # Correlation settings
+    corr_method = st.selectbox(
+        "Correlation method",
+        options=[
+            "Sample (Aligned, recommended)",
+            "Sample (Pairwise)",
+            "Ledoit–Wolf Shrinkage (if available)"
+        ],
+        index=0,
+        key="risk_corr_method"
+    )
+    method_map = {
+        "Sample (Aligned, recommended)": "sample_aligned",
+        "Sample (Pairwise)": "sample_pairwise",
+        "Ledoit–Wolf Shrinkage (if available)": "ledoit_wolf",
+    }
+    ensure_psd = st.checkbox("Enforce PSD (nearest correlation)", value=True, key="risk_corr_psd")
+
+    corr_df = _icd__compute_correlation_matrix(self, returns_df, method=method_map[corr_method], ensure_psd=ensure_psd)
+    if corr_df is not None and not corr_df.empty:
+        fig = self.visualizer.create_correlation_matrix(corr_df, title="Asset Correlations (Correct & PSD-Safe)")
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.warning("Correlation matrix unavailable (need at least 2 assets with sufficient data).")
+
+    st.markdown("#### VaR / CVaR / ES (Historical • Parametric • Modified)")
+    scope = st.radio(
+        "Scope",
+        options=["Equal-Weight Portfolio", "Single Asset"],
+        index=0,
+        horizontal=True,
+        key="risk_scope"
+    )
+
+    if scope.startswith("Equal"):
+        assets = list(returns_df.columns)
+        default_assets = assets[: min(6, len(assets))]
+        sel = st.multiselect("Assets (equal weight)", assets, default=default_assets, key="risk_assets")
+        series = _icd__equal_weight_portfolio(returns_df, sel)
+        label = "EW Portfolio"
+    else:
+        sym = st.selectbox("Select Asset", options=list(returns_df.columns), index=0, key="risk_asset")
+        series = pd.to_numeric(returns_df[sym], errors="coerce").dropna()
+        label = sym
+
+    if series.empty or len(series) < 120:
+        st.warning("Insufficient data for VaR (need ~120+ observations).")
+        return
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        cl = st.select_slider("Confidence", options=[0.90, 0.95, 0.99], value=0.95, key="risk_cl")
+    with c2:
+        method = st.selectbox("Method", options=["historical", "parametric", "modified"], index=0, key="risk_var_method")
+    with c3:
+        horizon = st.select_slider("Horizon (days)", options=[1, 5, 10, 20], value=1, key="risk_horizon")
+
+    try:
+        out = self.analytics.calculate_var(series, confidence_level=float(cl), method=method) or {}
+    except Exception:
+        out = {}
+
+    if out:
+        # horizon scaling (sqrt) for volatility-dominated measures
+        scale = float(np.sqrt(int(horizon)))
+        var = out.get("VaR")
+        cvar = out.get("CVaR")
+        es = out.get("ES", out.get("CVaR"))
+        # In our engine, VaR is likely a return-quantile (negative). Scale magnitude.
+        def _scale(x):
+            try:
+                return float(x) * scale
+            except Exception:
+                return np.nan
+        var_s = _scale(var)
+        cvar_s = _scale(cvar)
+        es_s = _scale(es)
+
+        m1, m2, m3 = st.columns(3)
+        with m1:
+            st.metric(f"VaR {int(cl*100)}% ({horizon}d)", f"{var_s:.2%}")
+        with m2:
+            st.metric(f"CVaR {int(cl*100)}% ({horizon}d)", f"{cvar_s:.2%}")
+        with m3:
+            st.metric(f"ES {int(cl*100)}% ({horizon}d)", f"{es_s:.2%}")
+
+        st.json({k: v for k, v in out.items() if k not in ("returns",)}, expanded=False)
+    else:
+        st.warning("VaR engine returned no result.")
+
+def _icd_display_ewma_ratio_signal_fallback(self, cfg):
+    import numpy as np
+    import pandas as pd
+    import streamlit as st
+
+    st.markdown("### 🚦 Institutional Signal — EWMA Vol Ratio (22 / (33 + 99))")
+
+    returns_df = _icd__get_returns_df(self)
+    if returns_df.empty:
+        st.info("Load data from the sidebar to begin.")
+        return
+
+    scope = st.radio(
+        "Scope",
+        options=["Equal-Weight Portfolio", "Single Asset"],
+        index=0,
+        horizontal=True,
+        key="sig_scope"
+    )
+
+    if scope.startswith("Equal"):
+        assets = list(returns_df.columns)
+        default_assets = assets[: min(6, len(assets))]
+        sel = st.multiselect("Assets (equal weight)", assets, default=default_assets, key="sig_assets")
+        series = _icd__equal_weight_portfolio(returns_df, sel)
+        label = "EW Portfolio"
+    else:
+        sym = st.selectbox("Select Asset", options=list(returns_df.columns), index=0, key="sig_asset")
+        series = pd.to_numeric(returns_df[sym], errors="coerce").dropna()
+        label = sym
+
+    if series.empty or len(series) < 120:
+        st.warning("Insufficient data for signal (need ~120+ observations).")
+        return
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        span_fast = st.number_input("Fast span", min_value=5, max_value=120, value=22, step=1, key="sig_span_fast")
+    with c2:
+        span_mid = st.number_input("Mid span", min_value=5, max_value=240, value=33, step=1, key="sig_span_mid")
+    with c3:
+        span_slow = st.number_input("Slow span", min_value=10, max_value=500, value=99, step=1, key="sig_span_slow")
+    with c4:
+        annualize = st.checkbox("Annualize vols", value=False, key="sig_annualize")
+
+    bb1, bb2, bb3, bb4 = st.columns(4)
+    with bb1:
+        bb_window = st.number_input("BB window", min_value=5, max_value=120, value=20, step=1, key="sig_bb_window")
+    with bb2:
+        bb_k = st.number_input("BB k", min_value=0.5, max_value=5.0, value=2.0, step=0.1, key="sig_bb_k")
+    with bb3:
+        green_max = st.number_input("Green max", min_value=0.0, max_value=5.0, value=0.35, step=0.01, key="sig_green")
+    with bb4:
+        red_min = st.number_input("Red min", min_value=0.0, max_value=5.0, value=0.55, step=0.01, key="sig_red")
+
+    ewma_df = self.analytics.compute_ewma_volatility_ratio(
+        series,
+        span_fast=int(span_fast),
+        span_mid=int(span_mid),
+        span_slow=int(span_slow),
+        annualize=bool(annualize),
+    )
+
+    if ewma_df is None or ewma_df.empty:
+        st.warning("Signal computation returned no result.")
+        return
+
+    fig = self.visualizer.create_ewma_ratio_signal_chart(
+        ewma_df,
+        title=f"EWMA Vol Ratio Signal — {label}",
+        bb_window=int(bb_window),
+        bb_k=float(bb_k),
+        green_max=float(green_max),
+        red_min=float(red_min),
+        show_bollinger=True,
+        show_threshold_lines=True,
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    latest = float(ewma_df["EWMA_RATIO"].iloc[-1])
+    if latest <= float(green_max):
+        band = "GREEN"
+    elif latest < float(red_min):
+        band = "ORANGE"
+    else:
+        band = "RED"
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.metric("Latest Ratio", f"{latest:.4f}")
+    with c2:
+        st.metric("Risk Band", band)
+
+    with st.expander("Method Notes", expanded=False):
+        st.markdown(
+            """
+- Ratio = EWMA_VOL(FAST) / (EWMA_VOL(MID) + EWMA_VOL(SLOW))
+- Bollinger Bands are computed on the ratio using rolling mean ± k·std.
+- Colored zones reflect institutional thresholds (green/orange/red).
+            """
+        )
+
+def _icd_display_portfolio_fallback(self, cfg):
+    import numpy as np
+    import pandas as pd
+    import streamlit as st
+
+    st.markdown("### 📈 Portfolio (Equal-Weight + Optimizer)")
+
+    returns_df = _icd__get_returns_df(self)
+    if returns_df.empty:
+        st.info("Load data from the sidebar to begin.")
+        return
+
+    assets = list(returns_df.columns)
+    default_assets = assets[: min(8, len(assets))]
+    sel = st.multiselect("Portfolio Assets", assets, default=default_assets, key="port_assets")
+    if not sel:
+        st.warning("Select at least one asset.")
+        return
+
+    port = _icd__equal_weight_portfolio(returns_df, sel)
+    if port.empty or len(port) < 120:
+        st.warning("Insufficient portfolio history (need ~120+ observations).")
+        return
+
+    # Performance chart
+    fig = self.visualizer.create_performance_chart(returns_df[sel], title="Asset Cumulative Performance")
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("#### Optimizer (Internal Engine)")
+    method = st.selectbox("Optimization Method", options=["sharpe", "min_var", "max_ret"], index=0, key="port_opt_method")
+    target = st.number_input("Target annual return (optional)", min_value=0.0, max_value=2.0, value=0.0, step=0.01, key="port_target")
+    target_val = None if target <= 0 else float(target)
+
+    try:
+        out = self.analytics.optimize_portfolio(returns_df[sel], method=method, target_return=target_val)
+    except Exception as e:
+        out = {"success": False, "message": str(e)}
+
+    if out.get("success", False):
+        w = out.get("weights", {})
+        if isinstance(w, dict) and w:
+            w_df = pd.DataFrame({"Weight": w}).sort_values("Weight", ascending=False)
+            st.dataframe(w_df.style.format({"Weight":"{:.2%}"}), use_container_width=True)
+        st.json({k: v for k, v in out.items() if k not in ("weights",)}, expanded=False)
+    else:
+        st.warning(out.get("message", "Optimizer did not return a solution."))
+
+def _icd_display_rolling_beta_fallback(self, cfg):
+    import numpy as np
+    import pandas as pd
+    import streamlit as st
+    import plotly.graph_objects as go
+
+    st.markdown("### β Rolling Beta (vs Benchmark)")
+
+    returns_df = _icd__get_returns_df(self)
+    bench_df = _icd__get_benchmark_df(self)
+
+    if returns_df.empty:
+        st.info("Load data from the sidebar to begin.")
+        return
+
+    bench_series, bench_col = _icd__pick_benchmark_series(bench_df)
+    if bench_series.empty:
+        st.warning("No benchmark returns available. Select a benchmark and reload data.")
+        return
+
+    scope = st.radio(
+        "Scope",
+        options=["Equal-Weight Portfolio", "Single Asset"],
+        index=0,
+        horizontal=True,
+        key="beta_scope"
+    )
+    if scope.startswith("Equal"):
+        assets = list(returns_df.columns)
+        default_assets = assets[: min(6, len(assets))]
+        sel = st.multiselect("Assets (equal weight)", assets, default=default_assets, key="beta_assets")
+        series = _icd__equal_weight_portfolio(returns_df, sel)
+        label = "EW Portfolio"
+    else:
+        sym = st.selectbox("Select Asset", options=list(returns_df.columns), index=0, key="beta_asset")
+        series = pd.to_numeric(returns_df[sym], errors="coerce").dropna()
+        label = sym
+
+    # align
+    idx = series.index.intersection(bench_series.index)
+    if len(idx) < 120:
+        st.warning("Insufficient overlap with benchmark (need ~120+ observations).")
+        return
+
+    series = series.loc[idx]
+    bench = bench_series.loc[idx]
+
+    window = st.select_slider("Rolling window (days)", options=[20, 40, 60, 90, 120, 180, 252], value=int(getattr(cfg, "rolling_window", 60)), key="beta_window")
+
+    # rolling beta via covariance
+    cov = series.rolling(window).cov(bench)
+    var = bench.rolling(window).var()
+    beta = (cov / var).replace([np.inf, -np.inf], np.nan).dropna()
+
+    if beta.empty:
+        st.warning("Beta could not be computed (check data).")
+        return
+
+    latest = float(beta.iloc[-1])
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("Latest Beta", f"{latest:.3f}")
+    with c2:
+        st.metric("Benchmark", bench_col or "Benchmark")
+    with c3:
+        st.metric("Window", f"{window}d")
+
+    # Bands: typical interpretation bands around 1.0
+    green_lo, green_hi = 0.8, 1.2
+    orange_lo, orange_hi = 0.6, 1.4
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=beta.index, y=beta.values, name="Rolling Beta", mode="lines"))
+    # shaded zones
+    x0, x1 = beta.index.min(), beta.index.max()
+    fig.add_shape(type="rect", xref="x", yref="y", x0=x0, x1=x1, y0=green_lo, y1=green_hi,
+                  fillcolor="rgba(34,197,94,0.12)", line=dict(width=0))
+    fig.add_shape(type="rect", xref="x", yref="y", x0=x0, x1=x1, y0=orange_lo, y1=green_lo,
+                  fillcolor="rgba(245,158,11,0.10)", line=dict(width=0))
+    fig.add_shape(type="rect", xref="x", yref="y", x0=x0, x1=x1, y0=green_hi, y1=orange_hi,
+                  fillcolor="rgba(245,158,11,0.10)", line=dict(width=0))
+    fig.add_shape(type="rect", xref="x", yref="y", x0=x0, x1=x1, y0=orange_hi, y1=max(float(beta.max())*1.1, orange_hi+0.2),
+                  fillcolor="rgba(239,68,68,0.08)", line=dict(width=0))
+    fig.add_shape(type="rect", xref="x", yref="y", x0=x0, x1=x1, y0=min(float(beta.min())*0.9, orange_lo-0.2), y1=orange_lo,
+                  fillcolor="rgba(239,68,68,0.08)", line=dict(width=0))
+
+    fig.update_layout(title=f"Rolling Beta — {label} vs {bench_col}", height=520)
+    st.plotly_chart(fig, use_container_width=True)
+
+def _icd_display_stress_testing_fallback(self, cfg):
+    import numpy as np
+    import pandas as pd
+    import streamlit as st
+
+    st.markdown("### 🧯 Stress Testing (Scenario Shocks)")
+
+    returns_df = _icd__get_returns_df(self)
+    if returns_df.empty:
+        st.info("Load data from the sidebar to begin.")
+        return
+
+    scope = st.radio("Scope", options=["Equal-Weight Portfolio", "Single Asset"], index=0, horizontal=True, key="st_scope")
+    if scope.startswith("Equal"):
+        assets = list(returns_df.columns)
+        default_assets = assets[: min(6, len(assets))]
+        sel = st.multiselect("Assets (equal weight)", assets, default=default_assets, key="st_assets")
+        series = _icd__equal_weight_portfolio(returns_df, sel)
+        label = "EW Portfolio"
+    else:
+        sym = st.selectbox("Select Asset", options=list(returns_df.columns), index=0, key="st_asset")
+        series = pd.to_numeric(returns_df[sym], errors="coerce").dropna()
+        label = sym
+
+    if series.empty or len(series) < 120:
+        st.warning("Insufficient history for stress testing (need ~120+ observations).")
+        return
+
+    shock = st.select_slider("Shock (return)", options=[-0.30, -0.20, -0.15, -0.10, -0.05, 0.05, 0.10], value=-0.10, key="st_shock")
+    duration = st.select_slider("Shock duration (days)", options=[1, 5, 10, 20], value=5, key="st_duration")
+
+    try:
+        out = self.analytics.stress_test(series, shock=float(shock), duration=int(duration))
+    except Exception as e:
+        out = {"success": False, "message": str(e)}
+
+    if out and out.get("success", False):
+        st.success(f"Stress test computed for {label}.")
+        st.json({k: v for k, v in out.items() if k not in ("path",)}, expanded=False)
+        path = out.get("path")
+        if isinstance(path, pd.Series) and not path.empty:
+            import plotly.graph_objects as go
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=path.index, y=path.values, mode="lines", name="Simulated Path"))
+            fig.update_layout(title=f"Stress Path — {label}", height=420)
+            st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.warning(out.get("message", "Stress test returned no result."))
+
+def _icd_display_reporting_fallback(self, cfg):
+    import pandas as pd
+    import streamlit as st
+    import numpy as np
+    from io import BytesIO
+
+    st.markdown("### 🧾 Reporting (Exports)")
+
+    returns_df = _icd__get_returns_df(self)
+    bench_df = _icd__get_benchmark_df(self)
+    if returns_df.empty:
+        st.info("Load data from the sidebar to begin.")
+        return
+
+    bench_series, bench_col = _icd__pick_benchmark_series(bench_df)
+
+    # Performance table for all assets
+    rows = []
+    for col in returns_df.columns:
+        s = pd.to_numeric(returns_df[col], errors="coerce").dropna()
+        bm = None
+        if not bench_series.empty:
+            idx = s.index.intersection(bench_series.index)
+            if len(idx) >= 60:
+                bm = bench_series.loc[idx]
+                s_use = s.loc[idx]
+            else:
+                s_use = s
+        else:
+            s_use = s
+        try:
+            m = self.analytics.calculate_performance_metrics(s_use, benchmark_returns=bm)
+        except Exception:
+            m = {}
+        if m:
+            m["asset"] = col
+            rows.append(m)
+
+    if rows:
+        df = pd.DataFrame(rows).set_index("asset")
+        st.dataframe(df, use_container_width=True)
+
+        # CSV download
+        csv = df.to_csv().encode("utf-8")
+        st.download_button("⬇️ Download Metrics CSV", data=csv, file_name="performance_metrics.csv", mime="text/csv", key="rep_csv")
+
+        # Excel download
+        bio = BytesIO()
+        with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+            df.to_excel(writer, sheet_name="metrics")
+        st.download_button("⬇️ Download Metrics Excel", data=bio.getvalue(), file_name="performance_metrics.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="rep_xlsx")
+    else:
+        st.warning("No metrics computed (data too short?).")
+
+    st.markdown("#### QuantStats Report (optional)")
+    qs_on = st.checkbox("Generate QuantStats HTML report (if installed)", value=False, key="rep_qs_on")
+    if qs_on:
+        try:
+            import quantstats as qs
+            # Choose scope
+            scope = st.radio("QS Scope", options=["Equal-Weight Portfolio", "Single Asset"], index=0, horizontal=True, key="rep_qs_scope")
+            if scope.startswith("Equal"):
+                assets = list(returns_df.columns)
+                default_assets = assets[: min(6, len(assets))]
+                sel = st.multiselect("Assets (equal weight)", assets, default=default_assets, key="rep_qs_assets")
+                series = _icd__equal_weight_portfolio(returns_df, sel)
+                label = "EW Portfolio"
+            else:
+                sym = st.selectbox("Select Asset", options=list(returns_df.columns), index=0, key="rep_qs_asset")
+                series = pd.to_numeric(returns_df[sym], errors="coerce").dropna()
+                label = sym
+
+            if series.empty or len(series) < 120:
+                st.warning("Insufficient data for QuantStats report.")
+                return
+
+            html = qs.reports.html(series, output=None, title=f"QuantStats Report — {label}", download_filename=None)
+            st.download_button("⬇️ Download QuantStats HTML", data=html.encode("utf-8"), file_name=f"quantstats_{label}.html",
+                               mime="text/html", key="rep_qs_dl")
+            st.success("Report generated.")
+        except Exception as e:
+            st.warning(f"QuantStats not available or failed: {e}")
+
+def _icd_display_settings_fallback(self, cfg):
+    import streamlit as st
+
+    st.markdown("### ⚙️ Settings & Diagnostics")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.write("**Core Parameters**")
+        cfg.risk_free_rate = st.number_input("Risk-free rate", min_value=0.0, max_value=0.2, value=float(getattr(cfg, "risk_free_rate", 0.02)),
+                                             step=0.001, format="%.3f", key="set_rf")
+        cfg.rolling_window = st.number_input("Default rolling window", min_value=10, max_value=500, value=int(getattr(cfg, "rolling_window", 60)),
+                                             step=1, key="set_rollw")
+        cfg.backtest_window = st.number_input("Backtest window", min_value=50, max_value=2000, value=int(getattr(cfg, "backtest_window", 250)),
+                                              step=10, key="set_btwin")
+    with c2:
+        st.write("**Correlation Policy**")
+        st.selectbox(
+            "Default correlation method",
+            options=["sample_aligned", "sample_pairwise", "ledoit_wolf"],
+            index=0,
+            key="set_corr_method",
+            help="Used by Risk Analytics tab; Ledoit-Wolf requires scikit-learn."
+        )
+        st.checkbox("Default PSD enforcement", value=True, key="set_corr_psd")
+
+    st.write("**Institutional Band Policies**")
+    st.caption("Defaults: Tracking Error <4% green, 4–8% orange, >8% red. EWMA Ratio green<=0.35, red>=0.55.")
+    st.number_input("Tracking Error green threshold", min_value=0.0, max_value=0.5, value=0.04, step=0.005, key="set_te_green")
+    st.number_input("Tracking Error orange threshold", min_value=0.0, max_value=0.8, value=0.08, step=0.005, key="set_te_orange")
+
+    st.markdown("#### Dependency Status")
+    deps = {
+        "arch (GARCH)": "arch",
+        "hmmlearn (HMM regimes)": "hmmlearn",
+        "scikit-learn (Ledoit–Wolf)": "sklearn",
+        "PyPortfolioOpt": "pypfopt",
+        "QuantStats": "quantstats",
+    }
+    status = {}
+    for label, mod in deps.items():
+        try:
+            __import__(mod)
+            status[label] = "✅ available"
+        except Exception:
+            status[label] = "⚠️ missing"
+    st.json(status, expanded=False)
+
+def _icd_display_portfolio_lab_fallback(self, cfg):
+    import numpy as np
+    import pandas as pd
+    import streamlit as st
+
+    st.markdown("### 🧰 Portfolio Lab (PyPortfolioOpt • Optional)")
+    returns_df = _icd__get_returns_df(self)
+    if returns_df.empty:
+        st.info("Load data from the sidebar to begin.")
+        return
+
+    assets = list(returns_df.columns)
+    default_assets = assets[: min(10, len(assets))]
+    sel = st.multiselect("Select assets for optimization", assets, default=default_assets, key="pypf_assets")
+    if len(sel) < 2:
+        st.warning("Select at least 2 assets.")
+        return
+
+    df = returns_df[sel].dropna(how="any")
+    if df.shape[0] < 120:
+        st.warning("Need at least ~120 aligned observations for optimization.")
+        return
+
+    st.info("If PyPortfolioOpt is not installed in your environment, this tab will auto-fallback to the internal optimizer.")
+    use_pypfopt = st.checkbox("Use PyPortfolioOpt (if available)", value=True, key="pypf_use")
+
+    if use_pypfopt:
+        try:
+            from pypfopt import expected_returns, risk_models
+            from pypfopt.efficient_frontier import EfficientFrontier
+            from pypfopt import CLA
+            from pypfopt.hierarchical_portfolio import HRPOpt
+
+            mu = expected_returns.mean_historical_return(df, frequency=int(getattr(cfg, "annual_trading_days", 252)))
+            S = risk_models.sample_cov(df, frequency=int(getattr(cfg, "annual_trading_days", 252)))
+
+            opt_type = st.selectbox(
+                "Optimizer",
+                options=["Max Sharpe", "Min Volatility", "Efficient Risk", "Efficient Return", "CLA (min vol)", "HRP"],
+                index=0,
+                key="pypf_type"
+            )
+
+            if opt_type == "HRP":
+                hrp = HRPOpt(df)
+                w = hrp.optimize()
+                w_df = pd.DataFrame({"Weight": w}).sort_values("Weight", ascending=False)
+                st.dataframe(w_df.style.format({"Weight":"{:.2%}"}), use_container_width=True)
+                perf = hrp.portfolio_performance(verbose=False)
+                st.json({"expected_return": perf[0], "volatility": perf[1], "sharpe": perf[2]}, expanded=False)
+                return
+
+            if opt_type.startswith("CLA"):
+                cla = CLA(mu, S)
+                w = cla.min_volatility()
+                w_df = pd.DataFrame({"Weight": w}).sort_values("Weight", ascending=False)
+                st.dataframe(w_df.style.format({"Weight":"{:.2%}"}), use_container_width=True)
+                perf = cla.portfolio_performance(verbose=False)
+                st.json({"expected_return": perf[0], "volatility": perf[1], "sharpe": perf[2]}, expanded=False)
+                return
+
+            ef = EfficientFrontier(mu, S)
+
+            if opt_type == "Max Sharpe":
+                ef.max_sharpe(risk_free_rate=float(getattr(cfg, "risk_free_rate", 0.02)))
+            elif opt_type == "Min Volatility":
+                ef.min_volatility()
+            elif opt_type == "Efficient Risk":
+                target_risk = st.slider("Target risk (annual vol)", min_value=0.05, max_value=0.80, value=0.20, step=0.01, key="pypf_trisk")
+                ef.efficient_risk(target_volatility=float(target_risk))
+            elif opt_type == "Efficient Return":
+                target_ret = st.slider("Target return (annual)", min_value=-0.10, max_value=1.00, value=0.15, step=0.01, key="pypf_tret")
+                ef.efficient_return(target_return=float(target_ret))
+
+            w = ef.clean_weights()
+            w_df = pd.DataFrame({"Weight": w}).sort_values("Weight", ascending=False)
+            st.dataframe(w_df.style.format({"Weight":"{:.2%}"}), use_container_width=True)
+
+            perf = ef.portfolio_performance(verbose=False, risk_free_rate=float(getattr(cfg, "risk_free_rate", 0.02)))
+            st.json({"expected_return": perf[0], "volatility": perf[1], "sharpe": perf[2]}, expanded=False)
+
+        except Exception as e:
+            st.warning(f"PyPortfolioOpt unavailable or failed ({e}). Falling back to internal optimizer.")
+            use_pypfopt = False
+
+    if not use_pypfopt:
+        method = st.selectbox("Internal optimizer method", options=["sharpe", "min_var", "max_ret"], index=0, key="pypf_int_method")
+        try:
+            out = self.analytics.optimize_portfolio(df, method=method)
+        except Exception as e:
+            out = {"success": False, "message": str(e)}
+        if out.get("success", False):
+            w = out.get("weights", {})
+            w_df = pd.DataFrame({"Weight": w}).sort_values("Weight", ascending=False)
+            st.dataframe(w_df.style.format({"Weight":"{:.2%}"}), use_container_width=True)
+        else:
+            st.warning(out.get("message", "Internal optimizer failed."))
+
+def run_scientific_platform_v7_2_ultra():
+    """Wrapper for merged v7.2 Ultra platform."""
+    try:
+        platform = ScientificCommoditiesPlatform()
+        platform.render()
+    except Exception as e:
+        import streamlit as st
+        st.error(f"Scientific v7.2 platform failed to start: {e}")
+        st.exception(e)
+
+# Bind missing UI methods safely (no AttributeErrors)
+try:
+    _ = InstitutionalCommoditiesDashboard  # noqa: F401
+    _bind = {
+        "_display_advanced_analytics": _icd_display_advanced_analytics_fallback,
+        "_display_risk_analytics": _icd_display_risk_analytics_fallback,
+        "_display_ewma_ratio_signal": _icd_display_ewma_ratio_signal_fallback,
+        "_display_portfolio": _icd_display_portfolio_fallback,
+        "_display_rolling_beta": _icd_display_rolling_beta_fallback,
+        "_display_stress_testing": _icd_display_stress_testing_fallback,
+        "_display_reporting": _icd_display_reporting_fallback,
+        "_display_settings": _icd_display_settings_fallback,
+        "_display_portfolio_lab": _icd_display_portfolio_lab_fallback,
+    }
+    for name, fn in _bind.items():
+        if not hasattr(InstitutionalCommoditiesDashboard, name):
+            setattr(InstitutionalCommoditiesDashboard, name, fn)
+except Exception:
+    pass
+
+
 def _run_app_router():
     import streamlit as st
 
@@ -4033,1593 +6446,6 @@ def _run_app_router():
         except Exception as e:
             st.error(f"Institutional dashboard failed to start: {e}")
             st.exception(e)
-
-
-# =============================================================================
-# ✅ MERGE PATCH: Missing Dashboard Tabs (Advanced/Risk/EWMA/Portfolio/Beta/Relative/Stress/Reporting/Settings/PyPortfolioOpt)
-# - Integrated as *safe binders* to avoid AttributeError while keeping the long single-file layout intact.
-# - Uses existing InstitutionalAnalytics + InstitutionalVisualizer implementations already in this file.
-# =============================================================================
-
-def _icd__get_returns_df(self):
-    """Return returns as a wide DataFrame (robust to dict/Series/DataFrame)."""
-    import numpy as np
-    import pandas as pd
-    import streamlit as st
-    rd = st.session_state.get("returns_data", None)
-    if hasattr(self, "_to_returns_df"):
-        try:
-            df = self._to_returns_df(rd)
-        except Exception:
-            df = None
-    else:
-        df = None
-    if df is None:
-        try:
-            # fallback defined earlier in this file (SAFETY BINDERS section)
-            df = _icd__to_returns_df_fallback(self, rd)
-        except Exception:
-            df = pd.DataFrame()
-    if not isinstance(df, pd.DataFrame):
-        try:
-            df = pd.DataFrame(df)
-        except Exception:
-            df = pd.DataFrame()
-    df = df.replace([np.inf, -np.inf], np.nan).dropna(axis=1, how="all")
-    return df
-
-
-def _icd__get_bench_df():
-    """Return benchmark returns as a wide DataFrame."""
-    import numpy as np
-    import pandas as pd
-    import streamlit as st
-    b = st.session_state.get("benchmark_returns_data", None)
-    if b is None:
-        return pd.DataFrame()
-    if isinstance(b, pd.DataFrame):
-        df = b.copy()
-    elif isinstance(b, dict):
-        cols = {}
-        for k, v in b.items():
-            if v is None:
-                continue
-            if isinstance(v, pd.Series):
-                cols[str(k)] = v
-            elif isinstance(v, pd.DataFrame) and v.shape[1] >= 1:
-                cols[str(k)] = v.iloc[:, 0]
-        df = pd.concat(cols, axis=1) if cols else pd.DataFrame()
-    else:
-        try:
-            df = pd.DataFrame(b)
-        except Exception:
-            df = pd.DataFrame()
-    df = df.replace([np.inf, -np.inf], np.nan).dropna(axis=1, how="all")
-    return df
-
-
-def _display_advanced_analytics(self, config: AnalysisConfiguration):
-    """Display advanced analytics section (GARCH + Regime Detection)."""
-    import pandas as pd
-    import streamlit as st
-
-    st.markdown('<div class="section-header"><h2>🧠 Advanced Analytics</h2></div>', unsafe_allow_html=True)
-
-    if not st.session_state.get("data_loaded", False):
-        st.warning("Please load data first.")
-        return
-
-    returns_df = _icd__get_returns_df(self)
-    if returns_df.empty:
-        st.warning("No returns data available.")
-        return
-
-    # ------------------------------
-    # GARCH Analysis
-    # ------------------------------
-    st.subheader("GARCH Volatility Modeling")
-
-    c1, c2 = st.columns([2, 1])
-    with c1:
-        selected_asset = st.selectbox(
-            "Select Asset for GARCH",
-            options=list(returns_df.columns),
-            key="aa_garch_asset",
-        )
-    with c2:
-        min_obs = st.number_input("Min obs", min_value=60, max_value=1000, value=260, step=10, key="aa_garch_minobs")
-
-    if selected_asset:
-        asset_returns = returns_df[selected_asset].dropna()
-        if len(asset_returns) >= int(min_obs):
-            with st.spinner("Fitting GARCH models..."):
-                # respect configuration ranges when present
-                try:
-                    p_rng = getattr(config, "garch_p_range", (1, 2))
-                    q_rng = getattr(config, "garch_q_range", (1, 2))
-                except Exception:
-                    p_rng, q_rng = (1, 2), (1, 2)
-
-                garch_results = self.analytics.garch_analysis(
-                    asset_returns,
-                    p_range=tuple(p_rng),
-                    q_range=tuple(q_rng),
-                )
-
-            if garch_results and garch_results.get("available", False):
-                best_model = garch_results.get("best_model", {})
-                st.success("GARCH models fitted successfully.")
-
-                m1, m2, m3, m4 = st.columns(4)
-                with m1:
-                    st.metric("Best Model", f"GARCH({best_model.get('p','?')},{best_model.get('q','?')})")
-                with m2:
-                    st.metric("Distribution", f"{best_model.get('distribution','?')}")
-                with m3:
-                    st.metric("AIC", f"{float(best_model.get('aic', float('nan'))):.2f}" if best_model.get("aic") is not None else "N/A")
-                with m4:
-                    st.metric("BIC", f"{float(best_model.get('bic', float('nan'))):.2f}" if best_model.get("bic") is not None else "N/A")
-
-                cond_vol = best_model.get("conditional_volatility", None)
-                if cond_vol is not None:
-                    # Chart 1: existing GARCH visualization (typically returns + volatility overlay, depending on Visualizer)
-                    try:
-                        fig = self.visualizer.create_garch_volatility(asset_returns, cond_vol)
-                        st.plotly_chart(fig, use_container_width=True, key="aa_garch_vol_chart")
-                    except Exception as e:
-                        st.info(f"Volatility plot unavailable: {e}")
-
-                    # Chart 2 (NEW): conditional volatility series as a separate detailed chart
-                    try:
-                        import numpy as np
-                        import pandas as pd
-                        import plotly.graph_objects as go
-
-                        # Normalize conditional volatility to a clean pandas Series aligned to dates
-                        if isinstance(cond_vol, pd.Series):
-                            cond_vol_ser = cond_vol.copy()
-                        elif isinstance(cond_vol, (list, tuple, np.ndarray)):
-                            # Align to the *tail* of the returns index if lengths differ
-                            n = len(cond_vol)
-                            cond_vol_ser = pd.Series(cond_vol, index=asset_returns.index[-n:])
-                        else:
-                            # best effort conversion
-                            cond_vol_ser = pd.Series(cond_vol)
-
-                        cond_vol_ser = cond_vol_ser.dropna()
-                        if not cond_vol_ser.empty:
-                            # Optional smoothing line (20D MA) for better "institutional" readability
-                            ma20 = cond_vol_ser.rolling(20).mean()
-
-                            fig2 = go.Figure()
-                            fig2.add_trace(go.Scatter(
-                                x=cond_vol_ser.index,
-                                y=cond_vol_ser.values,
-                                name="Conditional Volatility",
-                                mode="lines",
-                                line=dict(width=2),
-                            ))
-                            fig2.add_trace(go.Scatter(
-                                x=ma20.index,
-                                y=ma20.values,
-                                name="20D MA",
-                                mode="lines",
-                                line=dict(width=1, dash="dash"),
-                            ))
-
-                            template = getattr(self.visualizer, "template", "plotly_white")
-                            fig2.update_layout(
-                                title=f"GARCH Conditional Volatility (Detailed) — {selected_asset}",
-                                height=460,
-                                template=template,
-                                hovermode="x unified",
-                                xaxis_title="Date",
-                                yaxis_title="σ(t)",
-                                margin=dict(l=10, r=10, t=55, b=10),
-                            )
-
-                            st.plotly_chart(fig2, use_container_width=True, key="aa_garch_condvol_detail")
-
-                            with st.expander("📌 Conditional Volatility (last 30 obs)", expanded=False):
-                                tail_df = pd.DataFrame({"cond_vol": cond_vol_ser.tail(30)})
-                                st.dataframe(tail_df, use_container_width=True)
-                    except Exception as e:
-                        st.info(f"Conditional volatility series chart unavailable: {e}")
-            else:
-                st.warning(garch_results.get("message", "GARCH analysis failed.") if isinstance(garch_results, dict) else "GARCH analysis failed.")
-        else:
-            st.info(f"Need at least {int(min_obs)} observations for robust GARCH estimation.")
-
-    st.divider()
-
-    # ------------------------------
-    # Regime Detection
-    # ------------------------------
-    st.subheader("Market Regime Detection")
-
-    r1, r2, r3 = st.columns([2, 1, 1])
-    with r1:
-        regime_asset = st.selectbox(
-            "Select Asset for Regime Analysis",
-            options=list(returns_df.columns),
-            key="aa_regime_asset",
-        )
-    with r2:
-        n_regimes = st.slider("Number of Regimes", 2, 5, int(getattr(config, "regime_states", 3)), key="aa_n_regimes")
-    with r3:
-        min_obs_reg = st.number_input("Min obs", min_value=120, max_value=5000, value=520, step=20, key="aa_reg_minobs")
-
-    if regime_asset:
-        asset_returns = returns_df[regime_asset].dropna()
-        if len(asset_returns) >= int(min_obs_reg):
-            with st.spinner("Detecting market regimes..."):
-                regime_results = self.analytics.detect_regimes(asset_returns, n_regimes=int(n_regimes))
-
-            if regime_results and regime_results.get("available", False):
-                # Get price data for plotting if available
-                price_series = None
-                try:
-                    ad = st.session_state.get("asset_data", {})
-                    if isinstance(ad, dict) and regime_asset in ad:
-                        dfp = ad[regime_asset]
-                        # robust column naming
-                        for col in ["Adj Close", "Adj_Close", "Close", "Price"]:
-                            if isinstance(dfp, pd.DataFrame) and col in dfp.columns:
-                                price_series = dfp[col].dropna()
-                                break
-                except Exception:
-                    price_series = None
-
-                if price_series is not None and not price_series.empty:
-                    try:
-                        fig = self.visualizer.create_regime_chart(
-                            price_series,
-                            regime_results.get("regimes", None),
-                            regime_results.get("regime_labels", {}) or {},
-                        )
-                        st.plotly_chart(fig, use_container_width=True, key="aa_regime_chart")
-                    except Exception as e:
-                        st.info(f"Regime chart unavailable: {e}")
-                else:
-                    st.caption("Price series not available for chart. Showing regime statistics only.")
-
-                st.subheader("Regime Statistics")
-                regime_stats = regime_results.get("regime_stats", [])
-                if regime_stats:
-                    st.dataframe(pd.DataFrame(regime_stats), use_container_width=True)
-            else:
-                st.warning(regime_results.get("message", "Regime detection failed.") if isinstance(regime_results, dict) else "Regime detection failed.")
-        else:
-            st.info(f"Need at least {int(min_obs_reg)} observations for regime detection.")
-
-
-def _display_risk_analytics(self, config: AnalysisConfiguration):
-    """Display risk analytics (VaR/CVaR + Monte Carlo)."""
-    import streamlit as st
-
-    st.markdown('<div class="section-header"><h2>🧮 Risk Analytics</h2></div>', unsafe_allow_html=True)
-
-    if not st.session_state.get("data_loaded", False):
-        st.warning("Please load data first.")
-        return
-
-    returns_df = _icd__get_returns_df(self)
-    if returns_df.empty:
-        st.warning("No returns data available.")
-        return
-
-    st.subheader("Value at Risk (VaR) Analysis")
-
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        var_asset = st.selectbox("Select Asset", options=list(returns_df.columns), key="aa_var_asset")
-    with c2:
-        confidence_level = st.select_slider("Confidence Level", options=[0.90, 0.95, 0.99], value=0.95, key="aa_var_conf")
-    with c3:
-        var_method = st.selectbox("Method", options=["historical", "parametric", "modified"], key="aa_var_method")
-
-    if var_asset:
-        asset_returns = returns_df[var_asset].dropna()
-        if len(asset_returns) >= 100:
-            var_results = self.analytics.calculate_var(asset_returns, confidence_level=float(confidence_level), method=str(var_method))
-            if var_results:
-                m1, m2, m3 = st.columns(3)
-                with m1:
-                    st.metric(f"VaR ({confidence_level*100:.0f}%)", f"{var_results.get('var', float('nan')):.2f}%")
-                with m2:
-                    st.metric(f"CVaR / ES ({confidence_level*100:.0f}%)", f"{var_results.get('cvar', float('nan')):.2f}%")
-                with m3:
-                    st.metric("Obs", f"{int(var_results.get('observations', len(asset_returns)))}")
-        else:
-            st.info("Need at least 100 observations for VaR/CVaR estimates.")
-
-    st.divider()
-
-    st.subheader("Monte Carlo Simulation")
-
-    c1, c2 = st.columns([2, 1])
-    with c1:
-        mc_asset = st.selectbox("Select Asset for Simulation", options=list(returns_df.columns), key="aa_mc_asset")
-    with c2:
-        n_simulations = st.number_input("Number of Simulations", min_value=1000, max_value=50000, value=10000, step=1000, key="aa_mc_sims")
-
-    if mc_asset:
-        asset_returns = returns_df[mc_asset].dropna()
-        if len(asset_returns) >= 60:
-            with st.spinner("Running Monte Carlo simulation..."):
-                mc_results = self.analytics.monte_carlo_simulation(asset_returns, n_simulations=int(n_simulations))
-            if mc_results:
-                k1, k2, k3, k4 = st.columns(4)
-                with k1:
-                    st.metric("Mean Final Value", f"${mc_results.get('mean_final_value', float('nan')):.2f}")
-                with k2:
-                    st.metric("Std Final Value", f"${mc_results.get('std_final_value', float('nan')):.2f}")
-                with k3:
-                    st.metric("VaR 95%", f"${mc_results.get('var_95_final', float('nan')):.2f}")
-                with k4:
-                    st.metric("Probability of Loss", f"{mc_results.get('probability_loss', float('nan')):.1f}%")
-            else:
-                st.warning("Monte Carlo simulation returned no results.")
-        else:
-            st.info("Need at least 60 observations for Monte Carlo simulation.")
-
-
-def _display_ewma_ratio_signal(self, config: AnalysisConfiguration):
-    """Display EWMA Volatility Ratio signal tab (22 / (33+99) style)."""
-    import numpy as np
-    import streamlit as st
-
-    st.markdown('<div class="section-header"><h2>📉 EWMA Volatility Ratio Signal</h2></div>', unsafe_allow_html=True)
-
-    if not st.session_state.get("data_loaded", False):
-        st.warning("Please load data first.")
-        return
-
-    returns_df = _icd__get_returns_df(self)
-    if returns_df.empty:
-        st.warning("No returns data available.")
-        return
-
-    st.subheader("Institutional EWMA Volatility Ratio")
-
-    c1, c2 = st.columns([2, 1])
-    with c1:
-        ewma_asset = st.selectbox("Select Asset", options=list(returns_df.columns), key="aa_ewma_asset")
-    with c2:
-        annualize = st.checkbox("Annualize Volatility", value=True, key="aa_ewma_annualize")
-
-    if not ewma_asset:
-        return
-
-    asset_returns = returns_df[ewma_asset].dropna()
-
-    # Parameters
-    p1, p2, p3 = st.columns(3)
-    with p1:
-        span_fast = st.number_input("Fast Span", min_value=5, max_value=120, value=22, key="aa_ewma_fast")
-    with p2:
-        span_mid = st.number_input("Mid Span", min_value=10, max_value=240, value=33, key="aa_ewma_mid")
-    with p3:
-        span_slow = st.number_input("Slow Span", min_value=20, max_value=500, value=99, key="aa_ewma_slow")
-
-    # Thresholds (ratio is dimensionless; policy thresholds are user-configurable)
-    t1, t2 = st.columns(2)
-    with t1:
-        green_max = st.number_input("Green Max Threshold", min_value=0.0, max_value=2.0, value=0.35, step=0.01, key="aa_ewma_green")
-    with t2:
-        red_min = st.number_input("Red Min Threshold", min_value=0.0, max_value=5.0, value=0.55, step=0.01, key="aa_ewma_red")
-
-    if len(asset_returns) <= int(span_slow):
-        st.info(f"Need more data than Slow Span ({int(span_slow)}) to compute the ratio.")
-        return
-
-    with st.spinner("Calculating EWMA ratio..."):
-        ewma_df = self.analytics.compute_ewma_volatility_ratio(
-            asset_returns,
-            span_fast=int(span_fast),
-            span_mid=int(span_mid),
-            span_slow=int(span_slow),
-            annualize=bool(annualize),
-        )
-
-    if ewma_df is None or getattr(ewma_df, "empty", True):
-        st.warning("EWMA ratio computation returned no data.")
-        return
-
-    try:
-        fig = self.visualizer.create_ewma_ratio_signal_chart(
-            ewma_df,
-            title=f"EWMA Volatility Ratio - {ewma_asset}",
-            green_max=float(green_max),
-            red_min=float(red_min),
-        )
-        st.plotly_chart(fig, use_container_width=True, key="aa_ewma_ratio_chart")
-    except Exception as e:
-        st.info(f"EWMA signal chart unavailable: {e}")
-
-    # Latest values
-    latest = ewma_df.iloc[-1]
-    k1, k2, k3, k4 = st.columns(4)
-    with k1:
-        st.metric("Fast EWMA Vol", f"{float(latest.get('EWMA_VOL_22', np.nan)):.4f}" if np.isfinite(latest.get('EWMA_VOL_22', np.nan)) else "N/A")
-    with k2:
-        st.metric("Mid EWMA Vol", f"{float(latest.get('EWMA_VOL_33', np.nan)):.4f}" if np.isfinite(latest.get('EWMA_VOL_33', np.nan)) else "N/A")
-    with k3:
-        st.metric("Slow EWMA Vol", f"{float(latest.get('EWMA_VOL_99', np.nan)):.4f}" if np.isfinite(latest.get('EWMA_VOL_99', np.nan)) else "N/A")
-    with k4:
-        ratio = float(latest.get("EWMA_RATIO", np.nan))
-        if np.isfinite(ratio):
-            if ratio <= float(green_max):
-                status = "🟢 GREEN"
-            elif ratio >= float(red_min):
-                status = "🔴 RED"
-            else:
-                status = "🟡 ORANGE"
-            st.metric("Ratio", f"{ratio:.4f}", delta=status, delta_color="off")
-        else:
-            st.metric("Ratio", "N/A")
-
-
-def _display_portfolio(self, config: AnalysisConfiguration):
-    """Portfolio analysis: manual weights builder + optimization + saved comparisons.
-
-    Design goals:
-      - Let the user decide asset weights separately (manual builder).
-      - Keep the existing in-file optimizer (no feature removals).
-      - Provide a clean institutional layout with charts + metrics + save/compare.
-    """
-    import re
-    import numpy as np
-    import pandas as pd
-    import streamlit as st
-    import plotly.graph_objects as go
-    import plotly.express as px
-
-    st.markdown('<div class="section-header"><h2>📈 Portfolio Analysis</h2></div>', unsafe_allow_html=True)
-
-    if not st.session_state.get("data_loaded", False):
-        st.warning("Please load data first.")
-        return
-
-    returns_df = _icd__get_returns_df(self)
-    if returns_df.empty:
-        st.warning("No returns data available.")
-        return
-
-    # -------------------------------------------------------------------------
-    # Helpers
-    # -------------------------------------------------------------------------
-    def _compute_metrics(r: pd.Series, annual_days: int, rf: float) -> dict:
-        r = pd.Series(r).dropna()
-        if r.empty:
-            return {}
-        n = int(r.shape[0])
-        cum = (1.0 + r).cumprod()
-        ann_ret = float(cum.iloc[-1] ** (annual_days / max(n, 1)) - 1.0)
-        ann_vol = float(r.std(ddof=0) * np.sqrt(annual_days))
-        sharpe = float((ann_ret - rf) / ann_vol) if ann_vol and np.isfinite(ann_vol) and ann_vol > 0 else np.nan
-        downside = r[r < 0].std(ddof=0) * np.sqrt(annual_days)
-        sortino = float((ann_ret - rf) / downside) if downside and np.isfinite(downside) and downside > 0 else np.nan
-        dd = cum / cum.cummax() - 1.0
-        max_dd = float(dd.min()) if not dd.empty else np.nan
-        return {
-            "n_obs": n,
-            "annual_return": ann_ret * 100.0,
-            "annual_volatility": ann_vol * 100.0,
-            "sharpe_ratio": sharpe,
-            "sortino_ratio": sortino,
-            "max_drawdown": max_dd * 100.0,
-        }
-
-    def _risk_contributions(cov: pd.DataFrame, w: pd.Series) -> pd.Series:
-        # Percent contribution to variance (sums ~ 1)
-        try:
-            w = w.astype(float)
-            port_var = float(w.T @ cov.values @ w.values)
-            if not np.isfinite(port_var) or port_var <= 0:
-                return pd.Series(index=w.index, dtype=float)
-            mc = cov.values @ w.values
-            rc = (w.values * mc) / port_var
-            return pd.Series(rc, index=w.index)
-        except Exception:
-            return pd.Series(index=w.index, dtype=float)
-
-    annual_days = int(getattr(config, "annual_trading_days", 252) or 252)
-    rf = float(getattr(config, "risk_free_rate", 0.0) or 0.0)
-
-    # Persistent storage for comparisons
-    st.session_state.setdefault("saved_portfolios", [])
-
-    tab_manual, tab_opt, tab_saved = st.tabs(["🧩 Manual Weights Builder", "⚙️ Optimizer", "📚 Saved & Comparison"])
-
-    # =====================================================================
-    # TAB 1: MANUAL WEIGHTS BUILDER
-    # =====================================================================
-    with tab_manual:
-        left, right = st.columns([1.15, 1.0], gap="large")
-
-        with left:
-            st.subheader("1) Select Assets")
-            available_assets = returns_df.columns.tolist()
-
-            selected_assets = st.multiselect(
-                "Assets",
-                options=available_assets,
-                default=available_assets[: min(6, len(available_assets))],
-                key="portfolio_manual_assets",
-            )
-
-            if not selected_assets:
-                st.info("Select at least 1 asset to build a portfolio.")
-                return
-
-            base = returns_df[selected_assets].dropna(how="all")
-            base = base.replace([np.inf, -np.inf], np.nan).dropna(how="all")
-
-            if base.shape[0] < 30:
-                st.warning("Not enough aligned return history for portfolio analytics (need ≥ 30 observations).")
-                return
-
-            st.subheader("2) Decide Weights (separately per asset)")
-            st.caption("Enter weights in % terms. Optionally auto-normalize so total becomes 100%.")
-
-            auto_norm = st.checkbox("Auto-normalize weights to 100%", value=True, key="portfolio_manual_autonorm")
-
-            # Seed defaults (equal weights), but keep user edits if already set in session
-            default_w = 100.0 / max(len(selected_assets), 1)
-
-            cols = st.columns(2, gap="small")
-            w_raw = {}
-            for i, a in enumerate(selected_assets):
-                c = cols[i % 2]
-                safe = re.sub(r"[^0-9a-zA-Z_]+", "_", str(a))[:50]
-                key = f"portfolio_w_{safe}"
-                w = c.number_input(
-                    f"{a} weight (%)",
-                    min_value=0.0,
-                    max_value=100.0,
-                    value=float(st.session_state.get(key, default_w)),
-                    step=0.25,
-                    key=key,
-                )
-                w_raw[a] = float(w) / 100.0
-
-            total_raw = float(sum(w_raw.values()))
-            st.write(f"**Total entered:** {total_raw*100:.2f}%")
-
-            if total_raw <= 0:
-                st.warning("Total weight must be > 0.")
-                return
-
-            if auto_norm:
-                weights = {k: (v / total_raw) for k, v in w_raw.items()}
-            else:
-                weights = dict(w_raw)
-
-            w = pd.Series(weights, dtype=float).reindex(selected_assets).fillna(0.0)
-
-            # Optional benchmark selector (for beta / TE)
-            bench_df = st.session_state.get("benchmark_returns_data", pd.DataFrame())
-            bench_df = bench_df if isinstance(bench_df, pd.DataFrame) else pd.DataFrame()
-            bench_opts = ["(None)"] + (bench_df.columns.tolist() if not bench_df.empty else [])
-            benchmark_choice = st.selectbox("Benchmark (optional)", options=bench_opts, index=0, key="portfolio_manual_benchmark")
-
-            # Build portfolio (explicit button prevents heavy recompute loops)
-            build = st.button("✅ Build / Update Portfolio", key="portfolio_manual_build_btn")
-
-        with right:
-            st.subheader("Portfolio Output")
-            st.caption("Weights, metrics and charts update when you click **Build / Update Portfolio**.")
-
-            # show preview always
-            wdf = pd.DataFrame({"Asset": w.index, "Weight": w.values})
-            wdf["Weight %"] = (wdf["Weight"] * 100.0).map(lambda x: f"{x:.2f}%")
-            st.dataframe(wdf[["Asset", "Weight %"]].set_index("Asset"), use_container_width=True)
-
-            # Weight chart
-            try:
-                fig_w = px.pie(wdf, names="Asset", values="Weight", title="Weights (Normalized)" if auto_norm else "Weights")
-                fig_w.update_layout(height=360, legend_orientation="h")
-                st.plotly_chart(fig_w, use_container_width=True)
-            except Exception:
-                pass
-
-        if not build:
-            st.info("Click **Build / Update Portfolio** to compute portfolio returns + charts + metrics.")
-            return
-
-        # -----------------------------------------------------------------
-        # Compute portfolio returns
-        # -----------------------------------------------------------------
-        aligned = base.dropna()
-        if aligned.shape[0] < 30:
-            st.warning("Not enough fully-aligned observations across chosen assets after dropping NA.")
-            return
-
-        port_returns = (aligned.mul(w, axis=1)).sum(axis=1).dropna()
-        st.session_state["portfolio_manual_result"] = {
-            "assets": selected_assets,
-            "weights": w.to_dict(),
-            "returns": port_returns,
-            "benchmark": benchmark_choice,
-        }
-
-        # -----------------------------------------------------------------
-        # Metrics
-        # -----------------------------------------------------------------
-        metrics = _compute_metrics(port_returns, annual_days=annual_days, rf=rf)
-
-        # Beta / Tracking Error vs benchmark (optional)
-        te = np.nan
-        beta = np.nan
-        if benchmark_choice != "(None)" and not bench_df.empty and benchmark_choice in bench_df.columns:
-            b = bench_df[benchmark_choice].dropna()
-            pair = pd.concat([port_returns, b], axis=1).dropna()
-            if pair.shape[0] >= 30:
-                pair.columns = ["portfolio", "benchmark"]
-                active = pair["portfolio"] - pair["benchmark"]
-                te = float(active.std(ddof=0) * np.sqrt(annual_days) * 100.0)
-                vb = float(pair["benchmark"].var(ddof=0))
-                beta = float(pair["portfolio"].cov(pair["benchmark"]) / vb) if vb and vb > 0 else np.nan
-
-        # -----------------------------------------------------------------
-        # Display metrics cards
-        # -----------------------------------------------------------------
-        st.subheader("3) Performance & Risk Summary")
-        k1, k2, k3, k4, k5 = st.columns(5)
-        k1.metric("Annual Return", f"{metrics.get('annual_return', np.nan):.2f}%")
-        k2.metric("Annual Vol", f"{metrics.get('annual_volatility', np.nan):.2f}%")
-        k3.metric("Sharpe", f"{metrics.get('sharpe_ratio', np.nan):.2f}")
-        k4.metric("Max Drawdown", f"{metrics.get('max_drawdown', np.nan):.2f}%")
-        k5.metric("Tracking Error", f"{te:.2f}%" if np.isfinite(te) else "N/A")
-
-        if np.isfinite(beta):
-            st.caption(f"β (portfolio vs {benchmark_choice}): **{beta:.2f}**")
-
-        # -----------------------------------------------------------------
-        # Charts: equity curve + drawdown + rolling volatility
-        # -----------------------------------------------------------------
-        st.subheader("4) Portfolio Charts")
-        cum = (1.0 + port_returns).cumprod()
-
-        fig_eq = go.Figure()
-        fig_eq.add_trace(go.Scatter(x=cum.index, y=cum.values, name="Portfolio Equity Curve", line=dict(width=2)))
-        fig_eq.update_layout(
-            title="Cumulative Performance (Equity Curve)",
-            height=420,
-            xaxis_title="Date",
-            yaxis_title="Growth of $1",
-            template=getattr(self.visualizer, "template", "plotly_white"),
-            hovermode="x unified",
-        )
-        st.plotly_chart(fig_eq, use_container_width=True)
-
-        dd = cum / cum.cummax() - 1.0
-        fig_dd = go.Figure()
-        fig_dd.add_trace(go.Scatter(x=dd.index, y=dd.values * 100.0, name="Drawdown (%)", fill="tozeroy"))
-        fig_dd.update_layout(
-            title="Drawdown (%)",
-            height=280,
-            xaxis_title="Date",
-            yaxis_title="Drawdown (%)",
-            template=getattr(self.visualizer, "template", "plotly_white"),
-            hovermode="x unified",
-        )
-        st.plotly_chart(fig_dd, use_container_width=True)
-
-        win = st.select_slider("Rolling window (days)", options=[20, 60, 126, 252], value=60, key="portfolio_manual_rollwin")
-        roll_vol = port_returns.rolling(int(win)).std(ddof=0) * np.sqrt(annual_days) * 100.0
-        fig_rv = go.Figure()
-        fig_rv.add_trace(go.Scatter(x=roll_vol.index, y=roll_vol.values, name=f"Rolling Vol ({win}d)", line=dict(width=2)))
-        fig_rv.update_layout(
-            title=f"Rolling Annualized Volatility ({win}d)",
-            height=320,
-            xaxis_title="Date",
-            yaxis_title="Volatility (%)",
-            template=getattr(self.visualizer, "template", "plotly_white"),
-            hovermode="x unified",
-        )
-        st.plotly_chart(fig_rv, use_container_width=True)
-
-        # Risk contributions
-        try:
-            cov = aligned.cov()
-            rc = _risk_contributions(cov, w)
-            if not rc.empty and rc.notna().any():
-                st.subheader("5) Risk Contributions (variance share)")
-                rc_df = pd.DataFrame({"Asset": rc.index, "Contribution": rc.values})
-                rc_df["Contribution %"] = (rc_df["Contribution"] * 100.0).map(lambda x: f"{x:.2f}%")
-                st.dataframe(rc_df[["Asset", "Contribution %"]].set_index("Asset"), use_container_width=True)
-        except Exception:
-            pass
-
-        # Save snapshot
-        st.subheader("6) Save Portfolio Snapshot")
-        c1, c2 = st.columns([1.2, 0.8])
-        with c1:
-            name = st.text_input("Portfolio Name", value=f"Manual_{len(st.session_state['saved_portfolios'])+1}", key="portfolio_manual_name")
-        with c2:
-            save = st.button("💾 Save", key="portfolio_manual_save_btn")
-
-        if save:
-            st.session_state["saved_portfolios"].append(
-                {
-                    "name": str(name).strip() or f"Manual_{len(st.session_state['saved_portfolios'])+1}",
-                    "type": "manual",
-                    "assets": selected_assets,
-                    "weights": w.to_dict(),
-                    "benchmark": benchmark_choice,
-                    "metrics": {**metrics, "tracking_error": te if np.isfinite(te) else np.nan, "beta": beta},
-                    "returns": port_returns,
-                }
-            )
-            st.success("Saved.")
-
-    # =====================================================================
-    # TAB 2: OPTIMIZER (existing feature preserved)
-    # =====================================================================
-    with tab_opt:
-        st.subheader("Optimizer")
-        st.caption("This keeps your existing in-file optimization flow, with the same API calls and no feature removal.")
-
-        optimization_method = st.selectbox(
-            "Optimization Method",
-            options=["sharpe", "min_variance", "max_return"],
-            key="opt_method",
-        )
-
-        available_assets = returns_df.columns.tolist()
-        selected_portfolio_assets = st.multiselect(
-            "Select Assets for Portfolio",
-            options=available_assets,
-            default=available_assets[: min(6, len(available_assets))],
-            key="portfolio_assets",
-        )
-
-        if not selected_portfolio_assets:
-            st.info("Select assets to optimize.")
-            return
-
-        portfolio_returns = returns_df[selected_portfolio_assets].dropna()
-        if portfolio_returns.shape[0] < 60:
-            st.warning("Need at least 60 observations for optimization.")
-            return
-
-        st.subheader("Constraints")
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            min_weight = st.number_input("Minimum Weight", min_value=0.0, max_value=0.5, value=0.0, step=0.01, key="min_weight")
-        with c2:
-            max_weight = st.number_input("Maximum Weight", min_value=0.1, max_value=1.0, value=1.0, step=0.01, key="max_weight")
-        with c3:
-            run_opt = st.button("🚀 Optimize Portfolio", key="optimize_btn")
-
-        constraints = {"min_weight": float(min_weight), "max_weight": float(max_weight), "sum_to_one": True}
-
-        if run_opt:
-            if not hasattr(self, "analytics") or not hasattr(self.analytics, "optimize_portfolio"):
-                st.error("Optimization engine is not available: analytics.optimize_portfolio not found.")
-                return
-
-            with st.spinner("Optimizing portfolio..."):
-                optimization_results = self.analytics.optimize_portfolio(
-                    portfolio_returns,
-                    method=str(optimization_method),
-                    constraints=constraints,
-                )
-
-            if isinstance(optimization_results, dict) and optimization_results.get("success", False):
-                st.session_state["optimization_results"] = optimization_results
-                st.success("Portfolio optimized successfully!")
-
-                weights = optimization_results.get("weights", {}) or {}
-                wser = pd.Series(weights, dtype=float)
-                wser = wser[wser > 0].sort_values(ascending=False)
-
-                l, r = st.columns([1.0, 1.0], gap="large")
-                with l:
-                    st.subheader("Optimal Weights")
-                    wdf = pd.DataFrame({"Asset": wser.index, "Weight": wser.values})
-                    wdf["Weight %"] = (wdf["Weight"] * 100.0).map(lambda x: f"{x:.2f}%")
-                    st.dataframe(wdf[["Asset", "Weight %"]].set_index("Asset"), use_container_width=True)
-                with r:
-                    try:
-                        fig = px.bar(wdf, x="Asset", y="Weight", title="Optimal Weights (bar)")
-                        fig.update_layout(height=360, template=getattr(self.visualizer, "template", "plotly_white"))
-                        st.plotly_chart(fig, use_container_width=True)
-                    except Exception:
-                        pass
-
-                metrics = optimization_results.get("metrics", {}) or {}
-                st.subheader("Portfolio Performance (Optimizer Output)")
-                k1, k2, k3, k4 = st.columns(4)
-                k1.metric("Annual Return", f"{metrics.get('annual_return', 0):.2f}%")
-                k2.metric("Annual Volatility", f"{metrics.get('annual_volatility', 0):.2f}%")
-                k3.metric("Sharpe Ratio", f"{metrics.get('sharpe_ratio', 0):.2f}")
-                k4.metric("Max Drawdown", f"{metrics.get('max_drawdown', 0):.2f}%")
-
-                rc = optimization_results.get("risk_contributions", None)
-                if isinstance(rc, dict) and rc:
-                    st.subheader("Risk Contributions")
-                    rdf = pd.DataFrame({"Asset": list(rc.keys()), "Contribution": list(rc.values())})
-                    rdf["Contribution %"] = rdf["Contribution"].map(lambda x: f"{x:.2f}%")
-                    st.dataframe(rdf[["Asset", "Contribution %"]].set_index("Asset"), use_container_width=True)
-
-                # Save snapshot
-                st.subheader("Save Optimized Portfolio")
-                c1, c2 = st.columns([1.2, 0.8])
-                with c1:
-                    nm = st.text_input("Name", value=f"Optim_{len(st.session_state['saved_portfolios'])+1}", key="portfolio_opt_name")
-                with c2:
-                    save_opt = st.button("💾 Save", key="portfolio_opt_save_btn")
-
-                if save_opt:
-                    # Build a portfolio return series using the optimized weights
-                    ww = pd.Series(weights, dtype=float).reindex(portfolio_returns.columns).fillna(0.0)
-                    pret = (portfolio_returns.dropna().mul(ww, axis=1)).sum(axis=1).dropna()
-                    st.session_state["saved_portfolios"].append(
-                        {
-                            "name": str(nm).strip() or f"Optim_{len(st.session_state['saved_portfolios'])+1}",
-                            "type": "optimized",
-                            "assets": selected_portfolio_assets,
-                            "weights": ww.to_dict(),
-                            "benchmark": "(None)",
-                            "metrics": metrics,
-                            "returns": pret,
-                        }
-                    )
-                    st.success("Saved.")
-            else:
-                msg = optimization_results.get("message", "Unknown error") if isinstance(optimization_results, dict) else "Unknown error"
-                st.error(f"Optimization failed: {msg}")
-
-    # =====================================================================
-    # TAB 3: SAVED PORTFOLIOS & COMPARISON
-    # =====================================================================
-    with tab_saved:
-        st.subheader("Saved Portfolios")
-        saved = st.session_state.get("saved_portfolios", [])
-        if not saved:
-            st.info("No saved portfolios yet. Save one from the Manual Builder or Optimizer tab.")
-            return
-
-        # Summary table
-        rows = []
-        for p in saved:
-            met = p.get("metrics", {}) or {}
-            rows.append(
-                {
-                    "Name": p.get("name", ""),
-                    "Type": p.get("type", ""),
-                    "Assets": len(p.get("assets", []) or []),
-                    "Annual Return (%)": met.get("annual_return", np.nan),
-                    "Annual Vol (%)": met.get("annual_volatility", np.nan),
-                    "Sharpe": met.get("sharpe_ratio", np.nan),
-                    "Max DD (%)": met.get("max_drawdown", np.nan),
-                    "TE (%)": met.get("tracking_error", np.nan),
-                    "Beta": met.get("beta", np.nan),
-                }
-            )
-        sdf = pd.DataFrame(rows)
-        st.dataframe(sdf, use_container_width=True)
-
-        names = [p.get("name", f"P{i+1}") for i, p in enumerate(saved)]
-        sel = st.multiselect("Select portfolios to compare", options=names, default=names[: min(3, len(names))], key="portfolio_compare_sel")
-        if not sel:
-            return
-
-        name_to_port = {p.get("name", f"P{i+1}"): p for i, p in enumerate(saved)}
-        fig = go.Figure()
-        for nm in sel:
-            p = name_to_port.get(nm)
-            if not p:
-                continue
-            r = p.get("returns", None)
-            if r is None:
-                continue
-            r = pd.Series(r).dropna()
-            if r.empty:
-                continue
-            cum = (1.0 + r).cumprod()
-            fig.add_trace(go.Scatter(x=cum.index, y=cum.values, name=str(nm), line=dict(width=2)))
-
-        fig.update_layout(
-            title="Comparison: Equity Curves (Growth of $1)",
-            height=520,
-            xaxis_title="Date",
-            yaxis_title="Growth of $1",
-            template=getattr(self.visualizer, "template", "plotly_white"),
-            hovermode="x unified",
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-        # Optional delete
-        with st.expander("🗑️ Manage saved portfolios"):
-            del_name = st.selectbox("Choose a portfolio to delete", options=["(None)"] + names, key="portfolio_delete_sel")
-            if del_name != "(None)" and st.button("Delete", key="portfolio_delete_btn"):
-                st.session_state["saved_portfolios"] = [p for p in saved if p.get("name") != del_name]
-                st.success("Deleted. Re-run comparison if needed.")
-def _display_rolling_beta(self, config: AnalysisConfiguration):
-    """Display rolling beta analysis vs selected benchmark."""
-    import numpy as np
-    import pandas as pd
-    import streamlit as st
-    import plotly.graph_objects as go
-
-    st.markdown('<div class="section-header"><h2>β Rolling Beta Analysis</h2></div>', unsafe_allow_html=True)
-
-    if not st.session_state.get("data_loaded", False):
-        st.warning("Please load data first.")
-        return
-
-    returns_df = _icd__get_returns_df(self)
-    bench_df = _icd__get_bench_df()
-
-    if returns_df.empty:
-        st.warning("No returns data available.")
-        return
-    if bench_df.empty:
-        st.warning("No benchmark data available. Please select benchmarks in the sidebar.")
-        return
-
-    st.subheader("Rolling Beta Calculation")
-
-    c1, c2, c3 = st.columns([2, 2, 1])
-    with c1:
-        asset = st.selectbox("Select Asset", options=list(returns_df.columns), key="aa_beta_asset")
-    with c2:
-        benchmark = st.selectbox("Select Benchmark", options=list(bench_df.columns), key="aa_beta_benchmark")
-    with c3:
-        window = st.select_slider("Rolling Window", options=[20, 60, 126, 252], value=60, key="aa_beta_window")
-
-    if not asset or not benchmark:
-        return
-
-    aligned = pd.concat([returns_df[asset], bench_df[benchmark]], axis=1).dropna()
-    aligned.columns = ["asset", "benchmark"]
-
-    if len(aligned) <= int(window):
-        st.warning("Not enough overlapping observations for the selected window.")
-        return
-
-    # rolling beta
-    rb = aligned["asset"].rolling(int(window)).cov(aligned["benchmark"]) / aligned["benchmark"].rolling(int(window)).var()
-    rb = rb.replace([np.inf, -np.inf], np.nan).dropna()
-
-    if rb.empty:
-        st.warning("Rolling beta series is empty after computation.")
-        return
-
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=rb.index, y=rb.values, name=f"Beta vs {benchmark}", mode="lines"))
-    mean_beta = float(rb.mean())
-    fig.add_hline(y=mean_beta, line_dash="dash", line_color="gray", annotation_text=f"Mean: {mean_beta:.2f}", annotation_position="bottom right")
-    fig.update_layout(
-        title=f"Rolling {int(window)}-Day Beta: {asset} vs {benchmark}",
-        height=520,
-        xaxis_title="Date",
-        yaxis_title="Beta",
-        template=getattr(self.visualizer, "template", "plotly_white"),
-        hovermode="x unified",
-        margin=dict(l=10, r=10, t=60, b=10),
-    )
-    st.plotly_chart(fig, use_container_width=True, key="aa_beta_chart")
-
-    k1, k2, k3, k4 = st.columns(4)
-    with k1:
-        st.metric("Current Beta", f"{float(rb.iloc[-1]):.2f}")
-    with k2:
-        st.metric("Mean Beta", f"{mean_beta:.2f}")
-    with k3:
-        st.metric("Std Beta", f"{float(rb.std()):.2f}")
-    with k4:
-        st.metric("Min Beta", f"{float(rb.min()):.2f}")
-
-
-def _display_relative_risk(self, config: AnalysisConfiguration):
-    """Display relative VaR/CVaR/ES vs benchmark (active returns) + bands."""
-    import numpy as np
-    import pandas as pd
-    import streamlit as st
-    import plotly.graph_objects as go
-
-    st.markdown('<div class="section-header"><h2>📉 Relative VaR/CVaR/ES Analysis</h2></div>', unsafe_allow_html=True)
-
-    if not st.session_state.get("data_loaded", False):
-        st.warning("Please load data first.")
-        return
-
-    returns_df = _icd__get_returns_df(self)
-    bench_df = _icd__get_bench_df()
-
-    if returns_df.empty:
-        st.warning("No returns data available.")
-        return
-    if bench_df.empty:
-        st.warning("No benchmark data available. Please select benchmarks in the sidebar.")
-        return
-
-    st.subheader("Active Risk Measures (Asset − Benchmark)")
-
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        asset = st.selectbox("Select Asset", options=list(returns_df.columns), key="aa_rel_asset")
-    with c2:
-        benchmark = st.selectbox("Select Benchmark", options=list(bench_df.columns), key="aa_rel_benchmark")
-    with c3:
-        confidence = st.select_slider("Confidence Level", options=[0.90, 0.95, 0.99], value=0.95, key="aa_rel_conf")
-    with c4:
-        roll_win = st.selectbox("Rolling Window", options=[63, 126, 252, 504], index=2, key="aa_rel_win")
-
-    if not asset or not benchmark:
-        return
-
-    aligned = pd.concat([returns_df[asset], bench_df[benchmark]], axis=1).dropna()
-    aligned.columns = ["asset", "benchmark"]
-
-    if len(aligned) < max(120, int(roll_win)):
-        st.warning("Not enough overlapping observations to compute robust relative risk.")
-        return
-
-    active = (aligned["asset"] - aligned["benchmark"]).dropna()
-    if active.empty:
-        st.warning("Active returns series is empty after alignment.")
-        return
-
-    # instantaneous (full-sample) relative VaR/ES
-    rel_var = self.analytics.calculate_var(active, confidence_level=float(confidence), method="historical")
-    te_ann = float(active.std(ddof=1) * np.sqrt(252) * 100)
-
-    k1, k2, k3 = st.columns(3)
-    with k1:
-        st.metric(f"Relative VaR ({confidence*100:.0f}%)", f"{rel_var.get('var', float('nan')):.2f}%" if rel_var else "N/A")
-    with k2:
-        st.metric(f"Relative ES ({confidence*100:.0f}%)", f"{rel_var.get('cvar', float('nan')):.2f}%" if rel_var else "N/A")
-    with k3:
-        st.metric("Tracking Error (ann.)", f"{te_ann:.2f}%")
-
-    st.markdown("#### Active Returns")
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=active.index, y=active.values * 100, name="Active Returns (%)", mode="lines", fill="tozeroy"))
-    if rel_var and "var" in rel_var and rel_var["var"] is not None:
-        fig.add_hline(y=float(rel_var["var"]), line_dash="dash", line_color="red", annotation_text=f"VaR {confidence*100:.0f}%", annotation_position="bottom right")
-    fig.update_layout(
-        height=420,
-        title=f"Active Returns: {asset} − {benchmark}",
-        xaxis_title="Date",
-        yaxis_title="Active Return (%)",
-        template=getattr(self.visualizer, "template", "plotly_white"),
-        hovermode="x unified",
-        margin=dict(l=10, r=10, t=60, b=10),
-    )
-    st.plotly_chart(fig, use_container_width=True, key="aa_active_returns_chart")
-
-    st.divider()
-    st.markdown("#### Rolling Relative VaR / ES (Historical) with Risk Bands")
-
-    b1, b2, b3 = st.columns(3)
-    with b1:
-        green_thr = st.number_input("Green ≤ (|VaR|, %)", min_value=0.0, max_value=50.0, value=2.0, step=0.25, key="aa_rel_green")
-    with b2:
-        orange_thr = st.number_input("Orange ≤ (|VaR|, %)", min_value=0.0, max_value=50.0, value=4.0, step=0.25, key="aa_rel_orange")
-    with b3:
-        horizon = st.selectbox("Horizon (days)", options=[1, 5, 10, 21], index=0, key="aa_rel_horizon")
-
-    # horizon scaling (sqrt-time) for VaR/ES magnitudes on active returns
-    h = int(horizon)
-    active_h = active * np.sqrt(h)
-
-    q = (1.0 - float(confidence))
-    # rolling historical VaR and ES
-    var_roll = active_h.rolling(int(roll_win)).quantile(q) * 100
-    def _es_func(x):
-        if x is None or len(x) == 0:
-            return np.nan
-        x = np.asarray(x, dtype=float)
-        v = np.nanpercentile(x, q * 100.0)
-        tail = x[x <= v]
-        return np.nanmean(tail) * 100.0 if tail.size else np.nan
-    es_roll = active_h.rolling(int(roll_win)).apply(_es_func, raw=False)
-
-    plot_df = pd.DataFrame({"VaR": var_roll, "ES": es_roll}).dropna()
-    if plot_df.empty:
-        st.info("Rolling series not yet available for the selected window/horizon.")
-        return
-
-    # bands over |VaR|
-    y = plot_df["VaR"].values
-    y_abs = np.abs(y)
-    y_max = float(np.nanmax([y_abs.max(), orange_thr * 1.35, 1.0]))
-
-    fig2 = go.Figure()
-    x0, x1 = plot_df.index.min(), plot_df.index.max()
-    fig2.add_shape(type="rect", xref="x", yref="y", x0=x0, x1=x1, y0=0, y1=float(green_thr),
-                   fillcolor="rgba(0,200,0,0.18)", line_width=0, layer="below")
-    fig2.add_shape(type="rect", xref="x", yref="y", x0=x0, x1=x1, y0=float(green_thr), y1=float(orange_thr),
-                   fillcolor="rgba(255,165,0,0.18)", line_width=0, layer="below")
-    fig2.add_shape(type="rect", xref="x", yref="y", x0=x0, x1=x1, y0=float(orange_thr), y1=y_max,
-                   fillcolor="rgba(255,0,0,0.16)", line_width=0, layer="below")
-
-    fig2.add_trace(go.Scatter(x=plot_df.index, y=np.abs(plot_df["VaR"].values), mode="lines", name="|VaR| (%)"))
-    fig2.add_trace(go.Scatter(x=plot_df.index, y=np.abs(plot_df["ES"].values), mode="lines", name="|ES| (%)"))
-    fig2.update_layout(
-        height=460,
-        title=f"Rolling Relative Risk (h={h}d, window={int(roll_win)}d) — {asset} vs {benchmark}",
-        xaxis_title="Date",
-        yaxis_title="Magnitude (%)",
-        template=getattr(self.visualizer, "template", "plotly_white"),
-        hovermode="x unified",
-        margin=dict(l=10, r=10, t=60, b=10),
-    )
-    fig2.update_yaxes(range=[0, y_max])
-    st.plotly_chart(fig2, use_container_width=True, key="aa_relrisk_roll_chart")
-
-
-def _display_stress_testing(self, config: AnalysisConfiguration):
-    """Display stress testing section."""
-    import pandas as pd
-    import streamlit as st
-    import plotly.graph_objects as go
-
-    st.markdown('<div class="section-header"><h2>🧪 Stress Testing</h2></div>', unsafe_allow_html=True)
-
-    if not st.session_state.get("data_loaded", False):
-        st.warning("Please load data first.")
-        return
-
-    returns_df = _icd__get_returns_df(self)
-    if returns_df.empty:
-        st.warning("No returns data available.")
-        return
-
-    st.subheader("Historical Stress Scenarios")
-
-    stress_asset = st.selectbox("Select Asset", options=list(returns_df.columns), key="aa_stress_asset")
-    if not stress_asset:
-        return
-
-    asset_returns = returns_df[stress_asset].dropna()
-    if len(asset_returns) < 100:
-        st.info("Need at least 100 observations for stress testing.")
-        return
-
-    scenarios = st.multiselect(
-        "Shock Scenarios (additive returns)",
-        options=[-0.01, -0.02, -0.05, -0.10, -0.15],
-        default=[-0.01, -0.02, -0.05, -0.10],
-        key="aa_stress_scenarios",
-    )
-
-    with st.spinner("Running stress tests..."):
-        stress_results = self.analytics.stress_test(asset_returns, list(scenarios))
-
-    if not stress_results:
-        st.warning("Stress testing returned no results.")
-        return
-
-    # Table
-    df = pd.DataFrame(stress_results).T.reset_index().rename(columns={"index": "Scenario"})
-    # Format
-    for col in ["shock", "shocked_return", "shocked_volatility", "max_drawdown", "var_95"]:
-        if col in df.columns:
-            df[col] = df[col].map(lambda x: f"{x:.2f}%" if pd.notnull(x) else "N/A")
-    if "loss" in df.columns:
-        df["loss"] = df["loss"].map(lambda x: f"${x:.2f}" if pd.notnull(x) else "N/A")
-
-    st.dataframe(df, use_container_width=True)
-
-    # Bar impact
-    st.subheader("Scenario Impact Analysis (Loss)")
-    fig = go.Figure()
-    for scenario, data in stress_results.items():
-        fig.add_trace(go.Bar(x=[scenario], y=[abs(float(data.get("loss", 0.0)))], name=scenario, text=f"${float(data.get('loss',0.0)):.1f}", textposition="auto"))
-    fig.update_layout(
-        title="Loss Impact by Stress Scenario",
-        height=420,
-        xaxis_title="Scenario",
-        yaxis_title="Loss ($)",
-        template=getattr(self.visualizer, "template", "plotly_white"),
-        showlegend=False,
-        margin=dict(l=10, r=10, t=60, b=10),
-    )
-    st.plotly_chart(fig, use_container_width=True, key="aa_stress_loss_bar")
-
-
-def _display_reporting(self, config: AnalysisConfiguration):
-    """Display institutional reporting section."""
-    import numpy as np
-    import pandas as pd
-    import streamlit as st
-
-    st.markdown('<div class="section-header"><h2>📑 Institutional Reporting</h2></div>', unsafe_allow_html=True)
-
-    if not st.session_state.get("data_loaded", False):
-        st.warning("Please load data first.")
-        return
-
-    returns_df = _icd__get_returns_df(self)
-    if returns_df.empty:
-        st.warning("No returns data available.")
-        return
-
-    st.subheader("Performance Report Generator")
-
-    c1, c2 = st.columns(2)
-    with c1:
-        report_assets = st.multiselect(
-            "Assets to Include",
-            options=list(returns_df.columns),
-            default=list(returns_df.columns)[: min(5, len(returns_df.columns))],
-            key="aa_report_assets",
-        )
-    with c2:
-        report_metrics = st.multiselect(
-            "Metrics to Include",
-            options=["Returns", "Volatility", "Sharpe", "Sortino", "Max Drawdown", "VaR", "CVaR", "Beta", "Correlation"],
-            default=["Returns", "Volatility", "Sharpe", "Max Drawdown"],
-            key="aa_report_metrics",
-        )
-
-    if not report_assets:
-        st.info("Select assets to generate a report.")
-        return
-
-    if st.button("Generate Report", key="aa_generate_report"):
-        with st.spinner("Generating institutional report..."):
-            rows = []
-            for asset in report_assets:
-                s = returns_df[asset].dropna()
-                if len(s) < 60:
-                    continue
-                metrics = self.analytics.calculate_performance_metrics(s) or {}
-                r = {"Asset": asset}
-
-                if "Returns" in report_metrics:
-                    r["Annual Return"] = float(metrics.get("annual_return", np.nan))
-                if "Volatility" in report_metrics:
-                    r["Annual Volatility"] = float(metrics.get("annual_volatility", np.nan))
-                if "Sharpe" in report_metrics:
-                    r["Sharpe"] = float(metrics.get("sharpe_ratio", np.nan))
-                if "Sortino" in report_metrics:
-                    r["Sortino"] = float(metrics.get("sortino_ratio", np.nan))
-                if "Max Drawdown" in report_metrics:
-                    r["Max Drawdown"] = float(metrics.get("max_drawdown", np.nan))
-                if "VaR" in report_metrics:
-                    r["VaR 95%"] = float(metrics.get("var_95", np.nan))
-                if "CVaR" in report_metrics:
-                    r["CVaR 95%"] = float(metrics.get("cvar_95", np.nan))
-                rows.append(r)
-
-            if not rows:
-                st.warning("No metrics calculated. Check asset selection and data availability.")
-                return
-
-            metrics_df = pd.DataFrame(rows).set_index("Asset")
-
-            # display with light formatting
-            display_df = metrics_df.copy()
-            for col in display_df.columns:
-                if col in ["Annual Return", "Annual Volatility", "Max Drawdown", "VaR 95%", "CVaR 95%"]:
-                    display_df[col] = display_df[col].map(lambda x: f"{x:.2f}%" if np.isfinite(x) else "N/A")
-                else:
-                    display_df[col] = display_df[col].map(lambda x: f"{x:.3f}" if np.isfinite(x) else "N/A")
-
-            st.dataframe(display_df, use_container_width=True)
-
-            # correlation
-            if "Correlation" in report_metrics and len(report_assets) > 1:
-                st.subheader("Correlation Matrix (Aligned + PSD-safe)")
-                aligned = returns_df[report_assets].dropna(how="any")
-                if aligned.shape[0] < 30:
-                    st.info("Not enough overlapping observations to compute a stable correlation matrix.")
-                else:
-                    corr = aligned.corr()
-                    try:
-                        # enforce correlation PSD using existing Higham method if present
-                        corr_np = corr.values.astype(float)
-                        corr_fixed = self.analytics._higham_nearest_correlation(corr_np, max_iter=100, tol=1e-7, epsilon=1e-12)
-                        corr = pd.DataFrame(corr_fixed, index=corr.index, columns=corr.columns)
-                    except Exception:
-                        pass
-                    try:
-                        fig = self.visualizer.create_correlation_matrix(corr)
-                        st.plotly_chart(fig, use_container_width=True, key="aa_report_corr")
-                    except Exception as e:
-                        st.info(f"Correlation heatmap unavailable: {e}")
-
-            # Exports
-            st.subheader("Export Report")
-            csv = metrics_df.reset_index().to_csv(index=False)
-            jsn = metrics_df.reset_index().to_json(orient="records", indent=2)
-
-            d1, d2 = st.columns(2)
-            with d1:
-                st.download_button("Download CSV", data=csv, file_name="commodities_report.csv", mime="text/csv", key="aa_dl_csv")
-            with d2:
-                st.download_button("Download JSON", data=jsn, file_name="commodities_report.json", mime="application/json", key="aa_dl_json")
-
-
-def _display_settings(self, config: AnalysisConfiguration):
-    """Display settings section (cloud-safe, optional psutil)."""
-    import sys
-    import numpy as np
-    import pandas as pd
-    import streamlit as st
-
-    st.markdown('<div class="section-header"><h2>⚙️ Settings & Configuration</h2></div>', unsafe_allow_html=True)
-
-    st.subheader("Analysis Configuration")
-
-    risk_free_rate = st.number_input(
-        "Risk-Free Rate (%)",
-        min_value=0.0,
-        max_value=20.0,
-        value=float(getattr(config, "risk_free_rate", 0.02)) * 100.0,
-        step=0.1,
-        key="aa_rfr",
-    ) / 100.0
-
-    annual_trading_days = st.number_input(
-        "Annual Trading Days",
-        min_value=200,
-        max_value=365,
-        value=int(getattr(config, "annual_trading_days", 252)),
-        step=1,
-        key="aa_trading_days",
-    )
-
-    conf_levels = st.multiselect(
-        "Confidence Levels for VaR",
-        options=[0.90, 0.95, 0.99, 0.995],
-        default=list(getattr(config, "confidence_levels", (0.90, 0.95, 0.99))),
-        key="aa_conf_levels",
-    )
-
-    c1, c2 = st.columns(2)
-    with c1:
-        garch_p_min = st.number_input("GARCH p min", min_value=1, max_value=5, value=int(getattr(config, "garch_p_range", (1, 2))[0]), key="aa_garch_p_min")
-        garch_p_max = st.number_input("GARCH p max", min_value=1, max_value=5, value=int(getattr(config, "garch_p_range", (1, 2))[1]), key="aa_garch_p_max")
-    with c2:
-        garch_q_min = st.number_input("GARCH q min", min_value=1, max_value=5, value=int(getattr(config, "garch_q_range", (1, 2))[0]), key="aa_garch_q_min")
-        garch_q_max = st.number_input("GARCH q max", min_value=1, max_value=5, value=int(getattr(config, "garch_q_range", (1, 2))[1]), key="aa_garch_q_max")
-
-    regime_states = st.slider(
-        "Number of Regime States",
-        min_value=2,
-        max_value=5,
-        value=int(getattr(config, "regime_states", 3)),
-        key="aa_regime_states",
-    )
-
-    if st.button("Save Configuration", key="aa_save_cfg"):
-        config.risk_free_rate = float(risk_free_rate)
-        config.annual_trading_days = int(annual_trading_days)
-        config.confidence_levels = tuple(conf_levels) if conf_levels else (0.90, 0.95, 0.99)
-        config.garch_p_range = (int(garch_p_min), int(garch_p_max))
-        config.garch_q_range = (int(garch_q_min), int(garch_q_max))
-        config.regime_states = int(regime_states)
-
-        # propagate to analytics engine
-        self.analytics.risk_free_rate = float(risk_free_rate)
-        self.analytics.annual_trading_days = int(annual_trading_days)
-
-        st.session_state["analysis_config"] = config
-        st.success("Configuration saved successfully!")
-
-    st.divider()
-    st.subheader("System Information")
-
-    s1, s2 = st.columns(2)
-    with s1:
-        st.metric("Python Version", f"{sys.version.split()[0]}")
-        st.metric("Pandas Version", pd.__version__)
-        st.metric("NumPy Version", np.__version__)
-    with s2:
-        st.metric("Streamlit Version", st.__version__)
-        try:
-            import plotly
-            st.metric("Plotly Version", plotly.__version__)
-        except Exception:
-            st.metric("Plotly Version", "N/A")
-
-        # Memory usage (optional)
-        try:
-            import psutil
-            p = psutil.Process()
-            mem_mb = p.memory_info().rss / 1024 / 1024
-            st.metric("Memory Usage", f"{mem_mb:.1f} MB")
-        except Exception:
-            st.metric("Memory Usage", "N/A (psutil missing)")
-
-    st.divider()
-    st.subheader("Dependency Status")
-
-    try:
-        deps_status = []
-        for dep_name, dep_info in getattr(dep_manager, "dependencies", {}).items():
-            status = "✅ Available" if dep_info.get("available", False) else "❌ Not Available"
-            deps_status.append(f"{dep_name}: {status}")
-        st.write("\n".join(deps_status) if deps_status else "Dependency registry not available.")
-    except Exception:
-        st.write("Dependency registry not available.")
-
-
-def _display_portfolio_lab(self, config: AnalysisConfiguration):
-    """Portfolio Lab with PyPortfolioOpt integration (optional dependency)."""
-    import numpy as np
-    import pandas as pd
-    import streamlit as st
-
-    st.markdown('<div class="section-header"><h2>🧰 Portfolio Lab (PyPortfolioOpt Integration)</h2></div>', unsafe_allow_html=True)
-
-    # optional dependency
-    try:
-        from pypfopt import expected_returns, risk_models
-        from pypfopt.efficient_frontier import EfficientFrontier
-        from pypfopt.discrete_allocation import DiscreteAllocation, get_latest_prices
-        pypfopt_available = True
-    except Exception:
-        pypfopt_available = False
-
-    if not pypfopt_available:
-        st.warning("PyPortfolioOpt not available. Install with: pip install PyPortfolioOpt")
-        return
-
-    if not st.session_state.get("data_loaded", False):
-        st.warning("Please load data first.")
-        return
-
-    returns_df = _icd__get_returns_df(self)
-    if returns_df.empty:
-        st.warning("No returns data available.")
-        return
-
-    st.subheader("PyPortfolioOpt Optimization")
-
-    selected_assets = st.multiselect(
-        "Select Assets for Optimization",
-        options=list(returns_df.columns),
-        default=list(returns_df.columns)[: min(6, len(returns_df.columns))],
-        key="aa_pypfopt_assets",
-    )
-    if not selected_assets:
-        return
-
-    r = returns_df[selected_assets].dropna()
-    if len(r) < 60:
-        st.warning("Need at least 60 days of overlapping data for optimization.")
-        return
-
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        opt_method = st.selectbox(
-            "Optimization Method",
-            options=["max_sharpe", "min_volatility", "efficient_risk", "efficient_return"],
-            key="aa_pypfopt_method",
-        )
-    with c2:
-        returns_model = st.selectbox(
-            "Returns Model",
-            options=["mean_historical_return", "ema_historical_return", "capm_return"],
-            key="aa_pypfopt_returns_model",
-        )
-    with c3:
-        risk_model = st.selectbox(
-            "Risk Model",
-            options=["sample_cov", "semicovariance", "exp_cov", "ledoit_wolf", "oracle_approximating"],
-            key="aa_pypfopt_risk_model",
-        )
-
-    # expected returns
-    if returns_model == "mean_historical_return":
-        mu = expected_returns.mean_historical_return(r)
-    elif returns_model == "ema_historical_return":
-        mu = expected_returns.ema_historical_return(r)
-    else:
-        bench_df = _icd__get_bench_df()
-        if not bench_df.empty:
-            market_returns = bench_df.iloc[:, 0].dropna()
-            mu = expected_returns.capm_return(r, market_returns)
-        else:
-            mu = expected_returns.mean_historical_return(r)
-
-    # risk model
-    if risk_model == "sample_cov":
-        S = risk_models.sample_cov(r)
-    elif risk_model == "semicovariance":
-        S = risk_models.semicovariance(r)
-    elif risk_model == "exp_cov":
-        S = risk_models.exp_cov(r)
-    elif risk_model == "ledoit_wolf":
-        S = risk_models.CovarianceShrinkage(r).ledoit_wolf()
-    else:
-        S = risk_models.CovarianceShrinkage(r).oracle_approximating()
-
-    ef = EfficientFrontier(mu, S)
-
-    # optimization
-    try:
-        if opt_method == "max_sharpe":
-            ef.max_sharpe()
-        elif opt_method == "min_volatility":
-            ef.min_volatility()
-        elif opt_method == "efficient_risk":
-            target_vol = st.slider("Target Volatility", 0.05, 0.80, 0.20, 0.01, key="aa_target_vol")
-            ef.efficient_risk(target_volatility=float(target_vol))
-        else:
-            target_ret = st.slider("Target Return", 0.01, 0.80, 0.10, 0.01, key="aa_target_ret")
-            ef.efficient_return(target_return=float(target_ret))
-    except Exception as e:
-        st.error(f"Optimization failed: {e}")
-        return
-
-    w = ef.clean_weights()
-    st.subheader("Optimal Weights")
-    wdf = pd.DataFrame({"Asset": list(w.keys()), "Weight": list(w.values())})
-    wdf["Weight %"] = (wdf["Weight"] * 100).map(lambda x: f"{x:.2f}%")
-    st.dataframe(wdf[["Asset", "Weight %"]].set_index("Asset"), use_container_width=True)
-
-    st.subheader("Portfolio Performance")
-    perf = ef.portfolio_performance(verbose=False)
-    k1, k2, k3 = st.columns(3)
-    with k1:
-        st.metric("Expected Annual Return", f"{perf[0]*100:.2f}%")
-    with k2:
-        st.metric("Expected Annual Volatility", f"{perf[1]*100:.2f}%")
-    with k3:
-        st.metric("Sharpe Ratio", f"{perf[2]:.2f}")
-
-    st.subheader("Discrete Allocation")
-    port_value = st.number_input("Portfolio Value ($)", 10000, 10000000, 100000, 10000, key="aa_port_value")
-    try:
-        latest_prices = get_latest_prices(r)
-        da = DiscreteAllocation(w, latest_prices, total_portfolio_value=float(port_value))
-        allocation, leftover = da.lp_portfolio()
-
-        if allocation:
-            alloc_df = pd.DataFrame({
-                "Asset": list(allocation.keys()),
-                "Shares": list(allocation.values()),
-                "Value": [float(allocation[a]) * float(latest_prices[a]) for a in allocation.keys()],
-            })
-            st.dataframe(alloc_df, use_container_width=True)
-            st.metric("Leftover Cash", f"${float(leftover):.2f}")
-        else:
-            st.info("No discrete allocation found (constraints may be too tight).")
-    except Exception as e:
-        st.info(f"Discrete allocation not available: {e}")
-
-
-# -----------------------------------------------------------------------------
-# Bind missing methods to the class (safe: only if absent, or if a previous fallback binder was used)
-# -----------------------------------------------------------------------------
-def _icd__bind_method(name: str, fn):
-    try:
-        cur = getattr(InstitutionalCommoditiesDashboard, name, None)
-        # If missing OR previously bound to a fallback helper, override with the merged implementation
-        if cur is None or getattr(cur, "__name__", "").startswith("_icd_"):
-            setattr(InstitutionalCommoditiesDashboard, name, fn)
-    except Exception:
-        try:
-            setattr(InstitutionalCommoditiesDashboard, name, fn)
-        except Exception:
-            pass
-
-_icd__bind_method("_display_advanced_analytics", _display_advanced_analytics)
-_icd__bind_method("_display_risk_analytics", _display_risk_analytics)
-_icd__bind_method("_display_ewma_ratio_signal", _display_ewma_ratio_signal)
-_icd__bind_method("_display_portfolio", _display_portfolio)
-_icd__bind_method("_display_rolling_beta", _display_rolling_beta)
-_icd__bind_method("_display_relative_risk", _display_relative_risk)
-_icd__bind_method("_display_stress_testing", _display_stress_testing)
-_icd__bind_method("_display_reporting", _display_reporting)
-_icd__bind_method("_display_settings", _display_settings)
-_icd__bind_method("_display_portfolio_lab", _display_portfolio_lab)
-
-# =============================================================================
-# ✅ END MERGE PATCH
-# =============================================================================
-
 
 # Execute router (Streamlit entrypoint)
 _run_app_router()
