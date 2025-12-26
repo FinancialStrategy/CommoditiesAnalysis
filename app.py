@@ -6202,24 +6202,23 @@ def _icd_display_reporting_fallback(self, cfg):
         st.download_button("⬇️ Download Metrics CSV", data=csv, file_name="performance_metrics.csv", mime="text/csv", key="rep_csv")
 
         # Excel download
-                bio = None
+        excel_bytes = None
+        for _engine in ("openpyxl", "xlsxwriter"):
+            try:
+                __import__(_engine)
+                bio = BytesIO()
+                with pd.ExcelWriter(bio, engine=_engine) as writer:
+                    df.to_excel(writer, sheet_name="metrics")
+                excel_bytes = bio.getvalue()
+                break
+            except Exception:
                 excel_bytes = None
-                for _engine in ("openpyxl", "xlsxwriter"):
-                    try:
-                        __import__(_engine)
-                        bio = BytesIO()
-                        with pd.ExcelWriter(bio, engine=_engine) as writer:
-                            df.to_excel(writer, sheet_name="metrics")
-                        excel_bytes = bio.getvalue()
-                        break
-                    except Exception:
-                        excel_bytes = None
 
-                if excel_bytes:
-                    st.download_button("⬇️ Download Metrics Excel", data=excel_bytes, file_name="performance_metrics.xlsx",
-                                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="rep_xlsx")
-                else:
-                    st.info("Excel export is unavailable in this environment. Please use the CSV export.")
+        if excel_bytes:
+            st.download_button("⬇️ Download Metrics Excel", data=excel_bytes, file_name="performance_metrics.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="rep_xlsx")
+        else:
+            st.info("Excel export is unavailable in this environment. Please use the CSV export.")
     else:
         st.warning("No metrics computed (data too short?).")
 
