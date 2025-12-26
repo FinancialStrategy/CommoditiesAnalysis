@@ -2664,7 +2664,7 @@ class InstitutionalVisualizer:
 # =============================================================================
 
 class InstitutionalCommoditiesDashboard:
-    """Main dashboard class with superior architecture"""
+    """Institutional commodities dashboard (Streamlit)."""
     
     def __init__(self):
         # Initialize components
@@ -2773,7 +2773,7 @@ class InstitutionalCommoditiesDashboard:
     
 
     def display_header(self):
-        """Display professional institutional header (clean)."""
+        """Display the app header."""
 
         st.components.v1.html(f"""
         <div style="
@@ -3210,7 +3210,7 @@ class InstitutionalCommoditiesDashboard:
             )
 
     def run(self):
-        """Main app runner (Streamlit entry)."""
+        """Run the Streamlit app."""
         try:
             self.display_header()
 
@@ -3514,7 +3514,6 @@ def _icd_display_relative_risk_fallback(self, cfg):
 
 # Bind missing methods safely (no crashes)
 try:
-    InstitutionalCommoditiesDashboard  # noqa: F401
     if not hasattr(InstitutionalCommoditiesDashboard, "_to_returns_df"):
         InstitutionalCommoditiesDashboard._to_returns_df = _icd__to_returns_df_fallback
     if not hasattr(InstitutionalCommoditiesDashboard, "_display_relative_risk"):
@@ -4124,11 +4123,69 @@ def _display_advanced_analytics(self, config: AnalysisConfiguration):
 
                 cond_vol = best_model.get("conditional_volatility", None)
                 if cond_vol is not None:
+                    # Chart 1: existing GARCH visualization (typically returns + volatility overlay, depending on Visualizer)
                     try:
                         fig = self.visualizer.create_garch_volatility(asset_returns, cond_vol)
                         st.plotly_chart(fig, use_container_width=True, key="aa_garch_vol_chart")
                     except Exception as e:
                         st.info(f"Volatility plot unavailable: {e}")
+
+                    # Chart 2 (NEW): conditional volatility series as a separate detailed chart
+                    try:
+                        import numpy as np
+                        import pandas as pd
+                        import plotly.graph_objects as go
+
+                        # Normalize conditional volatility to a clean pandas Series aligned to dates
+                        if isinstance(cond_vol, pd.Series):
+                            cond_vol_ser = cond_vol.copy()
+                        elif isinstance(cond_vol, (list, tuple, np.ndarray)):
+                            # Align to the *tail* of the returns index if lengths differ
+                            n = len(cond_vol)
+                            cond_vol_ser = pd.Series(cond_vol, index=asset_returns.index[-n:])
+                        else:
+                            # best effort conversion
+                            cond_vol_ser = pd.Series(cond_vol)
+
+                        cond_vol_ser = cond_vol_ser.dropna()
+                        if not cond_vol_ser.empty:
+                            # Optional smoothing line (20D MA) for better "institutional" readability
+                            ma20 = cond_vol_ser.rolling(20).mean()
+
+                            fig2 = go.Figure()
+                            fig2.add_trace(go.Scatter(
+                                x=cond_vol_ser.index,
+                                y=cond_vol_ser.values,
+                                name="Conditional Volatility",
+                                mode="lines",
+                                line=dict(width=2),
+                            ))
+                            fig2.add_trace(go.Scatter(
+                                x=ma20.index,
+                                y=ma20.values,
+                                name="20D MA",
+                                mode="lines",
+                                line=dict(width=1, dash="dash"),
+                            ))
+
+                            template = getattr(self.visualizer, "template", "plotly_white")
+                            fig2.update_layout(
+                                title=f"GARCH Conditional Volatility (Detailed) — {selected_asset}",
+                                height=460,
+                                template=template,
+                                hovermode="x unified",
+                                xaxis_title="Date",
+                                yaxis_title="σ(t)",
+                                margin=dict(l=10, r=10, t=55, b=10),
+                            )
+
+                            st.plotly_chart(fig2, use_container_width=True, key="aa_garch_condvol_detail")
+
+                            with st.expander("📌 Conditional Volatility (last 30 obs)", expanded=False):
+                                tail_df = pd.DataFrame({"cond_vol": cond_vol_ser.tail(30)})
+                                st.dataframe(tail_df, use_container_width=True)
+                    except Exception as e:
+                        st.info(f"Conditional volatility series chart unavailable: {e}")
             else:
                 st.warning(garch_results.get("message", "GARCH analysis failed.") if isinstance(garch_results, dict) else "GARCH analysis failed.")
         else:
