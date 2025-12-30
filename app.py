@@ -53,6 +53,35 @@ except Exception:
 from io import BytesIO, StringIO
 import base64
 
+
+# =============================================================================
+# EXCEL EXPORT (CLOUD-SAFE ENGINE FALLBACK)
+# =============================================================================
+def icd_safe_excel_writer(buffer_obj):
+    """
+    Create a pandas ExcelWriter with a robust engine fallback.
+
+    Streamlit Cloud deployments sometimes omit optional Excel dependencies.
+    This helper tries `openpyxl` first (common default), then `xlsxwriter`.
+    If neither engine is available, returns (None, None) and the caller can
+    disable Excel export gracefully instead of crashing the app.
+    """
+    # Try openpyxl (preferred for .xlsx read/write compatibility)
+    try:
+        import openpyxl  # noqa: F401
+        return pd.ExcelWriter(buffer_obj, engine="openpyxl"), "openpyxl"
+    except Exception:
+        pass
+
+    # Try xlsxwriter (fast writer-only engine; great fallback on Cloud)
+    try:
+        import xlsxwriter  # noqa: F401
+        return pd.ExcelWriter(buffer_obj, engine="xlsxwriter"), "xlsxwriter"
+    except Exception:
+        pass
+
+    return None, None
+
 # =============================================================================
 # CONFIGURATION & SETUP
 # =============================================================================
@@ -6465,8 +6494,12 @@ def _icd_display_reporting_fallback(self, cfg):
 
         # Excel download
         bio = BytesIO()
-        with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-            df.to_excel(writer, sheet_name="metrics")
+        writer_obj, engine_used = icd_safe_excel_writer(bio)
+        if writer_obj is None:
+            st.error("Excel export disabled: install `openpyxl` or `xlsxwriter` in requirements.txt.")
+        else:
+            with writer_obj as writer:
+                df.to_excel(writer, sheet_name="metrics")
         st.download_button("⬇️ Download Metrics Excel", data=bio.getvalue(), file_name="performance_metrics.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="rep_xlsx")
     else:
