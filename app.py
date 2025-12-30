@@ -3794,7 +3794,7 @@ def run_quantum_sovereign_v14_terminal():
             """Global Macro Overlay (DXY, 10Y Yields)."""
             macro = yf.download(["DX-Y.NYB", "^TNX"], period="5y", progress=False)['Adj Close']
             macro.columns = ["DXY", "US10Y"]
-            return macro.pct_change().dropna()
+            return macro.pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan).dropna()
 
     # =============================================================================
     # 3. HYBRID QUANTUM AI ENGINE (LSTM + ELMAN RNN + XGBOOST)
@@ -3986,7 +3986,7 @@ def run_quantum_sovereign_v14_terminal():
                         st.error("No price data returned.")
                         return
 
-                    returns = price_data.pct_change().dropna()
+                    returns = price_data.pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan).dropna(how="all")
                     macro_data = self.dm.get_macro_data()
 
                     # Main Dashboard Layout
@@ -4072,7 +4072,7 @@ def run_quantum_sovereign_v14_terminal():
                         if combined.empty:
                             st.info("Not enough overlapping macro + asset returns.")
                         else:
-                            corr_matrix = combined.corr()
+                            corr_matrix = combined.corr(min_periods=60)
                             try:
                                 st.plotly_chart(px.imshow(corr_matrix, text_auto=".2f", color_continuous_scale="RdBu_r", template="plotly_dark"),
                                                 use_container_width=True, key="qs_macro_corr")
@@ -5871,80 +5871,163 @@ def _icd__equal_weight_portfolio(returns_df, asset_cols):
     port = pd.to_numeric(port, errors="coerce").dropna()
     return port
 
-def _icd__compute_correlation_matrix(self, returns_df, method="sample_aligned", ensure_psd=True):
+def _icd__compute_correlation_matrix(self, returns_df, method="sample_pairwise", ensure_psd=True):
     """
+    Robust correlation matrix for *reporting* and *visualization*.
+
+    Why correlations sometimes show as ~1 (or exactly 1) across many pairs:
+    - If you compute correlation on a *tiny overlap* (e.g., 2-5 points), the sample correlation can be ±1
+      (two points always lie perfectly on a line).
+    - If you do strict complete-case alignment across many assets, the intersection of dates can collapse.
+    - If a series is nearly constant (zero variance) after cleaning, corr can be unstable / NaN.
+
+    This implementation:
+    - Computes pairwise correlations with a **minimum overlap** (min_corr_obs; default 60).
+    - Falls back gracefully when alignment is too strict.
+    - Optionally enforces PSD (Higham) *after* sanitizing NaNs/Infs, to prevent optimization crashes.
+
+    Parameters
+    ----------
     method:
-      - sample_aligned: drop all-NA columns, then drop any row with NA (complete-case), then sample corr
-      - sample_pairwise: pandas pairwise correlation (can be non-PSD)
-      - ledoit_wolf: Ledoit–Wolf covariance -> correlation (requires sklearn); uses complete-case data
+      - "sample_pairwise" (default): pairwise deletion + min overlap (recommended for reporting)
+      - "sample_aligned": complete-case across all assets, but only if enough rows; else falls back to pairwise
+      - "ledoit_wolf": Ledoit–Wolf covariance -> corr on complete-case data (requires sklearn); needs enough rows
     """
     import numpy as np
     import pandas as pd
 
+    # --- data hygiene ---
+    if returns_df is None:
+        return pd.DataFrame()
+
     df = returns_df.copy()
+    df = df.replace([np.inf, -np.inf], np.nan)
     df = df.apply(pd.to_numeric, errors="coerce").dropna(axis=1, how="all")
 
     if df.shape[1] < 2:
         return pd.DataFrame()
 
-    if method in ("sample_aligned", "ledoit_wolf"):
-        # strict alignment for correct reporting
-        df_cc = df.dropna(how="any")
-        if df_cc.shape[0] >= 40:
-            df_use = df_cc
-        else:
-            df_use = df
-    else:
-        df_use = df
+    # Minimum overlap gate per pair (prevents tiny overlaps -> corr = ±1)
+    # Prefer cfg if present; else use safe default.
+    min_obs = int(getattr(getattr(self, "cfg", object()), "min_corr_obs", 60))
+    min_obs = max(10, min_obs)
 
-    corr = None
+    # Pairwise overlap counts (useful for diagnosing issues)
+    try:
+        mask = df.notna().astype(np.int8)
+        n_obs = (mask.T @ mask).astype(int)
+    except Exception:
+        n_obs = None
 
+    # --- correlation estimation ---
+    corr_df = None
+
+    # Ledoit–Wolf (optional)
     if method == "ledoit_wolf":
         try:
             from sklearn.covariance import LedoitWolf
-            X = df_use.dropna(how="any").values
-            if X.shape[0] < 40:
+            df_cc = df.dropna(how="any")
+            if df_cc.shape[0] < min_obs:
                 raise ValueError("Insufficient aligned observations for Ledoit-Wolf.")
+            X = df_cc.values
             lw = LedoitWolf().fit(X)
             cov = np.asarray(lw.covariance_, dtype=float)
             d = np.sqrt(np.clip(np.diag(cov), 1e-18, None))
             denom = np.outer(d, d)
-            corr = np.divide(cov, denom, out=np.zeros_like(cov), where=denom > 0)
+            corr = np.divide(cov, denom, out=np.full_like(cov, np.nan), where=denom > 0)
+            corr_df = pd.DataFrame(corr, index=list(df_cc.columns), columns=list(df_cc.columns))
         except Exception:
-            # fallback to aligned sample correlation
-            method = "sample_aligned"
+            # fallback to pairwise
+            method = "sample_pairwise"
+            corr_df = None
 
-    if corr is None:
-        if method == "sample_pairwise":
-            corr = df_use.corr().values
+    # Aligned sample correlation (only if enough rows)
+    if corr_df is None and method == "sample_aligned":
+        df_cc = df.dropna(how="any")
+        if df_cc.shape[0] >= min_obs:
+            # On aligned data, classic sample correlation is fine
+            corr_df = df_cc.corr()
         else:
-            corr = df_use.dropna(how="any").corr().values
+            # Fall back to pairwise with min overlap (more realistic on multi-market datasets)
+            method = "sample_pairwise"
 
-    # sanitize
-    corr = np.asarray(corr, dtype=float)
-    corr = 0.5 * (corr + corr.T)
-    np.fill_diagonal(corr, 1.0)
-    corr = np.clip(corr, -1.0, 1.0)
+    # Pairwise correlation with minimum overlap
+    if corr_df is None:
+        # pandas supports min_periods in corr() (modern versions). Keep a manual fallback.
+        try:
+            corr_df = df.corr(method="pearson", min_periods=min_obs)
+        except TypeError:
+            # Manual fallback for very old pandas
+            cols = list(df.columns)
+            corr_mat = np.full((len(cols), len(cols)), np.nan, dtype=float)
+            for i, ci in enumerate(cols):
+                xi = df[ci]
+                for j, cj in enumerate(cols):
+                    if j < i:
+                        continue
+                    xj = df[cj]
+                    both = xi.notna() & xj.notna()
+                    nn = int(both.sum())
+                    if i == j:
+                        corr_mat[i, j] = 1.0
+                    elif nn >= min_obs:
+                        a = xi[both].astype(float).values
+                        b = xj[both].astype(float).values
+                        sa = np.std(a, ddof=1)
+                        sb = np.std(b, ddof=1)
+                        if sa > 1e-12 and sb > 1e-12:
+                            corr_mat[i, j] = float(np.corrcoef(a, b)[0, 1])
+                        else:
+                            corr_mat[i, j] = np.nan
+                    else:
+                        corr_mat[i, j] = np.nan
+                    corr_mat[j, i] = corr_mat[i, j]
+            corr_df = pd.DataFrame(corr_mat, index=cols, columns=cols)
 
-    # PSD enforcement for downstream risk engines
+    # --- sanitize ---
+    corr_df = corr_df.copy()
+    corr_df = corr_df.replace([np.inf, -np.inf], np.nan)
+    # Keep NaNs for reporting (insufficient overlap), but ensure diag = 1
+    np.fill_diagonal(corr_df.values, 1.0)
+    corr_df = corr_df.clip(-1.0, 1.0)
+
+    # --- Optional PSD enforcement (for risk engines / optimization) ---
+    # For visualization, PSD is not strictly necessary; but if requested, sanitize NaNs to 0 for Higham.
     if ensure_psd:
         try:
+            corr_work = corr_df.copy()
+            corr_work = corr_work.fillna(0.0)
+            corr = corr_work.values.astype(float)
+            corr = 0.5 * (corr + corr.T)
+            np.fill_diagonal(corr, 1.0)
+
             if hasattr(self, "analytics") and hasattr(self.analytics, "_higham_nearest_correlation"):
                 corr = self.analytics._higham_nearest_correlation(corr, max_iter=100, tol=1e-7, epsilon=1e-12)
-        except Exception:
-            # eigen-clip fallback
-            try:
+            else:
+                # eigen-clip fallback
                 vals, vecs = np.linalg.eigh(corr)
                 vals = np.clip(vals, 1e-10, None)
                 corr = (vecs @ np.diag(vals) @ vecs.T)
                 corr = 0.5 * (corr + corr.T)
                 np.fill_diagonal(corr, 1.0)
-            except Exception:
-                pass
 
-    out = pd.DataFrame(corr, index=list(df_use.columns), columns=list(df_use.columns))
-    return out
+            corr = np.clip(corr, -1.0, 1.0)
+            corr_df = pd.DataFrame(corr, index=list(corr_df.index), columns=list(corr_df.columns))
+        except Exception:
+            # If PSD enforcement fails, return the non-PSD but realistic pairwise corr_df
+            pass
 
+    # Attach overlap counts for debugging if caller wants it
+    # (We do not return it to preserve API, but store in self for optional display.)
+    try:
+        if n_obs is not None:
+            self._last_corr_overlap = n_obs
+            self._last_corr_min_obs = min_obs
+            self._last_corr_method = method
+    except Exception:
+        pass
+
+    return corr_df
 def _icd_display_advanced_analytics_fallback(self, cfg):
     import numpy as np
     import pandas as pd
