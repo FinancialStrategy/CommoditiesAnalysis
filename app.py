@@ -1863,42 +1863,85 @@ class InstitutionalAnalytics:
         self,
         returns: pd.Series,
         confidence_level: float = 0.95,
-        method: str = "historical"
+        method: str = "historical",
+        horizon: int = 1,
+        use_log_aggregation: bool = True
     ) -> Dict[str, Any]:
-        """Robust VaR / CVaR(ES) / ES engine.
+        """Robust VaR / CVaR(ES) / ES engine (NaN-proof, horizon-aware).
 
-        This fixes two common issues that lead to NaNs or 'all 1' / nonsensical outputs:
-        1) Too-small effective sample after alignment / cleaning.
-        2) Key mismatches between analytics output and Streamlit UI expectations.
+        Fixes common production issues:
+        - NaNs in VaR/CVaR/ES from residual NaNs/Infs or tiny effective samples.
+        - Incorrect multi-day scaling (sqrt approximation) by computing horizon returns directly.
+        - Key mismatches between analytics output and Streamlit UI expectations.
 
-        Output keys are intentionally aligned with the Streamlit Risk Analytics UI:
-        - VaR (positive loss measure, decimal; e.g., 0.02 = 2%)
-        - CVaR (positive loss measure, decimal)
-        - ES (alias of CVaR; positive loss measure, decimal)
+        Returns POSITIVE loss measures in decimal units:
+        - VaR: 0.02 means 2% loss
+        - CVaR/ES: expected shortfall (positive)
         """
-        # Defensive cleaning: numeric, drop inf/nan, stable order
+        # Defensive cleaning: numeric, drop inf/nan, stable order, unique index
         try:
             rr = pd.to_numeric(returns, errors="coerce")
         except Exception:
             rr = returns.copy()
-        rr = rr.replace([np.inf, -np.inf], np.nan).dropna()
+
+        try:
+            rr = rr.replace([np.inf, -np.inf], np.nan).dropna()
+        except Exception:
+            rr = rr.dropna() if hasattr(rr, "dropna") else rr
+
         try:
             rr = rr[~rr.index.duplicated(keep="last")].sort_index()
         except Exception:
             pass
 
-        if rr is None or rr.empty:
-            return {"success": False, "message": "No valid returns available for VaR.", "n_obs": 0}
+        if rr is None or getattr(rr, "empty", False):
+            return {"success": False, "message": "No valid returns available for VaR.", "n_obs": 0, "horizon": int(horizon)}
 
-        n = int(len(rr))
-        alpha = 1.0 - float(confidence_level)  # tail probability
+        # Horizon aggregation (compute H-day returns explicitly)
+        try:
+            h = int(horizon)
+        except Exception:
+            h = 1
+        h = max(1, h)
+
+        if h > 1:
+            try:
+                if use_log_aggregation:
+                    # log aggregation is numerically stable: exp(sum(log(1+r))) - 1
+                    lr = np.log1p(rr.astype(float))
+                    agg = lr.rolling(h).sum()
+                    rr_h = np.expm1(agg).dropna()
+                else:
+                    rr_h = rr.astype(float).rolling(h).sum().dropna()
+            except Exception:
+                rr_h = rr.copy()
+        else:
+            rr_h = rr.copy()
+
+        if rr_h is None or getattr(rr_h, "empty", False):
+            return {"success": False, "message": "No valid horizon-aggregated returns for VaR.", "n_obs": 0, "horizon": int(h)}
+
+        # Final sanitize (nanquantile safety)
+        try:
+            rr_h = pd.to_numeric(rr_h, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+        except Exception:
+            pass
+
+        n = int(len(rr_h))
+        if n <= 0:
+            return {"success": False, "message": "No valid returns available after cleaning.", "n_obs": 0, "horizon": int(h)}
+
+        method = (method or "historical").lower().strip()
+        cl = float(confidence_level) if confidence_level is not None else 0.95
+        cl = min(max(cl, 0.50), 0.999)  # clamp to safe range
+        alpha = 1.0 - cl  # tail probability (e.g., 0.05 for 95% VaR)
 
         # Moments (guard against NaN std when n < 2)
-        mu = float(rr.mean()) if n > 0 else 0.0
+        mu = float(rr_h.mean()) if n > 0 else 0.0
         if n >= 2:
-            sigma = float(rr.std(ddof=1))
+            sigma = float(rr_h.std(ddof=1))
             if not np.isfinite(sigma):
-                sigma = float(rr.std(ddof=0))
+                sigma = float(rr_h.std(ddof=0))
         else:
             sigma = 0.0
 
@@ -1907,23 +1950,19 @@ class InstitutionalAnalytics:
         if not np.isfinite(sigma):
             sigma = 0.0
 
-        # Small-sample warning (compute anyway; but surface the risk)
         warning = ""
-        if n < 30:
-            warning = f"Very small sample (n={n}); VaR may be unstable."
+        if n < 60:
+            warning = f"Small effective sample (n={n}). Results may be unstable."
 
-        method = (method or "historical").lower().strip()
-
-        # Compute 1-day VaR and CVaR as POSITIVE loss measures (decimals)
         var = 0.0
         cvar = 0.0
 
         try:
             if method == "historical":
-                q = float(np.quantile(rr.values, alpha))
+                q = float(np.nanquantile(rr_h.values, alpha))
                 var = -q
-                tail = rr[rr <= q]
-                cvar = -float(tail.mean()) if len(tail) > 0 else float(var)
+                tail = rr_h[rr_h <= q]
+                cvar = -float(np.nanmean(tail.values)) if len(tail) > 0 else float(var)
 
             elif method == "parametric":
                 if sigma < 1e-12:
@@ -1936,68 +1975,83 @@ class InstitutionalAnalytics:
                     cvar = -mu + sigma * (pdf / max(alpha, 1e-12))
 
             elif method == "modified":
-                # Cornish-Fisher adjusted quantile (skew/kurt)
+                # Cornish-Fisher adjusted quantile (using empirical skew/excess kurtosis)
                 if sigma < 1e-12:
                     var, cvar = 0.0, 0.0
                 else:
                     z = float(stats.norm.ppf(alpha))
                     try:
-                        skew = float(stats.skew(rr.values, bias=False)) if n >= 3 else 0.0
+                        s = float(rr_h.skew())
                     except Exception:
-                        skew = 0.0
+                        s = 0.0
                     try:
-                        exkurt = float(stats.kurtosis(rr.values, fisher=True, bias=False)) if n >= 4 else 0.0
+                        k_ex = float(rr_h.kurtosis())  # pandas: excess kurtosis by default
                     except Exception:
-                        exkurt = 0.0
+                        k_ex = 0.0
+                    if not np.isfinite(s):
+                        s = 0.0
+                    if not np.isfinite(k_ex):
+                        k_ex = 0.0
 
-                    z_cf = (z
-                            + (z**2 - 1.0) * skew / 6.0
-                            + (z**3 - 3.0 * z) * exkurt / 24.0
-                            - (2.0 * z**3 - 5.0 * z) * (skew**2) / 36.0)
-
+                    z_cf = (
+                        z
+                        + (1.0 / 6.0) * (z**2 - 1.0) * s
+                        + (1.0 / 24.0) * (z**3 - 3.0 * z) * k_ex
+                        - (1.0 / 36.0) * (2.0 * z**3 - 5.0 * z) * (s**2)
+                    )
                     q = mu + sigma * z_cf
                     var = -(q)
 
-                    # ES: prefer empirical tail beyond q if enough points, else normal approx
-                    tail = rr[rr <= q]
-                    if len(tail) >= max(5, int(0.01 * n)):
-                        cvar = -float(tail.mean())
-                    else:
-                        pdf = float(stats.norm.pdf(z_cf))
-                        cvar = -mu + sigma * (pdf / max(alpha, 1e-12))
+                    # Robust ES estimate from empirical tail below the adjusted quantile
+                    tail = rr_h[rr_h <= q]
+                    cvar = -float(np.nanmean(tail.values)) if len(tail) > 0 else float(var)
 
             else:
-                # Unknown method -> fall back to historical
-                q = float(np.quantile(rr.values, alpha))
+                # Unknown method -> default to historical
+                q = float(np.nanquantile(rr_h.values, alpha))
                 var = -q
-                tail = rr[rr <= q]
-                cvar = -float(tail.mean()) if len(tail) > 0 else float(var)
+                tail = rr_h[rr_h <= q]
+                cvar = -float(np.nanmean(tail.values)) if len(tail) > 0 else float(var)
 
         except Exception as e:
             return {
                 "success": False,
-                "message": f"VaR calculation failed: {e}",
-                "n_obs": n,
+                "message": f"VaR computation failed: {e}",
+                "method": method,
+                "confidence_level": float(cl),
+                "n_obs": int(n),
+                "horizon": int(h),
+                "warning": warning,
             }
 
-        # Keep as non-negative (loss measure). Guard against tiny negatives from float noise.
-        if not np.isfinite(var):
-            var = 0.0
-        if not np.isfinite(cvar):
-            cvar = 0.0
-        var = float(max(0.0, var))
-        cvar = float(max(0.0, cvar))
+        # Final output sanitation
+        if not np.isfinite(var) or not np.isfinite(cvar):
+            return {
+                "success": False,
+                "message": "VaR computation produced non-finite output (NaN/Inf). Check return series cleaning/overlap.",
+                "method": method,
+                "confidence_level": float(cl),
+                "n_obs": int(n),
+                "horizon": int(h),
+                "warning": warning,
+            }
+
+        # Ensure non-negative loss magnitudes (can happen if returns are strongly positive)
+        var = float(max(var, 0.0))
+        cvar = float(max(cvar, 0.0))
 
         return {
             "success": True,
             "VaR": var,
             "CVaR": cvar,
             "ES": cvar,
-            "confidence_level": float(confidence_level),
+            "confidence_level": float(cl),
             "method": method,
-            "n_obs": n,
+            "n_obs": int(n),
+            "horizon": int(h),
             "warning": warning,
-            "returns": rr,
+            "mu": float(mu),
+            "sigma": float(sigma),
         }
 
     def stress_test(
@@ -6505,34 +6559,39 @@ def _icd_display_risk_analytics_fallback(self, cfg):
         horizon = st.select_slider("Horizon (days)", options=[1, 5, 10, 20], value=1, key="risk_horizon")
 
     try:
-        out = self.analytics.calculate_var(series, confidence_level=float(cl), method=method) or {}
+        out = self.analytics.calculate_var(series, confidence_level=float(cl), method=method, horizon=int(horizon)) or {}
     except Exception:
         out = {}
 
     if out and out.get("success", True):
-        # horizon scaling (sqrt) for volatility-dominated measures
-        scale = float(np.sqrt(int(horizon)))
-        var = out.get("VaR")
+                var = out.get("VaR")
         cvar = out.get("CVaR")
         es = out.get("ES", out.get("CVaR"))
-        # In our engine, VaR is likely a return-quantile (negative). Scale magnitude.
-        def _scale(x):
+        def _num(x):
             try:
-                return float(x) * scale
+                v = float(x)
+                return v if np.isfinite(v) else np.nan
             except Exception:
                 return np.nan
-        var_s = _scale(var)
-        cvar_s = _scale(cvar)
-        es_s = _scale(es)
-
+        var_s = _num(var)
+        cvar_s = _num(cvar)
+        es_s = _num(es)
         m1, m2, m3 = st.columns(3)
+        def _fmt(v):
+            try:
+                v = float(v)
+                return f"{v:.2%}" if np.isfinite(v) else "—"
+            except Exception:
+                return "—"
         with m1:
-            st.metric(f"VaR {int(cl*100)}% ({horizon}d)", f"{var_s:.2%}")
+            st.metric(f"VaR {int(cl*100)}% ({horizon}d)", _fmt(var_s))
         with m2:
-            st.metric(f"CVaR {int(cl*100)}% ({horizon}d)", f"{cvar_s:.2%}")
+            st.metric(f"CVaR {int(cl*100)}% ({horizon}d)", _fmt(cvar_s))
         with m3:
-            st.metric(f"ES {int(cl*100)}% ({horizon}d)", f"{es_s:.2%}")
+            st.metric(f"ES {int(cl*100)}% ({horizon}d)", _fmt(es_s))
 
+        if any([not np.isfinite(var_s), not np.isfinite(cvar_s), not np.isfinite(es_s)]):
+            st.warning("VaR/CVaR/ES returned non-finite values. This usually means your effective sample is too small after cleaning/alignment. Try selecting fewer assets, increasing history, or lowering min overlap.")
         st.json({k: v for k, v in out.items() if k not in ("returns",)}, expanded=False)
     else:
         st.warning(out.get("message", "VaR engine returned no result."))
