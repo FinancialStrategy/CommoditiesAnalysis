@@ -1761,7 +1761,7 @@ class InstitutionalAnalytics:
             }
             
         except Exception as e:
-            return {'available': False, 'message': 'Regime detection unavailable.'}
+            return {'available': False, 'message': f'Regime detection failed: {str(e)}'}
     
     # =========================================================================
     # RISK METRICS
@@ -3138,7 +3138,7 @@ class InstitutionalCommoditiesDashboard:
         """Interactive Tracking Error analytics with institutional band zones.
         Robust implementation: always available even if earlier patch blocks were misplaced.
         """
-        st.markdown("### Tracking Error (Band Monitoring)")
+        st.markdown("### 🎯 Tracking Error (Institutional Band Monitoring)")
         # --- Load returns
         to_df = getattr(self, "_to_returns_df", None)
         if callable(to_df):
@@ -3369,7 +3369,7 @@ class InstitutionalCommoditiesDashboard:
                 "🧮 Risk Analytics",
                 "📉 EWMA Ratio Signal",
                 "📈 Portfolio",
-                "Tracking Error",
+                "🎯 Tracking Error",
                 "β Rolling Beta",
                 "📉 Relative VaR/CVaR/ES",
                 "🧪 Stress Testing",
@@ -3634,7 +3634,7 @@ def _icd_display_relative_risk_fallback(self, cfg):
 
 # Bind missing methods safely (no crashes)
 try:
-    _ = InstitutionalCommoditiesDashboard  # noqa: F401
+    InstitutionalCommoditiesDashboard  # noqa: F401
     if not hasattr(InstitutionalCommoditiesDashboard, "_to_returns_df"):
         InstitutionalCommoditiesDashboard._to_returns_df = _icd__to_returns_df_fallback
     if not hasattr(InstitutionalCommoditiesDashboard, "_display_relative_risk"):
@@ -4094,9 +4094,27 @@ def run_quantum_sovereign_v14_terminal():
 
 
 # =============================================================================
-# 🧬 MERGED MODULE: Scientific Commodities Platform ULTRA (merged)
+# 🧬 MERGED MODULE: Scientific Commodities Platform v7.2 ULTRA (fixed)
 # =============================================================================
 
+"""
+🏛️ Institutional Commodities Analytics Platform v7.2 (Ultra)
+Enhanced Scientific Analytics • Robust Correlations (incl. Ledoit–Wolf) • Professional Risk Metrics
+Institutional-Grade Computational Finance Platform (Streamlit Single-File Edition)
+
+Key Upgrades (v7.2)
+- ✅ Correct correlation matrix + PSD-safe nearest-correlation fix (Higham-style)
+- ✅ Optional Ledoit–Wolf shrinkage correlation (scikit-learn)
+- ✅ New Institutional Signal tab:
+      (EWMA 22D Vol) / (EWMA 33D Vol + EWMA 99D Vol)
+      + Bollinger Bands + Green/Orange/Red risk bands
+- ✅ Real benchmark-based Treynor + Information Ratio (no random benchmark)
+- ✅ Hard crash fixes: `import scipy` + Higham DataFrame-safe implementation
+- ✅ NEW (added without removing core platform features):
+      • Interactive Tracking Error tab with green/orange/red band zones
+      • Rolling Beta tab
+      • Relative VaR / CVaR / ES vs benchmark chart with band zones
+"""
 
 # =============================================================================
 # IMPORTS (DO NOT MOVE st.set_page_config BELOW IMPORTS THAT REQUIRE st)
@@ -4136,7 +4154,7 @@ except Exception:
 # =============================================================================
 try:
     st.set_page_config(
-        page_title="Institutional Commodities Analytics v6.0",
+        page_title="Institutional Commodities Analytics Platform v7.2",
         page_icon="🏛️",
         layout="wide",
         initial_sidebar_state="expanded"
@@ -5033,8 +5051,8 @@ class ScientificCommoditiesPlatform:
         st.markdown(
             """
             <div class="institutional-hero">
-              <h1>Institutional Commodities Analytics <span class="subtle">v6.0</span></h1>
-              <p>Institutional-grade analytics and risk research toolkit.</p>
+              <h1>🏛️ Institutional Commodities Analytics Platform <span class="subtle">v7.2</span></h1>
+              <p>Robust correlations • Institutional risk metrics • EWMA volatility risk signal • Tracking Error • Rolling Beta • Relative VaR/CVaR/ES</p>
             </div>
             """,
             unsafe_allow_html=True
@@ -5051,13 +5069,13 @@ class ScientificCommoditiesPlatform:
                     st.code(traceback.format_exc())
 
         tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-            "Overview",
-            "Risk Analytics",
-            "EWMA Vol Ratio Signal",
-            "Correlation Analysis",
-            "Tracking Error",
-            "Rolling Beta",
-            "Relative VaR/CVaR/ES"
+            "📊 Overview",
+            "📈 Risk Analytics",
+            "🧭 EWMA Vol Ratio Signal",
+            "🔗 Correlation Analysis",
+            "🎯 Tracking Error",
+            "🧷 Rolling Beta",
+            "⚖️ Relative VaR/CVaR/ES"
         ])
 
         with tab1:
@@ -5082,8 +5100,9 @@ class ScientificCommoditiesPlatform:
         st.markdown(
             """
             <div class="section-header">
-                <h2>Overview</h2>
+                <h2>📊 Overview</h2>
                 <div class="section-actions">
+                    <span class="scientific-badge info">v7.2 Ultra</span>
                     <span class="scientific-badge">SciPy: {}</span>
                     <span class="scientific-badge">Plotly</span>
                 </div>
@@ -5155,9 +5174,12 @@ class ScientificCommoditiesPlatform:
         st.markdown(
             """
             <div class="section-header">
-                <h2>Risk Analytics</h2>
+                <h2>📈 Risk Analytics</h2>
                 <div class="section-actions">
-                    </div>
+                    <span class="scientific-badge info">Sharpe • Sortino</span>
+                    <span class="scientific-badge medium-risk">VaR/CVaR/ES</span>
+                    <span class="scientific-badge">Treynor • IR (real benchmark)</span>
+                </div>
             </div>
             """,
             unsafe_allow_html=True
@@ -5165,7 +5187,7 @@ class ScientificCommoditiesPlatform:
 
         res = st.session_state.get("sc_results", {})
         if not res:
-            st.info("Please run the analysis to populate this section.")
+            st.info("Run analysis first.")
             return
 
         metrics: Dict[str, Dict[str, Any]] = res.get("metrics", {})
@@ -5189,7 +5211,7 @@ class ScientificCommoditiesPlatform:
     def render_vol_ratio_signal(self):
         res = st.session_state.get("sc_results", {})
         if not res:
-            st.info("Please run the analysis to populate this section.")
+            st.info("Run analysis first.")
             return
 
         st.markdown(
@@ -5256,12 +5278,12 @@ class ScientificCommoditiesPlatform:
     def render_correlation_analysis(self):
         res = st.session_state.get("sc_results", {})
         if not res:
-            st.info("Please run the analysis to populate this section.")
+            st.info("Run analysis first.")
             return
         st.markdown(
             """
             <div class="section-header">
-                <h2>Correlation Analysis</h2>
+                <h2>🔗 Correlation Analysis</h2>
                 <div class="section-actions">
                     <span class="scientific-badge info">Correct alignment</span>
                     <span class="scientific-badge">PSD safe</span>
@@ -5283,12 +5305,12 @@ class ScientificCommoditiesPlatform:
     def render_tracking_error(self):
         res = st.session_state.get("sc_results", {})
         if not res:
-            st.info("Please run the analysis to populate this section.")
+            st.info("Run analysis first.")
             return
         st.markdown(
             """
             <div class="section-header">
-                <h2>Tracking Error</h2>
+                <h2>🎯 Tracking Error</h2>
                 <div class="section-actions">
                     <span class="scientific-badge info">Active risk vs benchmark</span>
                     <span class="scientific-badge medium-risk">Green/Orange/Red Zones</span>
@@ -5337,12 +5359,12 @@ class ScientificCommoditiesPlatform:
     def render_rolling_beta(self):
         res = st.session_state.get("sc_results", {})
         if not res:
-            st.info("Please run the analysis to populate this section.")
+            st.info("Run analysis first.")
             return
         st.markdown(
             """
             <div class="section-header">
-                <h2>Rolling Beta</h2>
+                <h2>🧷 Rolling Beta</h2>
                 <div class="section-actions">
                     <span class="scientific-badge info">Rolling CAPM beta</span>
                     <span class="scientific-badge">Benchmark-linked</span>
@@ -5384,7 +5406,7 @@ class ScientificCommoditiesPlatform:
     def render_relative_risk(self):
         res = st.session_state.get("sc_results", {})
         if not res:
-            st.info("Please run the analysis to populate this section.")
+            st.info("Run analysis first.")
             return
         st.markdown(
             """
@@ -5448,15 +5470,18 @@ class ScientificCommoditiesPlatform:
         st.markdown(
             """
             <div class="section-header">
-                <h2>Data & Validation</h2>
+                <h2>📋 Data & Validation</h2>
                 <div class="section-actions">
-                    </div>
+                    <span class="scientific-badge">Quality checks</span>
+                    <span class="scientific-badge">Overlap / NA</span>
+                    <span class="scientific-badge">Diagnostics</span>
+                </div>
             </div>
             """,
             unsafe_allow_html=True
         )
         if not res:
-            st.info("Please run the analysis to populate this section.")
+            st.info("No results yet.")
             return
 
         prices: pd.DataFrame = res.get("prices", pd.DataFrame())
@@ -5732,11 +5757,11 @@ def _icd_display_advanced_analytics_fallback(self, cfg):
         st.info("Performance metrics unavailable (data too short or invalid).")
 
     # GARCH (optional)
-    st.markdown("#### Volatility Modeling")
+    st.markdown("#### 📉 Volatility Modeling (GARCH)")
     garch_on = st.checkbox("Run GARCH(1,1) volatility estimate", value=False, key="adv_garch_on")
     if garch_on:
         try:
-            out = self.analytics.garch_analysis(s_aligned, p_range=(1, 1), q_range=(1, 1))
+            out = self.analytics.garch_analysis(s_aligned, p=1, q=1)
             if out and out.get("success", False):
                 vol = out.get("conditional_volatility")
                 if isinstance(vol, pd.Series) and not vol.empty:
@@ -5746,14 +5771,14 @@ def _icd_display_advanced_analytics_fallback(self, cfg):
             else:
                 st.warning(out.get("message", "GARCH analysis returned no result."))
         except Exception as e:
-            st.warning("Volatility model unavailable.")
+            st.warning(f"GARCH failed: {e}")
 
     # Regime detection (optional)
-    st.markdown("#### Regime Detection")
+    st.markdown("#### 🧩 Regime Detection (HMM optional)")
     reg_on = st.checkbox("Run regime detection (HMM if available)", value=False, key="adv_regime_on")
     if reg_on:
         try:
-            reg = self.analytics.detect_regimes(s_aligned, n_regimes=int(getattr(cfg, "regime_states", 3)))
+            reg = self.analytics.detect_regimes(s_aligned, n_states=int(getattr(cfg, "regime_states", 3)))
             if reg and reg.get("success", False):
                 states = reg.get("states")
                 if isinstance(states, pd.Series) and not states.empty:
@@ -5763,7 +5788,7 @@ def _icd_display_advanced_analytics_fallback(self, cfg):
             else:
                 st.warning(reg.get("message", "Regime detection returned no result."))
         except Exception as e:
-            st.warning("Regime model unavailable.")
+            st.warning(f"Regime detection failed: {e}")
 
 def _icd_display_risk_analytics_fallback(self, cfg):
     import numpy as np
@@ -6202,24 +6227,11 @@ def _icd_display_reporting_fallback(self, cfg):
         st.download_button("⬇️ Download Metrics CSV", data=csv, file_name="performance_metrics.csv", mime="text/csv", key="rep_csv")
 
         # Excel download
-                bio = None
-                excel_bytes = None
-                for _engine in ("openpyxl", "xlsxwriter"):
-                    try:
-                        __import__(_engine)
-                        bio = BytesIO()
-                        with pd.ExcelWriter(bio, engine=_engine) as writer:
-                            df.to_excel(writer, sheet_name="metrics")
-                        excel_bytes = bio.getvalue()
-                        break
-                    except Exception:
-                        excel_bytes = None
-
-                if excel_bytes:
-                    st.download_button("⬇️ Download Metrics Excel", data=excel_bytes, file_name="performance_metrics.xlsx",
-                                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="rep_xlsx")
-                else:
-                    st.info("Excel export is unavailable in this environment. Please use the CSV export.")
+        bio = BytesIO()
+        with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+            df.to_excel(writer, sheet_name="metrics")
+        st.download_button("⬇️ Download Metrics Excel", data=bio.getvalue(), file_name="performance_metrics.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="rep_xlsx")
     else:
         st.warning("No metrics computed (data too short?).")
 
@@ -6255,7 +6267,7 @@ def _icd_display_reporting_fallback(self, cfg):
 def _icd_display_settings_fallback(self, cfg):
     import streamlit as st
 
-    st.markdown("### Settings")
+    st.markdown("### ⚙️ Settings & Diagnostics")
 
     c1, c2 = st.columns(2)
     with c1:
@@ -6398,18 +6410,18 @@ def _icd_display_portfolio_lab_fallback(self, cfg):
             st.warning(out.get("message", "Internal optimizer failed."))
 
 def run_scientific_platform_v7_2_ultra():
-    """Wrapper for merged Scientific ULTRA platform."""
+    """Wrapper for merged v7.2 Ultra platform."""
     try:
         platform = ScientificCommoditiesPlatform()
         platform.render()
     except Exception as e:
         import streamlit as st
-        st.error(f"Scientific platform failed to start: {e}")
+        st.error(f"Scientific v7.2 platform failed to start: {e}")
         st.exception(e)
 
 # Bind missing UI methods safely (no AttributeErrors)
 try:
-    _ = InstitutionalCommoditiesDashboard  # noqa: F401
+    InstitutionalCommoditiesDashboard  # noqa: F401
     _bind = {
         "_display_advanced_analytics": _icd_display_advanced_analytics_fallback,
         "_display_risk_analytics": _icd_display_risk_analytics_fallback,
@@ -6436,6 +6448,7 @@ def _run_app_router():
         "Select application layer",
         options=[
             "🏛️ Institutional Commodities Platform (v6.x)",
+            "🧪 Scientific Commodities Platform (v7.2 Ultra)",
             "🧠 Quantum Sovereign Terminal (v14.0)"
         ],
         index=0,
@@ -6444,6 +6457,8 @@ def _run_app_router():
 
     if mode == "🧠 Quantum Sovereign Terminal (v14.0)":
         run_quantum_sovereign_v14_terminal()
+    elif mode == "🧪 Scientific Commodities Platform (v7.2 Ultra)":
+        run_scientific_platform_v7_2_ultra()
     else:
         # Ensure InstitutionalCommoditiesDashboard exists and is runnable
         try:
