@@ -22,3 +22,4 @@ plotly>=5.17.0
 quantstats>=0.0.60
 hmmlearn
 scikit-learn
+openpyxl
