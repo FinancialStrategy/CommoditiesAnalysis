@@ -1,4 +1,4 @@
-"""
+Portfolio optimization failed: Singular matrix C in LSQ subproblem: """
 🏛️ Institutional Commodities Analytics Platform v6.1
 Integrated Portfolio Analytics • Advanced GARCH & Regime Detection • Machine Learning • Professional Reporting
 Streamlit Cloud Optimized with Superior Architecture & Performance
@@ -1471,12 +1471,16 @@ class InstitutionalAnalytics:
         constraints: Optional[Dict] = None,
         target_return: Optional[float] = None
     ) -> Dict[str, Any]:
-        """Advanced portfolio optimization"""
+        """Advanced portfolio optimization with robust covariance handling"""
         
         if returns_df.empty or len(returns_df) < 60:
             return {'success': False, 'message': 'Insufficient data'}
         
         n_assets = returns_df.shape[1]
+        
+        # Check for sufficient data
+        if len(returns_df) < 2 * n_assets:
+            return {'success': False, 'message': f'Insufficient data points ({len(returns_df)}) for {n_assets} assets. Need at least {2 * n_assets} observations.'}
         
         # Default constraints
         if constraints is None:
@@ -1489,7 +1493,7 @@ class InstitutionalAnalytics:
         bounds = tuple((constraints['min_weight'], constraints['max_weight']) 
                       for _ in range(n_assets))
         
-        # Initial weights
+        # Initial weights (equal weight)
         init_weights = np.ones(n_assets) / n_assets
         
         # Define optimization constraints
@@ -1503,12 +1507,32 @@ class InstitutionalAnalytics:
                 'type': 'eq',
                 'fun': lambda w: np.sum(returns_df.mean() * w) * self.annual_trading_days - target_return
             })
-        # Define objective functions
-        cov_matrix = returns_df.cov() * self.annual_trading_days
-        mean_returns = returns_df.mean() * self.annual_trading_days
-
-        # Defensive covariance repair (prevents hard crashes in sqrt / optimizer due to indefiniteness)
+        
+        # Calculate covariance matrix with enhanced numerical stability
         try:
+            # Drop any assets with zero variance or NaN returns
+            valid_assets = []
+            for col in returns_df.columns:
+                if returns_df[col].std() > 1e-8 and not returns_df[col].isna().all():
+                    valid_assets.append(col)
+            
+            if len(valid_assets) < 2:
+                return {'success': False, 'message': 'Insufficient valid assets for optimization'}
+            
+            # Use only valid assets
+            returns_df = returns_df[valid_assets]
+            n_assets = len(valid_assets)
+            
+            # Recalculate bounds and initial weights
+            bounds = tuple((constraints['min_weight'], constraints['max_weight']) 
+                          for _ in range(n_assets))
+            init_weights = np.ones(n_assets) / n_assets
+            
+            # Calculate mean returns and covariance
+            mean_returns = returns_df.mean() * self.annual_trading_days
+            cov_matrix = returns_df.cov() * self.annual_trading_days
+            
+            # Enhanced regularization
             cov_matrix = self._ensure_psd_covariance(
                 cov_matrix,
                 method="higham",
@@ -1516,27 +1540,30 @@ class InstitutionalAnalytics:
                 max_iter=100,
                 tol=1e-7,
             )
-        except Exception as _psd_e:
-            # Fallback to eigen-clip (very fast)
-            try:
-                cov_matrix = self._ensure_psd_covariance(
-                    cov_matrix,
-                    method="eigen_clip",
-                    epsilon=1e-12,
-                    max_iter=50,
-                    tol=1e-6,
-                )
-            except Exception:
-                # Last resort: numeric hygiene only
-                cov_matrix = cov_matrix.fillna(0.0)
-                cov_matrix = 0.5 * (cov_matrix + cov_matrix.T)
+            
+            # Add small ridge regularization to ensure numerical stability
+            ridge_lambda = 1e-6
+            identity_matrix = np.eye(n_assets)
+            cov_matrix = (1 - ridge_lambda) * cov_matrix + ridge_lambda * np.mean(np.diag(cov_matrix)) * identity_matrix
+            
+            # Check condition number
+            cond_number = np.linalg.cond(cov_matrix)
+            if cond_number > 1e10:
+                # Add more regularization for ill-conditioned matrices
+                ridge_lambda = 1e-4
+                cov_matrix = (1 - ridge_lambda) * cov_matrix + ridge_lambda * np.mean(np.diag(cov_matrix)) * identity_matrix
+                
+        except Exception as e:
+            return {'success': False, 'message': f'Covariance matrix calculation failed: {str(e)}'}
+        
+        # Define objective functions
         def portfolio_variance(weights):
             return weights.T @ cov_matrix @ weights
         
         def portfolio_sharpe(weights):
             port_return = np.sum(mean_returns * weights)
-            port_vol = np.sqrt(weights.T @ cov_matrix @ weights)
-            return -(port_return - self.risk_free_rate) / port_vol if port_vol > 0 else 1e6
+            port_vol = np.sqrt(max(weights.T @ cov_matrix @ weights, 1e-12))
+            return -(port_return - self.risk_free_rate) / port_vol if port_vol > 1e-12 else 1e6
         
         def portfolio_return(weights):
             return -np.sum(mean_returns * weights)
@@ -1551,7 +1578,7 @@ class InstitutionalAnalytics:
         else:
             objective = portfolio_sharpe
         
-        # Perform optimization
+        # Perform optimization with fallback methods
         try:
             result = optimize.minimize(
                 objective,
@@ -1559,7 +1586,7 @@ class InstitutionalAnalytics:
                 bounds=bounds,
                 constraints=opt_constraints,
                 method='SLSQP',
-                options={'maxiter': 1000, 'ftol': 1e-9}
+                options={'maxiter': 1000, 'ftol': 1e-9, 'eps': 1e-8}
             )
             
             if result.success:
@@ -1587,13 +1614,46 @@ class InstitutionalAnalytics:
                     'risk_contributions': risk_contributions,
                     'diversification_ratio': diversification_ratio,
                     'objective_value': -result.fun if method == 'sharpe' else result.fun,
-                    'n_iterations': result.nit
+                    'n_iterations': result.nit,
+                    'condition_number': float(np.linalg.cond(cov_matrix))
                 }
             else:
-                return {'success': False, 'message': result.message}
-                
+                # Try alternative method if SLSQP fails
+                try:
+                    result = optimize.minimize(
+                        objective,
+                        x0=init_weights,
+                        bounds=bounds,
+                        constraints=opt_constraints,
+                        method='trust-constr',
+                        options={'maxiter': 500, 'verbose': 0}
+                    )
+                    
+                    if result.success:
+                        optimized_weights = result.x
+                        optimized_weights = optimized_weights / np.sum(optimized_weights)
+                        
+                        portfolio_returns = returns_df @ optimized_weights
+                        metrics = self.calculate_performance_metrics(portfolio_returns)
+                        
+                        return {
+                            'success': True,
+                            'weights': dict(zip(returns_df.columns, optimized_weights)),
+                            'metrics': metrics,
+                            'risk_contributions': {},
+                            'diversification_ratio': 1.0,
+                            'objective_value': -result.fun if method == 'sharpe' else result.fun,
+                            'n_iterations': result.nit,
+                            'method_used': 'trust-constr'
+                        }
+                    else:
+                        return {'success': False, 'message': f'Optimization failed: {result.message}'}
+                        
+                except Exception as e2:
+                    return {'success': False, 'message': f'Both SLSQP and trust-constr failed: {str(e2)}'}
+                    
         except Exception as e:
-            return {'success': False, 'message': str(e)}
+            return {'success': False, 'message': f'Optimization error: {str(e)}'}
     
     def _calculate_risk_contributions(
         self,
@@ -1623,6 +1683,31 @@ class InstitutionalAnalytics:
         portfolio_vol = np.sqrt(weights.T @ (returns_df.cov() * self.annual_trading_days) @ weights)
         
         return weighted_vol / portfolio_vol if portfolio_vol > 0 else 1.0
+    
+    def _validate_returns_data(self, returns_df: pd.DataFrame) -> pd.DataFrame:
+        """Validate and clean returns data for optimization"""
+        if returns_df.empty:
+            return returns_df
+        
+        # Remove assets with insufficient data
+        min_obs = max(60, returns_df.shape[1] * 2)
+        returns_df = returns_df.dropna(thresh=min_obs, axis=1)
+        
+        # Remove assets with zero or near-zero variance
+        valid_cols = []
+        for col in returns_df.columns:
+            if returns_df[col].std() > 1e-8:
+                valid_cols.append(col)
+        
+        returns_df = returns_df[valid_cols]
+        
+        # Remove any remaining NaNs by forward filling then backward filling
+        returns_df = returns_df.ffill().bfill()
+        
+        # If still NaN, drop those rows
+        returns_df = returns_df.dropna()
+        
+        return returns_df
     
     # =========================================================================
     # GARCH MODELING
@@ -1763,7 +1848,80 @@ class InstitutionalAnalytics:
             "conditional_volatility": best.get("conditional_volatility"),
             "returns": r,
             "annualized": bool(annualize),
-        }  
+        }
+    
+    def garch_forecast(
+        self,
+        returns: pd.Series,
+        p: int = 1,
+        q: int = 1,
+        forecast_horizon: int = 30,
+        dist: str = "normal"
+    ) -> Dict[str, Any]:
+        """Generate GARCH volatility forecasts"""
+        if not dep_manager.is_available("arch"):
+            return {"success": False, "message": "ARCH package not available"}
+        
+        try:
+            # Clean returns
+            r = returns.dropna()
+            if len(r) < 100:
+                return {"success": False, "message": "Insufficient data for forecasting"}
+            
+            # Scale returns
+            returns_scaled = r.values.astype(float) * 100.0
+            
+            # Fit GARCH model
+            arch_model = dep_manager.dependencies["arch"]["arch_model"]
+            model = arch_model(
+                returns_scaled,
+                mean="Constant",
+                vol="GARCH",
+                p=p,
+                q=q,
+                dist=dist,
+                rescale=False
+            )
+            fit = model.fit(disp="off", show_warning=False, update_freq=0)
+            
+            # Generate forecasts
+            forecast = fit.forecast(horizon=forecast_horizon, reindex=False)
+            
+            # Extract conditional volatility forecasts (convert from percent)
+            conditional_volatility = fit.conditional_volatility / 100.0
+            forecast_volatility = np.sqrt(forecast.variance.values[-1, :]) / 100.0
+            
+            # Calculate confidence intervals
+            if dist == "normal":
+                z_score = stats.norm.ppf(0.95)
+            elif dist == "t":
+                # Use t-distribution with degrees of freedom from model
+                df = fit.params.get("nu", 5.0)
+                z_score = stats.t.ppf(0.95, df)
+            else:
+                z_score = 1.96  # Default to normal
+            
+            upper_ci = forecast_volatility * (1 + z_score / np.sqrt(2 * len(r)))
+            lower_ci = forecast_volatility * (1 - z_score / np.sqrt(2 * len(r)))
+            
+            return {
+                "success": True,
+                "conditional_volatility": pd.Series(conditional_volatility * np.sqrt(self.annual_trading_days), 
+                                                    index=r.index[:len(conditional_volatility)]),
+                "forecast_volatility": forecast_volatility * np.sqrt(self.annual_trading_days),
+                "forecast_dates": pd.date_range(start=r.index[-1] + pd.Timedelta(days=1), 
+                                                periods=forecast_horizon, 
+                                                freq='D'),
+                "upper_ci": upper_ci * np.sqrt(self.annual_trading_days),
+                "lower_ci": lower_ci * np.sqrt(self.annual_trading_days),
+                "model_params": dict(fit.params),
+                "model_aic": float(fit.aic),
+                "model_bic": float(fit.bic)
+            }
+            
+        except Exception as e:
+            return {"success": False, "message": f"GARCH forecast failed: {str(e)}"}
+    
     # =========================================================================
     # REGIME DETECTION
     # =========================================================================
@@ -2718,6 +2876,7 @@ class InstitutionalVisualizer:
         fig.update_xaxes(title_text="Theoretical Quantiles", row=3, col=2)
 
         return fig
+    
     def create_correlation_matrix(
         self,
         corr_matrix: pd.DataFrame,
@@ -2841,63 +3000,368 @@ class InstitutionalVisualizer:
         
         return fig
     
-    def create_garch_volatility(
+    def create_advanced_garch_chart(
         self,
         returns: pd.Series,
-        conditional_vol: np.ndarray,
-        forecast_vol: Optional[np.ndarray] = None,
-        title: str = "GARCH Volatility Analysis"
+        garch_result: Dict[str, Any],
+        forecast_result: Optional[Dict[str, Any]] = None,
+        title: str = "Advanced GARCH Volatility Analysis"
     ) -> go.Figure:
-        """Create GARCH volatility visualization"""
+        """Create comprehensive GARCH visualization with advanced features"""
         
-        fig = go.Figure()
-        
-        # Realized volatility
-        realized_vol = returns.rolling(window=20).std() * np.sqrt(252) * 100
-        
-        fig.add_trace(go.Scatter(
-            x=realized_vol.index,
-            y=realized_vol.values,
-            name='Realized Vol (20D)',
-            line=dict(color=self.colors['gray'], width=2),
-            opacity=0.7
-        ))
-        
-        # Conditional volatility
-        if conditional_vol is not None:
-            cond_vol_series = pd.Series(conditional_vol * 100, index=returns.index[:len(conditional_vol)])
-            fig.add_trace(go.Scatter(
-                x=cond_vol_series.index,
-                y=cond_vol_series.values,
-                name='GARCH Conditional Vol',
-                line=dict(color=self.colors['primary'], width=3)
-            ))
-        
-        # Forecast volatility
-        if forecast_vol is not None:
-            forecast_dates = pd.date_range(
-                start=returns.index[-1] + pd.Timedelta(days=1),
-                periods=len(forecast_vol),
-                freq='D'
-            )
-            fig.add_trace(go.Scatter(
-                x=forecast_dates,
-                y=forecast_vol * 100,
-                name='Volatility Forecast',
-                line=dict(color=self.colors['danger'], width=2, dash='dot')
-            ))
-        
-        fig.update_layout(
-            title=dict(text=title, x=0.5, font=dict(size=20)),
-            height=500,
-            template=self.template,
-            hovermode='x unified',
-            yaxis_title="Annualized Volatility (%)",
-            xaxis_title="Date"
+        # Create subplot figure
+        fig = make_subplots(
+            rows=4, cols=2,
+            subplot_titles=(
+                "Returns Series",
+                "Conditional Volatility",
+                "Volatility Forecast",
+                "QQ Plot - Standardized Residuals",
+                "ACF of Squared Returns",
+                "ACF of Standardized Residuals",
+                "Volatility Regime Analysis",
+                "Residuals Distribution"
+            ),
+            specs=[
+                [{"type": "scatter"}, {"type": "scatter"}],
+                [{"type": "scatter"}, {"type": "scatter"}],
+                [{"type": "scatter"}, {"type": "scatter"}],
+                [{"type": "scatter"}, {"type": "histogram"}]
+            ],
+            vertical_spacing=0.08,
+            horizontal_spacing=0.1
         )
         
+        # 1. Returns Series (row 1, col 1)
+        fig.add_trace(
+            go.Scatter(
+                x=returns.index,
+                y=returns.values * 100,
+                name='Returns (%)',
+                line=dict(color=self.colors['primary'], width=1),
+                opacity=0.8
+            ),
+            row=1, col=1
+        )
+        
+        # Add zero line
+        fig.add_hline(y=0, line_dash="dash", line_color=self.colors['gray'], 
+                     opacity=0.5, row=1, col=1)
+        
+        # 2. Conditional Volatility (row 1, col 2)
+        if 'conditional_volatility' in garch_result:
+            cond_vol = garch_result['conditional_volatility']
+            fig.add_trace(
+                go.Scatter(
+                    x=cond_vol.index,
+                    y=cond_vol.values * 100,
+                    name='Conditional Volatility',
+                    line=dict(color=self.colors['danger'], width=2),
+                    fill='tozeroy',
+                    fillcolor=f"rgba({int(self.colors['danger'][1:3], 16)}, "
+                             f"{int(self.colors['danger'][3:5], 16)}, "
+                             f"{int(self.colors['danger'][5:7], 16)}, 0.2)"
+                ),
+                row=1, col=2
+            )
+            
+            # Add realized volatility for comparison
+            realized_vol = returns.rolling(window=20).std() * np.sqrt(252) * 100
+            fig.add_trace(
+                go.Scatter(
+                    x=realized_vol.index,
+                    y=realized_vol.values,
+                    name='Realized Vol (20D)',
+                    line=dict(color=self.colors['secondary'], width=1.5, dash='dash'),
+                    opacity=0.7
+                ),
+                row=1, col=2
+            )
+        
+        # 3. Volatility Forecast (row 2, col 1)
+        if forecast_result and forecast_result.get('success', False):
+            forecast_vol = forecast_result.get('forecast_volatility', [])
+            forecast_dates = forecast_result.get('forecast_dates', [])
+            upper_ci = forecast_result.get('upper_ci', [])
+            lower_ci = forecast_result.get('lower_ci', [])
+            
+            if len(forecast_vol) > 0:
+                # Historical conditional volatility
+                if 'conditional_volatility' in garch_result:
+                    cond_vol = garch_result['conditional_volatility']
+                    fig.add_trace(
+                        go.Scatter(
+                            x=cond_vol.index,
+                            y=cond_vol.values * 100,
+                            name='Historical Volatility',
+                            line=dict(color=self.colors['gray'], width=1),
+                            opacity=0.7
+                        ),
+                        row=2, col=1
+                    )
+                
+                # Forecast with confidence intervals
+                fig.add_trace(
+                    go.Scatter(
+                        x=forecast_dates,
+                        y=forecast_vol * 100,
+                        name='Forecast',
+                        line=dict(color=self.colors['success'], width=3)
+                    ),
+                    row=2, col=1
+                )
+                
+                # Confidence interval
+                fig.add_trace(
+                    go.Scatter(
+                        x=np.concatenate([forecast_dates, forecast_dates[::-1]]),
+                        y=np.concatenate([upper_ci * 100, lower_ci[::-1] * 100]),
+                        fill='toself',
+                        fillcolor=f"rgba({int(self.colors['success'][1:3], 16)}, "
+                                 f"{int(self.colors['success'][3:5], 16)}, "
+                                 f"{int(self.colors['success'][5:7], 16)}, 0.2)",
+                        line=dict(color='rgba(255,255,255,0)'),
+                        name='95% CI',
+                        showlegend=True
+                    ),
+                    row=2, col=1
+                )
+        
+        # 4. QQ Plot - Standardized Residuals (row 2, col 2)
+        try:
+            if 'conditional_volatility' in garch_result:
+                cond_vol = garch_result['conditional_volatility']
+                # Align returns with conditional volatility
+                aligned_returns = returns.reindex(cond_vol.index).dropna()
+                if len(aligned_returns) > 0:
+                    # Calculate standardized residuals
+                    std_residuals = aligned_returns.values / cond_vol.iloc[:len(aligned_returns)].values
+                    
+                    # Create QQ plot
+                    qq_data = stats.probplot(std_residuals, dist="norm")
+                    
+                    fig.add_trace(
+                        go.Scatter(
+                            x=qq_data[0][0],
+                            y=qq_data[0][1],
+                            mode='markers',
+                            name='Standardized Residuals',
+                            marker=dict(
+                                size=6,
+                                color=self.colors['primary'],
+                                opacity=0.7
+                            )
+                        ),
+                        row=2, col=2
+                    )
+                    
+                    # Add theoretical line
+                    x_line = np.array([qq_data[0][0][0], qq_data[0][0][-1]])
+                    y_line = qq_data[1][0] + qq_data[1][1] * x_line
+                    fig.add_trace(
+                        go.Scatter(
+                            x=x_line,
+                            y=y_line,
+                            mode='lines',
+                            name='Normal Distribution',
+                            line=dict(
+                                color=self.colors['danger'],
+                                width=2,
+                                dash='dash'
+                            )
+                        ),
+                        row=2, col=2
+                    )
+        except Exception as e:
+            pass
+        
+        # 5. ACF of Squared Returns (row 3, col 1)
+        try:
+            max_lag = min(40, len(returns) // 2)
+            acf_squared = self._calculate_acf(returns**2, max_lag)
+            
+            fig.add_trace(
+                go.Bar(
+                    x=list(range(1, len(acf_squared) + 1)),
+                    y=acf_squared,
+                    name='Squared Returns ACF',
+                    marker_color=self.colors['warning'],
+                    opacity=0.7
+                ),
+                row=3, col=1
+            )
+            
+            # Add significance bounds
+            sig_level = 1.96 / np.sqrt(len(returns))
+            fig.add_hline(y=sig_level, line_dash="dash", 
+                         line_color=self.colors['danger'], 
+                         opacity=0.5, row=3, col=1)
+            fig.add_hline(y=-sig_level, line_dash="dash", 
+                         line_color=self.colors['danger'], 
+                         opacity=0.5, row=3, col=1)
+        except Exception:
+            pass
+        
+        # 6. ACF of Standardized Residuals (row 3, col 2)
+        try:
+            if 'conditional_volatility' in garch_result:
+                cond_vol = garch_result['conditional_volatility']
+                aligned_returns = returns.reindex(cond_vol.index).dropna()
+                if len(aligned_returns) > 0:
+                    std_residuals = aligned_returns.values / cond_vol.iloc[:len(aligned_returns)].values
+                    
+                    max_lag = min(40, len(std_residuals) // 2)
+                    acf_resid = self._calculate_acf(std_residuals, max_lag)
+                    
+                    fig.add_trace(
+                        go.Bar(
+                            x=list(range(1, len(acf_resid) + 1)),
+                            y=acf_resid,
+                            name='Std Residuals ACF',
+                            marker_color=self.colors['success'],
+                            opacity=0.7
+                        ),
+                        row=3, col=2
+                    )
+                    
+                    # Add significance bounds
+                    sig_level = 1.96 / np.sqrt(len(std_residuals))
+                    fig.add_hline(y=sig_level, line_dash="dash", 
+                                 line_color=self.colors['danger'], 
+                                 opacity=0.5, row=3, col=2)
+                    fig.add_hline(y=-sig_level, line_dash="dash", 
+                                 line_color=self.colors['danger'], 
+                                 opacity=0.5, row=3, col=2)
+        except Exception:
+            pass
+        
+        # 7. Volatility Regime Analysis (row 4, col 1)
+        try:
+            if 'conditional_volatility' in garch_result:
+                cond_vol = garch_result['conditional_volatility']
+                
+                # Calculate volatility percentiles
+                low_threshold = np.percentile(cond_vol, 33)
+                high_threshold = np.percentile(cond_vol, 66)
+                
+                # Create regime series
+                regimes = pd.Series(index=cond_vol.index, dtype=str)
+                regimes[cond_vol < low_threshold] = 'Low'
+                regimes[(cond_vol >= low_threshold) & (cond_vol <= high_threshold)] = 'Medium'
+                regimes[cond_vol > high_threshold] = 'High'
+                
+                # Plot with different colors
+                colors = {
+                    'Low': self.colors['success'],
+                    'Medium': self.colors['warning'],
+                    'High': self.colors['danger']
+                }
+                
+                for regime in ['Low', 'Medium', 'High']:
+                    mask = regimes == regime
+                    if mask.any():
+                        fig.add_trace(
+                            go.Scatter(
+                                x=cond_vol.index[mask],
+                                y=cond_vol.values[mask] * 100,
+                                mode='markers',
+                                name=f'{regime} Volatility',
+                                marker=dict(
+                                    size=8,
+                                    color=colors[regime],
+                                    symbol='circle'
+                                ),
+                                opacity=0.7
+                            ),
+                            row=4, col=1
+                        )
+        except Exception:
+            pass
+        
+        # 8. Residuals Distribution (row 4, col 2)
+        try:
+            if 'conditional_volatility' in garch_result:
+                cond_vol = garch_result['conditional_volatility']
+                aligned_returns = returns.reindex(cond_vol.index).dropna()
+                if len(aligned_returns) > 0:
+                    std_residuals = aligned_returns.values / cond_vol.iloc[:len(aligned_returns)].values
+                    
+                    fig.add_trace(
+                        go.Histogram(
+                            x=std_residuals,
+                            nbinsx=50,
+                            name='Std Residuals',
+                            marker_color=self.colors['accent'],
+                            opacity=0.7,
+                            histnorm='probability density'
+                        ),
+                        row=4, col=2
+                    )
+                    
+                    # Add normal distribution overlay
+                    x_norm = np.linspace(std_residuals.min(), std_residuals.max(), 100)
+                    y_norm = stats.norm.pdf(x_norm, 0, 1)
+                    fig.add_trace(
+                        go.Scatter(
+                            x=x_norm,
+                            y=y_norm,
+                            mode='lines',
+                            name='Normal PDF',
+                            line=dict(color=self.colors['danger'], width=2, dash='dash')
+                        ),
+                        row=4, col=2
+                    )
+        except Exception:
+            pass
+        
+        # Update layout
+        fig.update_layout(
+            title=dict(
+                text=title,
+                x=0.5,
+                font=dict(size=24, color=self.colors['dark'])
+            ),
+            height=1400,
+            template=self.template,
+            showlegend=True,
+            hovermode='x unified'
+        )
+        
+        # Update axes labels
+        fig.update_yaxes(title_text="Return (%)", row=1, col=1)
+        fig.update_yaxes(title_text="Volatility (%)", row=1, col=2)
+        fig.update_yaxes(title_text="Volatility (%)", row=2, col=1)
+        fig.update_yaxes(title_text="Sample Quantiles", row=2, col=2)
+        fig.update_yaxes(title_text="ACF", row=3, col=1)
+        fig.update_yaxes(title_text="ACF", row=3, col=2)
+        fig.update_yaxes(title_text="Volatility (%)", row=4, col=1)
+        fig.update_yaxes(title_text="Density", row=4, col=2)
+        
+        fig.update_xaxes(title_text="Date", row=1, col=1)
+        fig.update_xaxes(title_text="Date", row=1, col=2)
+        fig.update_xaxes(title_text="Date", row=2, col=1)
+        fig.update_xaxes(title_text="Theoretical Quantiles", row=2, col=2)
+        fig.update_xaxes(title_text="Lag", row=3, col=1)
+        fig.update_xaxes(title_text="Lag", row=3, col=2)
+        fig.update_xaxes(title_text="Date", row=4, col=1)
+        fig.update_xaxes(title_text="Standardized Residuals", row=4, col=2)
+        
         return fig
-
+    
+    def _calculate_acf(self, series: Union[pd.Series, np.ndarray], max_lag: int) -> np.ndarray:
+        """Calculate autocorrelation function"""
+        if isinstance(series, pd.Series):
+            series = series.values
+        
+        series = series - np.mean(series)
+        n = len(series)
+        
+        acf = np.zeros(max_lag)
+        for lag in range(1, max_lag + 1):
+            acf[lag-1] = np.sum(series[lag:] * series[:-lag]) / np.sum(series**2)
+        
+        return acf
+    
     def create_ewma_ratio_signal_chart(
         self,
         ewma_df: pd.DataFrame,
@@ -3798,32 +4262,185 @@ class InstitutionalCommoditiesDashboard:
         
         # Asset selector
         assets = list(returns_df.columns)
-        selected_asset = st.selectbox("Select Asset", options=assets, index=0)
+        selected_asset = st.selectbox("Select Asset", options=assets, index=0, key="adv_analytics_asset")
         
         if selected_asset:
             returns = returns_df[selected_asset].dropna()
             
-            # GARCH Analysis
-            st.subheader("📉 GARCH Volatility Analysis")
-            if st.button("Run GARCH Analysis", key="garch_btn"):
-                with st.spinner("Running GARCH analysis..."):
-                    garch_result = self.analytics.garch_analysis(returns)
-                    if garch_result.get("success", False):
-                        st.success("GARCH analysis completed!")
-                        st.json(garch_result, expanded=False)
-                    else:
-                        st.warning(f"GARCH analysis failed: {garch_result.get('message', 'Unknown error')}")
+            # Create tabs for different advanced analytics
+            garch_tab, regime_tab, adv_garch_tab = st.tabs(["📉 GARCH Analysis", "🧩 Regime Detection", "📊 Advanced GARCH Charts"])
             
-            # Regime Detection
-            st.subheader("🧩 Regime Detection")
-            if st.button("Detect Market Regimes", key="regime_btn"):
-                with st.spinner("Detecting market regimes..."):
-                    regime_result = self.analytics.detect_regimes(returns)
-                    if regime_result.get("available", False):
-                        st.success("Regime detection completed!")
-                        st.json(regime_result, expanded=False)
-                    else:
-                        st.warning(f"Regime detection failed: {regime_result.get('message', 'Unknown error')}")
+            with garch_tab:
+                st.subheader("📉 GARCH Volatility Analysis")
+                
+                # GARCH Parameters
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    garch_p = st.selectbox("GARCH p", options=[1, 2, 3], index=0, key="garch_p")
+                with col2:
+                    garch_q = st.selectbox("GARCH q", options=[1, 2, 3], index=0, key="garch_q")
+                with col3:
+                    distribution = st.selectbox("Distribution", options=["normal", "t", "skewt"], index=0, key="garch_dist")
+                
+                # Run GARCH analysis
+                if st.button("Run GARCH Analysis", key="garch_btn"):
+                    with st.spinner("Running GARCH analysis..."):
+                        garch_result = self.analytics.garch_analysis(
+                            returns, 
+                            p=garch_p, 
+                            q=garch_q, 
+                            dist=distribution
+                        )
+                        
+                        if garch_result.get("success", False):
+                            st.success("GARCH analysis completed!")
+                            
+                            # Display model information
+                            best_model = garch_result.get("best_model", {})
+                            col1, col2, col3, col4 = st.columns(4)
+                            with col1:
+                                st.metric("AIC", f"{best_model.get('aic', 0):.2f}")
+                            with col2:
+                                st.metric("BIC", f"{best_model.get('bic', 0):.2f}")
+                            with col3:
+                                st.metric("Log Likelihood", f"{best_model.get('log_likelihood', 0):.2f}")
+                            with col4:
+                                st.metric("Converged", "✅" if best_model.get('converged', False) else "❌")
+                            
+                            # Show conditional volatility chart
+                            if 'conditional_volatility' in garch_result:
+                                cond_vol = garch_result['conditional_volatility']
+                                fig = self.visualizer.create_garch_volatility(
+                                    returns,
+                                    cond_vol.values,
+                                    title=f"GARCH Conditional Volatility - {selected_asset}"
+                                )
+                                st.plotly_chart(fig, use_container_width=True)
+                            
+                            # Model parameters
+                            with st.expander("Model Parameters", expanded=False):
+                                st.json(best_model.get('params', {}))
+                        else:
+                            st.warning(f"GARCH analysis failed: {garch_result.get('message', 'Unknown error')}")
+            
+            with regime_tab:
+                st.subheader("🧩 Regime Detection")
+                
+                # Regime parameters
+                col1, col2 = st.columns(2)
+                with col1:
+                    n_regimes = st.selectbox("Number of Regimes", options=[2, 3, 4], index=1, key="n_regimes")
+                with col2:
+                    features = st.multiselect(
+                        "Features for HMM",
+                        options=['returns', 'volatility', 'volume'],
+                        default=['returns', 'volatility'],
+                        key="hmm_features"
+                    )
+                
+                if st.button("Detect Market Regimes", key="regime_btn"):
+                    with st.spinner("Detecting market regimes..."):
+                        regime_result = self.analytics.detect_regimes(
+                            returns,
+                            n_regimes=n_regimes,
+                            features=features
+                        )
+                        
+                        if regime_result.get("available", False):
+                            st.success("Regime detection completed!")
+                            
+                            # Display regime statistics
+                            regime_stats = regime_result.get("regime_stats", [])
+                            if regime_stats:
+                                stats_df = pd.DataFrame(regime_stats)
+                                st.dataframe(stats_df, use_container_width=True)
+                            
+                            # Create regime chart
+                            price_data = st.session_state.asset_data[selected_asset]['Close'] if selected_asset in st.session_state.asset_data else pd.Series()
+                            if not price_data.empty:
+                                fig = self.visualizer.create_regime_chart(
+                                    price_data,
+                                    regime_result.get('regimes', []),
+                                    regime_result.get('regime_labels', {}),
+                                    title=f"Market Regimes - {selected_asset}"
+                                )
+                                st.plotly_chart(fig, use_container_width=True)
+                        else:
+                            st.warning(f"Regime detection failed: {regime_result.get('message', 'Unknown error')}")
+            
+            with adv_garch_tab:
+                st.subheader("📊 Advanced GARCH Charts")
+                
+                st.markdown("""
+                This section provides comprehensive GARCH analysis with advanced visualizations including:
+                - Returns series and conditional volatility
+                - Volatility forecasts with confidence intervals
+                - QQ plots for standardized residuals
+                - Autocorrelation analysis
+                - Volatility regime detection
+                - Residuals distribution
+                """)
+                
+                # Advanced GARCH parameters
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    adv_p = st.selectbox("GARCH p", options=[1, 2, 3], index=0, key="adv_garch_p")
+                with col2:
+                    adv_q = st.selectbox("GARCH q", options=[1, 2, 3], index=0, key="adv_garch_q")
+                with col3:
+                    adv_dist = st.selectbox("Distribution", options=["normal", "t"], index=0, key="adv_garch_dist")
+                with col4:
+                    forecast_horizon = st.number_input("Forecast Horizon (days)", min_value=5, max_value=100, value=30, key="forecast_horizon")
+                
+                # Run advanced GARCH analysis
+                if st.button("Generate Advanced GARCH Analysis", key="adv_garch_btn"):
+                    with st.spinner("Running advanced GARCH analysis..."):
+                        # First get GARCH fit
+                        garch_result = self.analytics.garch_analysis(
+                            returns, 
+                            p=adv_p, 
+                            q=adv_q, 
+                            dist=adv_dist
+                        )
+                        
+                        # Generate forecasts
+                        forecast_result = self.analytics.garch_forecast(
+                            returns,
+                            p=adv_p,
+                            q=adv_q,
+                            forecast_horizon=forecast_horizon,
+                            dist=adv_dist
+                        )
+                        
+                        if garch_result.get("success", False) or forecast_result.get("success", False):
+                            st.success("Advanced GARCH analysis completed!")
+                            
+                            # Create comprehensive chart
+                            fig = self.visualizer.create_advanced_garch_chart(
+                                returns,
+                                garch_result,
+                                forecast_result,
+                                title=f"Advanced GARCH Analysis - {selected_asset}"
+                            )
+                            st.plotly_chart(fig, use_container_width=True)
+                            
+                            # Display key metrics
+                            if forecast_result.get("success", False):
+                                st.subheader("📈 Forecast Metrics")
+                                col1, col2, col3 = st.columns(3)
+                                with col1:
+                                    st.metric("Current Volatility", 
+                                             f"{garch_result.get('conditional_volatility', pd.Series()).iloc[-1]*100:.2f}%" 
+                                             if 'conditional_volatility' in garch_result else "N/A")
+                                with col2:
+                                    st.metric("30-Day Forecast", 
+                                             f"{forecast_result.get('forecast_volatility', [0])[-1]*100:.2f}%"
+                                             if forecast_result.get('forecast_volatility') else "N/A")
+                                with col3:
+                                    st.metric("Model AIC", 
+                                             f"{forecast_result.get('model_aic', 0):.2f}")
+                        else:
+                            st.warning("Advanced GARCH analysis failed. Please check the parameters.")
 
     def _display_risk_analytics(self, config: AnalysisConfiguration):
         """Display risk analytics tab"""
@@ -3870,6 +4487,21 @@ class InstitutionalCommoditiesDashboard:
                             st.metric(f"CVaR ({confidence*100}%)", f"{var_result.get('CVaR', 0)*100:.2f}%")
                         with col3:
                             st.metric(f"ES ({confidence*100}%)", f"{var_result.get('ES', 0)*100:.2f}%")
+                        
+                        # Display additional statistics
+                        with st.expander("Additional Statistics", expanded=False):
+                            col1, col2, col3, col4 = st.columns(4)
+                            with col1:
+                                st.metric("Mean Return", f"{var_result.get('mu', 0)*100:.4f}%")
+                            with col2:
+                                st.metric("Volatility", f"{var_result.get('sigma', 0)*100:.4f}%")
+                            with col3:
+                                st.metric("Observations", var_result.get('n_obs', 0))
+                            with col4:
+                                st.metric("Horizon", f"{var_result.get('horizon', 1)} days")
+                        
+                        if var_result.get('warning'):
+                            st.warning(var_result['warning'])
                     else:
                         st.warning(f"VaR calculation failed: {var_result.get('message', 'Unknown error')}")
 
@@ -3912,6 +4544,14 @@ class InstitutionalCommoditiesDashboard:
             with col5:
                 red_min = st.number_input("Red Min Threshold", min_value=0.0, max_value=2.0, value=0.55, step=0.01)
             
+            # Bollinger Bands parameters
+            st.subheader("📊 Bollinger Bands Settings")
+            col6, col7 = st.columns(2)
+            with col6:
+                bb_window = st.number_input("BB Window", min_value=5, max_value=100, value=20)
+            with col7:
+                bb_k = st.number_input("BB Std Multiplier", min_value=1.0, max_value=3.0, value=2.0, step=0.1)
+            
             if st.button("Calculate EWMA Ratio", key="ewma_btn"):
                 with st.spinner("Calculating EWMA ratio..."):
                     ewma_df = self.analytics.compute_ewma_volatility_ratio(
@@ -3925,6 +4565,8 @@ class InstitutionalCommoditiesDashboard:
                         fig = self.visualizer.create_ewma_ratio_signal_chart(
                             ewma_df,
                             title=f"EWMA Volatility Ratio - {selected_asset}",
+                            bb_window=int(bb_window),
+                            bb_k=bb_k,
                             green_max=green_max,
                             red_min=red_min
                         )
@@ -3934,12 +4576,59 @@ class InstitutionalCommoditiesDashboard:
                         latest_ratio = ewma_df["EWMA_RATIO"].iloc[-1]
                         if latest_ratio <= green_max:
                             signal = "🟢 GREEN (Low Risk)"
+                            signal_color = "success"
                         elif latest_ratio >= red_min:
                             signal = "🔴 RED (High Risk)"
+                            signal_color = "danger"
                         else:
                             signal = "🟡 ORANGE (Medium Risk)"
+                            signal_color = "warning"
                         
-                        st.metric("Current Signal", signal, f"Ratio: {latest_ratio:.4f}")
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            st.metric("Current Signal", signal)
+                        with col2:
+                            st.metric("Current Ratio", f"{latest_ratio:.4f}")
+                        with col3:
+                            st.metric("Signal Strength", f"{(abs(latest_ratio - green_max) / (red_min - green_max) * 100):.1f}%")
+                        
+                        # Display EWMA volatilities
+                        st.subheader("📈 EWMA Volatilities")
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            st.metric(f"Fast EWMA ({span_fast}d)", f"{ewma_df.iloc[-1, 0]:.4f}")
+                        with col2:
+                            st.metric(f"Mid EWMA ({span_mid}d)", f"{ewma_df.iloc[-1, 1]:.4f}")
+                        with col3:
+                            st.metric(f"Slow EWMA ({span_slow}d)", f"{ewma_df.iloc[-1, 2]:.4f}")
+                        
+                        # Historical statistics
+                        st.subheader("📊 Historical Statistics")
+                        ratio_series = ewma_df["EWMA_RATIO"]
+                        col1, col2, col3, col4 = st.columns(4)
+                        with col1:
+                            st.metric("Mean Ratio", f"{ratio_series.mean():.4f}")
+                        with col2:
+                            st.metric("Std Dev", f"{ratio_series.std():.4f}")
+                        with col3:
+                            st.metric("Min Ratio", f"{ratio_series.min():.4f}")
+                        with col4:
+                            st.metric("Max Ratio", f"{ratio_series.max():.4f}")
+                        
+                        # Signal frequency
+                        green_pct = (ratio_series <= green_max).mean() * 100
+                        orange_pct = ((ratio_series > green_max) & (ratio_series < red_min)).mean() * 100
+                        red_pct = (ratio_series >= red_min).mean() * 100
+                        
+                        st.subheader("🎯 Signal Frequency Distribution")
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            st.metric("Green Signal %", f"{green_pct:.1f}%")
+                        with col2:
+                            st.metric("Orange Signal %", f"{orange_pct:.1f}%")
+                        with col3:
+                            st.metric("Red Signal %", f"{red_pct:.1f}%")
+                        
                     else:
                         st.warning("EWMA ratio calculation failed. Please check the data.")
 
@@ -3964,19 +4653,64 @@ class InstitutionalCommoditiesDashboard:
         selected_assets = st.multiselect(
             "Select Assets for Portfolio",
             options=assets,
-            default=assets[:min(4, len(assets))]
+            default=assets[:min(4, len(assets))],
+            key="portfolio_assets"
         )
         
         if len(selected_assets) >= 2:
             portfolio_returns = returns_df[selected_assets]
             
+            # Data validation
+            with st.expander("Data Quality Check", expanded=False):
+                # Check for NaN values
+                nan_count = portfolio_returns.isna().sum().sum()
+                st.write(f"NaN values in returns: {nan_count}")
+                
+                # Check for zero variance assets
+                zero_var_assets = [col for col in portfolio_returns.columns 
+                                 if portfolio_returns[col].std() < 1e-8]
+                if zero_var_assets:
+                    st.warning(f"Zero variance assets: {', '.join(zero_var_assets)}")
+                    portfolio_returns = portfolio_returns.drop(columns=zero_var_assets)
+                    selected_assets = [a for a in selected_assets if a not in zero_var_assets]
+                
+                # Check correlation
+                correlation_matrix = portfolio_returns.corr()
+                high_corr_pairs = []
+                for i in range(len(correlation_matrix.columns)):
+                    for j in range(i+1, len(correlation_matrix.columns)):
+                        if abs(correlation_matrix.iloc[i, j]) > 0.95:
+                            high_corr_pairs.append(
+                                f"{correlation_matrix.columns[i]} - {correlation_matrix.columns[j]}: {correlation_matrix.iloc[i, j]:.3f}"
+                            )
+                
+                if high_corr_pairs:
+                    st.warning("Highly correlated assets detected:")
+                    for pair in high_corr_pairs:
+                        st.write(f"  • {pair}")
+            
+            # Clean data
+            portfolio_returns = portfolio_returns.dropna()
+            
+            if len(selected_assets) < 2:
+                st.error("Need at least 2 valid assets for portfolio optimization.")
+                return
+            
             # Portfolio Optimization
             st.subheader("🔧 Portfolio Optimization")
             col1, col2 = st.columns(2)
             with col1:
-                method = st.selectbox("Optimization Method", options=["sharpe", "min_var", "max_ret"], index=0)
+                method = st.selectbox("Optimization Method", 
+                                    options=["sharpe", "min_var", "max_ret"], 
+                                    index=0,
+                                    key="portfolio_opt_method")
             with col2:
-                target_return = st.number_input("Target Return (annual)", min_value=0.0, max_value=1.0, value=0.0, step=0.01)
+                target_return = st.number_input("Target Return (annual)", 
+                                              min_value=-0.5, 
+                                              max_value=2.0, 
+                                              value=0.0, 
+                                              step=0.01,
+                                              key="portfolio_target_return")
             
             if st.button("Optimize Portfolio", key="optimize_btn"):
                 with st.spinner("Optimizing portfolio..."):
@@ -4005,8 +4739,62 @@ class InstitutionalCommoditiesDashboard:
                                 st.metric("Volatility", f"{metrics.get('annual_volatility', 0):.2f}%")
                             with col3:
                                 st.metric("Sharpe Ratio", f"{metrics.get('sharpe_ratio', 0):.2f}")
+                        
+                        # Display additional metrics
+                        col1, col2, col3, col4 = st.columns(4)
+                        with col1:
+                            st.metric("Sortino Ratio", f"{metrics.get('sortino_ratio', 0):.2f}")
+                        with col2:
+                            st.metric("Max Drawdown", f"{metrics.get('max_drawdown', 0):.2f}%")
+                        with col3:
+                            st.metric("Calmar Ratio", f"{metrics.get('calmar_ratio', 0):.2f}")
+                        with col4:
+                            st.metric("Win Rate", f"{metrics.get('win_rate', 0):.1f}%")
+                        
+                        # Risk contributions
+                        risk_contributions = opt_result.get("risk_contributions", {})
+                        if risk_contributions:
+                            st.subheader("📊 Risk Contributions")
+                            risk_df = pd.DataFrame(list(risk_contributions.items()), 
+                                                  columns=["Asset", "Risk Contribution %"])
+                            st.dataframe(risk_df, use_container_width=True)
+                        
+                        # Diversification ratio
+                        div_ratio = opt_result.get("diversification_ratio", 1.0)
+                        st.metric("Diversification Ratio", f"{div_ratio:.3f}",
+                                 help="Higher values indicate better diversification (weighted avg vol / portfolio vol)")
+                        
+                        # Add debug info
+                        with st.expander("Optimization Details", expanded=False):
+                            st.write(f"Condition Number: {opt_result.get('condition_number', 'N/A'):.2e}")
+                            st.write(f"Iterations: {opt_result.get('n_iterations', 'N/A')}")
+                            st.write(f"Method Used: {opt_result.get('method_used', 'SLSQP')}")
+                            
+                            # Show covariance matrix condition
+                            if not portfolio_returns.empty:
+                                cov_matrix = portfolio_returns.cov() * 252
+                                cond_number = np.linalg.cond(cov_matrix)
+                                st.write(f"Covariance Matrix Condition Number: {cond_number:.2e}")
                     else:
-                        st.warning(f"Portfolio optimization failed: {opt_result.get('message', 'Unknown error')}")
+                        st.error(f"Portfolio optimization failed: {opt_result.get('message', 'Unknown error')}")
+                        
+                        # Show fallback equal-weight portfolio
+                        st.info("Showing equal-weight portfolio as fallback:")
+                        n_assets = len(selected_assets)
+                        equal_weights = {asset: 1/n_assets for asset in selected_assets}
+                        equal_portfolio = portfolio_returns.mean(axis=1)
+                        metrics = self.analytics.calculate_performance_metrics(equal_portfolio)
+                        
+                        weights_df = pd.DataFrame(list(equal_weights.items()), columns=["Asset", "Weight"])
+                        st.dataframe(weights_df, use_container_width=True)
+                        
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            st.metric("Expected Return", f"{metrics.get('annual_return', 0):.2f}%")
+                        with col2:
+                            st.metric("Volatility", f"{metrics.get('annual_volatility', 0):.2f}%")
+                        with col3:
+                            st.metric("Sharpe Ratio", f"{metrics.get('sharpe_ratio', 0):.2f}")
             
             # Performance Chart
             st.subheader("📊 Portfolio Performance")
@@ -4087,6 +4875,35 @@ class InstitutionalCommoditiesDashboard:
                         # Display current beta
                         current_beta = beta.iloc[-1]
                         st.metric("Current Beta", f"{current_beta:.3f}")
+                        
+                        # Beta statistics
+                        st.subheader("📊 Beta Statistics")
+                        col1, col2, col3, col4 = st.columns(4)
+                        with col1:
+                            st.metric("Mean Beta", f"{beta.mean():.3f}")
+                        with col2:
+                            st.metric("Median Beta", f"{beta.median():.3f}")
+                        with col3:
+                            st.metric("Min Beta", f"{beta.min():.3f}")
+                        with col4:
+                            st.metric("Max Beta", f"{beta.max():.3f}")
+                        
+                        # Beta regime analysis
+                        st.subheader("🎯 Beta Regime Analysis")
+                        low_beta_threshold = beta.quantile(0.33)
+                        high_beta_threshold = beta.quantile(0.67)
+                        
+                        low_beta_pct = (beta < low_beta_threshold).mean() * 100
+                        mid_beta_pct = ((beta >= low_beta_threshold) & (beta <= high_beta_threshold)).mean() * 100
+                        high_beta_pct = (beta > high_beta_threshold).mean() * 100
+                        
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            st.metric("Low Beta (<33%)", f"{low_beta_pct:.1f}%")
+                        with col2:
+                            st.metric("Medium Beta", f"{mid_beta_pct:.1f}%")
+                        with col3:
+                            st.metric("High Beta (>67%)", f"{high_beta_pct:.1f}%")
                     else:
                         st.warning("Beta calculation failed. Please check the data.")
 
@@ -4179,6 +4996,23 @@ class InstitutionalCommoditiesDashboard:
                             yaxis_title="Active Return (%)"
                         )
                         st.plotly_chart(fig, use_container_width=True)
+                        
+                        # Display active returns statistics
+                        st.subheader("📊 Active Returns Statistics")
+                        col1, col2, col3, col4 = st.columns(4)
+                        with col1:
+                            st.metric("Mean", f"{active_returns.mean()*100:.4f}%")
+                        with col2:
+                            st.metric("Std Dev", f"{active_returns.std()*100:.4f}%")
+                        with col3:
+                            st.metric("Skewness", f"{active_returns.skew():.4f}")
+                        with col4:
+                            st.metric("Kurtosis", f"{active_returns.kurtosis():.4f}")
+                        
+                        # Information ratio
+                        info_ratio = active_returns.mean() / active_returns.std() * np.sqrt(252) if active_returns.std() > 0 else 0
+                        st.metric("Information Ratio", f"{info_ratio:.4f}")
+                        
                     else:
                         st.warning(f"Relative risk calculation failed: {relrisk_result.get('message', 'Unknown error')}")
 
@@ -4266,6 +5100,20 @@ class InstitutionalCommoditiesDashboard:
                                 yaxis_title="Cumulative Return"
                             )
                             st.plotly_chart(fig, use_container_width=True)
+                            
+                            # Calculate impact metrics
+                            final_base = base_path.iloc[-1] if not base_path.empty else 1.0
+                            final_stress = path.iloc[-1] if not path.empty else 1.0
+                            impact_pct = (final_stress - final_base) / final_base * 100
+                            
+                            st.subheader("📊 Stress Test Impact")
+                            col1, col2, col3 = st.columns(3)
+                            with col1:
+                                st.metric("Final Base Value", f"{final_base:.2f}")
+                            with col2:
+                                st.metric("Final Stress Value", f"{final_stress:.2f}")
+                            with col3:
+                                st.metric("Total Impact", f"{impact_pct:.2f}%")
                     else:
                         st.warning(f"Stress test failed: {stress_result.get('message', 'Unknown error')}")
 
@@ -4293,7 +5141,8 @@ class InstitutionalCommoditiesDashboard:
         selected_assets = st.multiselect(
             "Select Assets for Report",
             options=assets,
-            default=assets[:min(5, len(assets))]
+            default=assets[:min(5, len(assets))],
+            key="report_assets"
         )
         
         if selected_assets:
@@ -4328,7 +5177,8 @@ class InstitutionalCommoditiesDashboard:
                                 label="Download CSV",
                                 data=csv,
                                 file_name="performance_report.csv",
-                                mime="text/csv"
+                                mime="text/csv",
+                                key="csv_download"
                             )
                         
                         with col2:
@@ -4342,12 +5192,43 @@ class InstitutionalCommoditiesDashboard:
                                     label="Download Excel",
                                     data=buffer.getvalue(),
                                     file_name="performance_report.xlsx",
-                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                    key="excel_download"
                                 )
                             else:
                                 st.info("Excel export requires openpyxl or xlsxwriter")
+                        
+                        # Summary statistics
+                        st.subheader("📈 Summary Statistics")
+                        summary_cols = ['annual_return', 'annual_volatility', 'sharpe_ratio', 'max_drawdown']
+                        summary_df = report_df[summary_cols].describe()
+                        st.dataframe(summary_df, use_container_width=True)
                     else:
                         st.warning("Insufficient data to generate report.")
+        
+        # Correlation matrix report
+        st.subheader("🔗 Correlation Matrix Report")
+        if st.button("Generate Correlation Report", key="corr_report_btn"):
+            with st.spinner("Generating correlation report..."):
+                # Calculate correlation matrix
+                corr_matrix = returns_df.corr()
+                
+                # Create correlation heatmap
+                fig = self.visualizer.create_correlation_matrix(
+                    corr_matrix,
+                    title="Asset Correlation Matrix"
+                )
+                st.plotly_chart(fig, use_container_width=True)
+                
+                # Export correlation matrix
+                corr_csv = corr_matrix.to_csv()
+                st.download_button(
+                    label="Download Correlation Matrix (CSV)",
+                    data=corr_csv,
+                    file_name="correlation_matrix.csv",
+                    mime="text/csv",
+                    key="corr_csv_download"
+                )
 
     def _display_settings(self, config: AnalysisConfiguration):
         """Display settings tab"""
@@ -4364,7 +5245,8 @@ class InstitutionalCommoditiesDashboard:
             max_value=0.2,
             value=float(config.risk_free_rate),
             step=0.001,
-            format="%.3f"
+            format="%.3f",
+            key="rf_rate"
         )
         
         # Annual trading days
@@ -4373,7 +5255,8 @@ class InstitutionalCommoditiesDashboard:
             min_value=200,
             max_value=365,
             value=int(config.annual_trading_days),
-            step=1
+            step=1,
+            key="trading_days"
         )
         
         # Confidence levels
@@ -4381,18 +5264,19 @@ class InstitutionalCommoditiesDashboard:
         conf_levels = st.multiselect(
             "Select Confidence Levels",
             options=[0.90, 0.95, 0.99, 0.995],
-            default=list(config.confidence_levels)
+            default=list(config.confidence_levels),
+            key="confidence_levels"
         )
         
         # GARCH parameters
         st.subheader("📉 GARCH Parameters")
         col1, col2 = st.columns(2)
         with col1:
-            garch_p_min = st.number_input("GARCH p min", min_value=1, max_value=5, value=config.garch_p_range[0])
-            garch_p_max = st.number_input("GARCH p max", min_value=1, max_value=5, value=config.garch_p_range[1])
+            garch_p_min = st.number_input("GARCH p min", min_value=1, max_value=5, value=config.garch_p_range[0], key="garch_p_min")
+            garch_p_max = st.number_input("GARCH p max", min_value=1, max_value=5, value=config.garch_p_range[1], key="garch_p_max")
         with col2:
-            garch_q_min = st.number_input("GARCH q min", min_value=1, max_value=5, value=config.garch_q_range[0])
-            garch_q_max = st.number_input("GARCH q max", min_value=1, max_value=5, value=config.garch_q_range[1])
+            garch_q_min = st.number_input("GARCH q min", min_value=1, max_value=5, value=config.garch_q_range[0], key="garch_q_min")
+            garch_q_max = st.number_input("GARCH q max", min_value=1, max_value=5, value=config.garch_q_range[1], key="garch_q_max")
         
         # Regime detection
         st.subheader("🧩 Regime Detection")
@@ -4401,7 +5285,19 @@ class InstitutionalCommoditiesDashboard:
             min_value=2,
             max_value=5,
             value=config.regime_states,
-            step=1
+            step=1,
+            key="n_regimes_setting"
+        )
+        
+        # Monte Carlo simulations
+        st.subheader("🎲 Monte Carlo Settings")
+        mc_simulations = st.number_input(
+            "Monte Carlo Simulations",
+            min_value=1000,
+            max_value=50000,
+            value=config.monte_carlo_simulations,
+            step=1000,
+            key="mc_simulations"
         )
         
         # Save settings
@@ -4412,6 +5308,7 @@ class InstitutionalCommoditiesDashboard:
             config.garch_p_range = (garch_p_min, garch_p_max)
             config.garch_q_range = (garch_q_min, garch_q_max)
             config.regime_states = n_regimes
+            config.monte_carlo_simulations = int(mc_simulations)
             
             # Update analytics engine
             self.analytics.risk_free_rate = new_rf
@@ -4435,7 +5332,6 @@ class InstitutionalCommoditiesDashboard:
             st.json(settings_dict, expanded=False)
 
     def _display_portfolio_lab(self, config: AnalysisConfiguration):
-        # def _display_portfolio_lab(self, config: AnalysisConfiguration):
         """Display portfolio lab tab with PyPortfolioOpt integration"""
         st.markdown("### 🧰 Portfolio Lab (PyPortfolioOpt)")
         st.write("Advanced portfolio optimization using PyPortfolioOpt")
