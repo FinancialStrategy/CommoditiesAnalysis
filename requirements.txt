@@ -24,3 +24,4 @@ hmmlearn
 scikit-learn
 openpyxl>=3.1.2
 xlsxwriter>=3.1.2
+yaml
