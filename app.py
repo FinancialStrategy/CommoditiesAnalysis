@@ -1628,7 +1628,7 @@ class InstitutionalAnalytics:
     # GARCH MODELING
     # =========================================================================
     
-              def garch_analysis(
+    def garch_analysis(
         self,
         returns: pd.Series,
         p: Optional[int] = None,
