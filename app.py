@@ -4435,6 +4435,7 @@ class InstitutionalCommoditiesDashboard:
             st.json(settings_dict, expanded=False)
 
     def _display_portfolio_lab(self, config: AnalysisConfiguration):
+        # def _display_portfolio_lab(self, config: AnalysisConfiguration):
         """Display portfolio lab tab with PyPortfolioOpt integration"""
         st.markdown("### 🧰 Portfolio Lab (PyPortfolioOpt)")
         st.write("Advanced portfolio optimization using PyPortfolioOpt")
@@ -4450,12 +4451,13 @@ class InstitutionalCommoditiesDashboard:
             st.warning("No returns data available. Please load data first.")
             return
         
-        # Asset selection for portfolio
+        # Asset selection for portfolio - ADDED UNIQUE KEY
         assets = list(returns_df.columns)
         selected_assets = st.multiselect(
             "Select Assets for Portfolio",
             options=assets,
-            default=assets[:min(6, len(assets))]
+            default=assets[:min(6, len(assets))],
+            key="portfolio_lab_assets"  # ADDED UNIQUE KEY
         )
         
         if len(selected_assets) >= 2:
@@ -4474,11 +4476,12 @@ class InstitutionalCommoditiesDashboard:
             if pypfopt_available:
                 st.subheader("🔧 PyPortfolioOpt Optimization")
                 
-                # Optimization method selection
+                # Optimization method selection - ADDED UNIQUE KEY
                 method = st.selectbox(
                     "Optimization Method",
                     options=["Max Sharpe", "Min Volatility", "Efficient Risk", "Efficient Return"],
-                    index=0
+                    index=0,
+                    key="pypfopt_method"  # ADDED UNIQUE KEY
                 )
                 
                 # Additional parameters
@@ -4488,7 +4491,8 @@ class InstitutionalCommoditiesDashboard:
                         min_value=0.05,
                         max_value=1.0,
                         value=0.20,
-                        step=0.01
+                        step=0.01,
+                        key="pypfopt_target_risk"  # ADDED UNIQUE KEY
                     )
                 elif method == "Efficient Return":
                     target_return = st.number_input(
@@ -4496,7 +4500,8 @@ class InstitutionalCommoditiesDashboard:
                         min_value=-0.2,
                         max_value=1.0,
                         value=0.15,
-                        step=0.01
+                        step=0.01,
+                        key="pypfopt_target_return"  # ADDED UNIQUE KEY
                     )
                 
                 if st.button("Optimize with PyPortfolioOpt", key="pypfopt_btn"):
@@ -4533,11 +4538,11 @@ class InstitutionalCommoditiesDashboard:
                             perf = ef.portfolio_performance(verbose=False)
                             col1, col2, col3 = st.columns(3)
                             with col1:
-                                st.metric("Expected Return", f"{perf[0]*100:.2f}%")
+                                st.metric("Expected Return", f"{perf[0]*100:.2f}%", key="pypfopt_return")
                             with col2:
-                                st.metric("Volatility", f"{perf[1]*100:.2f}%")
+                                st.metric("Volatility", f"{perf[1]*100:.2f}%", key="pypfopt_vol")
                             with col3:
-                                st.metric("Sharpe Ratio", f"{perf[2]:.2f}")
+                                st.metric("Sharpe Ratio", f"{perf[2]:.2f}", key="pypfopt_sharpe")
                                 
                         except Exception as e:
                             st.error(f"PyPortfolioOpt optimization failed: {str(e)}")
@@ -4564,14 +4569,13 @@ class InstitutionalCommoditiesDashboard:
                         if metrics:
                             col1, col2, col3 = st.columns(3)
                             with col1:
-                                st.metric("Expected Return", f"{metrics.get('annual_return', 0):.2f}%")
+                                st.metric("Expected Return", f"{metrics.get('annual_return', 0):.2f}%", key="internal_return")
                             with col2:
-                                st.metric("Volatility", f"{metrics.get('annual_volatility', 0):.2f}%")
+                                st.metric("Volatility", f"{metrics.get('annual_volatility', 0):.2f}%", key="internal_vol")
                             with col3:
-                                st.metric("Sharpe Ratio", f"{metrics.get('sharpe_ratio', 0):.2f}")
+                                st.metric("Sharpe Ratio", f"{metrics.get('sharpe_ratio', 0):.2f}", key="internal_sharpe")
                     else:
-                        st.warning(f"Internal optimization failed: {opt_result.get('message', 'Unknown error')}")
-
+                        st.warning(f"Internal optimization failed: {opt_result.get('message', 'Unknown error')}")    
 # =============================================================================
 # 🧭 APPLICATION ROUTER — Mode selector
 # =============================================================================
