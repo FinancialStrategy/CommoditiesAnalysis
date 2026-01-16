@@ -1628,7 +1628,7 @@ class InstitutionalAnalytics:
     # GARCH MODELING
     # =========================================================================
     
-    def garch_analysis(
+              def garch_analysis(
         self,
         returns: pd.Series,
         p: Optional[int] = None,
@@ -1689,8 +1689,8 @@ class InstitutionalAnalytics:
 
         arch_model = dep_manager.dependencies["arch"]["arch_model"]
 
-        annual_days = float(getattr(self.cfg, "annual_trading_days", 252))
-        ann_scale = math.sqrt(annual_days) if annualize else 1.0
+        # FIX: Use self.annual_trading_days instead of self.cfg
+        ann_scale = math.sqrt(float(self.annual_trading_days)) if annualize else 1.0
 
         results: List[Dict[str, Any]] = []
         best = None  # track best by BIC
@@ -1763,8 +1763,7 @@ class InstitutionalAnalytics:
             "conditional_volatility": best.get("conditional_volatility"),
             "returns": r,
             "annualized": bool(annualize),
-        }
-
+        }  
     # =========================================================================
     # REGIME DETECTION
     # =========================================================================
