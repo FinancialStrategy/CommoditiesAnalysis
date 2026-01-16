@@ -1,4 +1,4 @@
-Portfolio optimization failed: Singular matrix C in LSQ subproblem: """
+"""
 🏛️ Institutional Commodities Analytics Platform v6.1
 Integrated Portfolio Analytics • Advanced GARCH & Regime Detection • Machine Learning • Professional Reporting
 Streamlit Cloud Optimized with Superior Architecture & Performance
